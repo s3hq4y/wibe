@@ -15,14 +15,14 @@ $ErrorActionPreference = "Stop"
 $extSrc  = Join-Path $Src  "extensions\incontrol"
 $extProd = Join-Path $Prod "resources\app\extensions\incontrol"
 
-Write-Host "[1/2] uwa-sidecar -> product"
+Write-Host "[1/4] uwa-sidecar -> product"
 $sideSrc = Join-Path $Src  "resources\uwa-sidecar"
 $sideDst = Join-Path $Prod "resources\app\resources\uwa-sidecar"
 robocopy $sideSrc $sideDst /E /NFL /NDL /NJH /NJS /XD __pycache__ .git chrome_profile /XF *.pyc | Out-Null
 if(-not (Test-Path (Join-Path $sideDst "start.py"))){ throw "uwa-sidecar copy failed" }
 Write-Host ("      files: " + (Get-ChildItem $sideDst -Recurse -File).Count)
 
-Write-Host "[2/2] external node_modules -> product"
+Write-Host "[2/4] external node_modules -> product"
 $nmDst = Join-Path $extProd "node_modules"
 New-Item -ItemType Directory -Force -Path $nmDst | Out-Null
 $roots = @((Join-Path $extSrc "core\node_modules"), (Join-Path $extSrc "node_modules"))
@@ -42,7 +42,7 @@ New-Item -ItemType Directory -Force -Path (Split-Path $binDst) | Out-Null
 Copy-Item $binSrc $binDst -Force
 if(-not (Test-Path $binDst)){ throw "sqlite3 native binary missing" }
 
-Write-Host "[3/3] incontrol dist -> product"
+Write-Host "[3/4] incontrol dist -> product"
 # VS Code 鎵撳寘浼氭妸 main 閲嶅啓涓?./dist/extension.js锛岄€傞厤灞備篃蹇呴』杈撳嚭 dist/
 $distSrc = Join-Path $extSrc  "dist"
 $distDst = Join-Path $extProd "dist"
@@ -50,6 +50,32 @@ if(Test-Path $distSrc){
   robocopy $distSrc $distDst /E /NFL /NDL /NJH /NJS | Out-Null
 }
 if(-not (Test-Path (Join-Path $distDst "extension.js"))){ throw "dist/extension.js missing in product" }
+
+Write-Host "[4/4] node-pty native module -> product"
+# node-pty 的 .node 不随 npm install 落地（prebuild 脚本对 electron ABI 无预编译产物），
+# 必须用 node-gyp 按 .npmrc 里的 runtime=electron/target 手工编译一次：
+#   cd node_modules\node-pty
+#   npx node-gyp rebuild --runtime=electron --target=<ver> --dist-url=https://electronjs.org/headers --arch=x64
+# 编译产物需同时放到 build/Release 与 prebuilds/win32-x64 —— utils.js 两处都会探。
+# 缺失时报错：Failed to load native module: conpty.node，终端完全无法启动。
+$ptySrc = Join-Path $Src "node_modules\node-pty"
+$ptyDst = Join-Path $Prod "resources\app\node_modules.asar.unpacked\node-pty"
+$ptyBin = Join-Path $ptySrc "build\Release"
+if (Test-Path (Join-Path $ptyBin "conpty.node")) {
+  foreach ($sub in @("build\Release", "prebuilds\win32-x64")) {
+    $d = Join-Path $ptyDst $sub
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    foreach ($f in @("conpty.node", "conpty_console_list.node")) {
+      Copy-Item (Join-Path $ptyBin $f) $d -Force
+    }
+    # ConPTY 运行时依赖，必须与 .node 同目录
+    $dll = Join-Path $ptySrc "third_party\conpty\1.25.260303002\win10-x64\conpty.dll"
+    if (Test-Path $dll) { Copy-Item $dll $d -Force }
+  }
+  Write-Host "      conpty.node deployed"
+} else {
+  Write-Host "      WARN: conpty.node not built; terminal will not launch"
+}
 
 Write-Host "verify:"
 Push-Location $extProd
