@@ -73,6 +73,14 @@ if (Test-Path (Join-Path $ptyBin "conpty.node")) {
     if (Test-Path $dll) { Copy-Item $dll $d -Force }
   }
   Write-Host "      conpty.node deployed"
+  # 文件放到 .unpacked 还不够：Electron 只对 asar 头部登记过的条目做重定向。
+  $reg = Join-Path $Src "build\register-pty-in-asar.js"
+  $asar = Join-Path $Prod "resources\app\node_modules.asar"
+  if ((Test-Path $reg) -and (Test-Path $asar)) {
+    $env:ASAR = $asar
+    $env:PICKLE = Join-Path $Src "node_modules\chromium-pickle-js"
+    node $reg
+  }
 } else {
   Write-Host "      WARN: conpty.node not built; terminal will not launch"
 }
