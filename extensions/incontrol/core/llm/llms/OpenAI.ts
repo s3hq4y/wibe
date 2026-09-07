@@ -25,6 +25,7 @@ import {
   toChatBody,
   toResponsesInput,
 } from "../openaiTypeConverters.js";
+import { consumeUwaFields } from "../../util/uwaRequestContext.js";
 
 const NON_CHAT_MODELS = [
   "text-davinci-002",
@@ -538,6 +539,9 @@ class OpenAI extends BaseLLM {
     }
 
     const body = this._convertArgs(options, messages);
+    // 合并 uwa 桥接字段：让 sidecar 知道这是 ide 模式的续聊，
+    // 否则它会按默认逻辑在同一会话里反复开新对话。
+    Object.assign(body as any, consumeUwaFields() ?? {});
 
     const response = await this.fetch(this._getEndpoint("chat/completions"), {
       method: "POST",

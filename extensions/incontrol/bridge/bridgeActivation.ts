@@ -15,6 +15,7 @@ import { ConversationBridge } from './conversationBridge';
 import { onCompactionComplete, onModelSwitch } from './bridgeTriggers';
 import { MigrationResult, SessionBinding } from './protocol';
 import { SidecarManager } from './sidecarManager';
+import { markNextRequest, setUwaBridgeEnabled } from '../core/util/uwaRequestContext.js';
 
 let sidecar: SidecarManager | undefined;
 let bridge: ConversationBridge | undefined;
@@ -138,6 +139,9 @@ export async function activateBridge(
 	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
 	statusItem.command = 'incontrol.bridge.status';
 	context.subscriptions.push(statusItem);
+	// 开启后，core 侧每个 chat/completions 都会带上 history_mode='ide'。
+	// 这是需求 0/1 的关键：没有它，uwa 会在同一会话里反复开新对话。
+	setUwaBridgeEnabled(true, { history_mode: 'ide', system_prompt_mode: 'inject_once' });
 	renderStatus(bridge.getBinding());
 	renderSidecarStatus(false);
 
@@ -167,6 +171,7 @@ export async function activateBridge(
 				{ location: vscode.ProgressLocation.Notification, title: '正在停止 uwa sidecar…' },
 				() => sidecar!.stop(),
 			);
+			setUwaBridgeEnabled(false);
 			renderSidecarStatus(false);
 			vscode.window.showInformationMessage('uwa sidecar 已停止。');
 		}),
@@ -311,6 +316,15 @@ export async function activateBridge(
 			if (!enabled || !e.summary?.trim()) {
 				return;
 			}
+			// 需求 2：压缩后下一条消息必须落到新对话，并重新注入系统提示词。
+			markNextRequest({
+				force_new_conversation: true,
+				system_prompt_mode: 'always',
+				conversation_hint: {
+					reason: 'compaction',
+					prev_conversation_url: bridge?.getBinding()?.conversationUrl,
+				},
+			});
 			log(`compaction completed for session=${e.sessionId} idx=${e.index}`);
 			await onCompactionComplete(e.systemPrompt ?? '', e.summary);
 		}),
@@ -325,6 +339,15 @@ export async function activateBridge(
 			if (!enabled || !e.packedHistory?.trim()) {
 				return;
 			}
+			// 需求 3：切换模型后开新窗口，带上打包历史与系统提示词。
+			markNextRequest({
+				force_new_conversation: true,
+				system_prompt_mode: 'always',
+				conversation_hint: {
+					reason: 'model_switch',
+					prev_conversation_url: bridge?.getBinding()?.conversationUrl,
+				},
+			});
 			log(`model switched ${e.previousModel ?? '?'} -> ${e.newModel}`);
 			await onModelSwitch(e.newModel, e.systemPrompt ?? '', e.packedHistory);
 		}),
