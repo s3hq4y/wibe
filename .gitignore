@@ -85,3 +85,6 @@ extensions/incontrol/_tsc*.log
 _build*.log
 
 extensions/incontrol/dist/
+
+resources/uwa-sidecar/chrome_profile/
+resources/uwa-sidecar/_s.*

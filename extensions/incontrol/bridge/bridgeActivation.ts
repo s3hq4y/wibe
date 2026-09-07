@@ -102,6 +102,8 @@ export async function activateBridge(
 
 	sidecar = new SidecarManager({
 		sidecarRoot,
+		browserPort: cfg.get<number>('browserPort') ?? 9222,
+		browserPath: cfg.get<string>('browserPath') || undefined,
 		pythonPath: cfg.get<string>('pythonPath') || undefined,
 		preferredPort: cfg.get<number>('port') ?? 8199,
 		log,

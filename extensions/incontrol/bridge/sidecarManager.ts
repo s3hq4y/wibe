@@ -9,6 +9,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ChildProcess, spawn } from 'child_process';
+import { BrowserLauncher } from './browserLauncher';
 import * as net from 'net';
 import * as path from 'path';
 import { DEFAULT_SIDECAR_PORT, SidecarHealth } from './protocol';
@@ -18,6 +19,8 @@ export interface SidecarOptions {
 	sidecarRoot: string;
 	/** Python 解释器路径；未提供时按平台探测 */
 	pythonPath?: string;
+	browserPath?: string;
+	browserPort?: number;
 	preferredPort?: number;
 	/** 日志回调，接到扩展的 OutputChannel */
 	log?: (line: string) => void;
@@ -25,6 +28,7 @@ export interface SidecarOptions {
 
 export class SidecarManager {
 	private proc: ChildProcess | undefined;
+	private browser: BrowserLauncher | undefined;
 	private port: number = DEFAULT_SIDECAR_PORT;
 	private healthTimer: NodeJS.Timeout | undefined;
 	private disposed = false;
@@ -103,6 +107,17 @@ export class SidecarManager {
 		// start.py 是 venv 引导脚本：它会新建 venv/、联网装依赖、必要时下载
 		// Python 本体，耗时以分钟计，远超我们 15s 的探活窗口，且装出来的解释器
 		// 与我们探测到的不是同一个。main.py 才是真正的 uvicorn 服务入口。
+		// uwa 只「接管」浏览器、不负责启动它；连不上时它仅记一条 WRN 就继续跑，
+		// 所以必须在这里先把调试端口上的浏览器准备好，否则服务看似正常但完全不可用。
+		const browserPort = this.opts.browserPort ?? 9222;
+		this.browser = new BrowserLauncher({
+			port: browserPort,
+			profileDir: path.join(this.opts.sidecarRoot, 'chrome_profile'),
+			executablePath: this.opts.browserPath,
+			log: m => this.log(`[browser] ${m}`),
+		});
+		await this.browser.ensure();
+
 		const entry = path.join(this.opts.sidecarRoot, 'main.py');
 		const python = this.opts.pythonPath || this.resolvePython();
 
@@ -112,6 +127,7 @@ export class SidecarManager {
 			env: {
 				...process.env,
 				APP_PORT: String(this.port),
+				BROWSER_PORT: String(browserPort),
 				// ide 模式是本项目为 IDE 场景新增的历史模式
 				HISTORY_MODE: 'ide',
 				PYTHONIOENCODING: 'utf-8',
@@ -221,6 +237,8 @@ export class SidecarManager {
 	 * 超时后再强杀整个进程树。
 	 */
 	async stop(): Promise<void> {
+		await this.browser?.dispose();
+		this.browser = undefined;
 		this.disposed = true;
 		this.stopHealthLoop();
 

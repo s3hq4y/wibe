@@ -168,6 +168,16 @@
           "type": "boolean",
           "default": true,
           "description": "切换模型时，自动把打包的历史迁移到新的网页对话"
+        },
+        "incontrol.sidecar.browserPort": {
+          "type": "number",
+          "default": 9222,
+          "description": "uwa 接管的浏览器远程调试端口（须与 BROWSER_PORT 一致）"
+        },
+        "incontrol.sidecar.browserPath": {
+          "type": "string",
+          "default": "",
+          "description": "Chrome/Edge 可执行文件路径；留空自动探测"
         }
       }
     },
