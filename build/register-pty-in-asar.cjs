@@ -35,6 +35,12 @@ const targets = [
   ['prebuilds', 'win32-x64', 'conpty.node'],
   ['prebuilds', 'win32-x64', 'conpty_console_list.node'],
   ['prebuilds', 'win32-x64', 'conpty.dll'],
+  // conpty.node 运行时按 <native_dir>/conpty/conpty.dll 拼路径，
+  // 且该 DLL 依赖同目录的 OpenConsole.exe，两者必须一起登记。
+  ['build', 'Release', 'conpty', 'conpty.dll'],
+  ['build', 'Release', 'conpty', 'OpenConsole.exe'],
+  ['prebuilds', 'win32-x64', 'conpty', 'conpty.dll'],
+  ['prebuilds', 'win32-x64', 'conpty', 'OpenConsole.exe'],
 ];
 
 let added = 0;

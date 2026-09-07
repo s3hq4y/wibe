@@ -68,9 +68,15 @@ if (Test-Path (Join-Path $ptyBin "conpty.node")) {
     foreach ($f in @("conpty.node", "conpty_console_list.node")) {
       Copy-Item (Join-Path $ptyBin $f) $d -Force
     }
-    # ConPTY 运行时依赖，必须与 .node 同目录
-    $dll = Join-Path $ptySrc "third_party\conpty\1.25.260303002\win10-x64\conpty.dll"
-    if (Test-Path $dll) { Copy-Item $dll $d -Force }
+    # ConPTY 运行时依赖：conpty.node 按 <native_dir>/conpty/conpty.dll 拼路径，
+    # 且该 DLL 需要同目录的 OpenConsole.exe 才能真正启动伪终端。
+    $tp = Join-Path $ptySrc "third_party\conpty\1.25.260303002\win10-x64"
+    if (Test-Path $tp) {
+      $cd = Join-Path $d "conpty"
+      New-Item -ItemType Directory -Force -Path $cd | Out-Null
+      Copy-Item (Join-Path $tp "conpty.dll") $cd -Force
+      Copy-Item (Join-Path $tp "OpenConsole.exe") $cd -Force
+    }
   }
   Write-Host "      conpty.node deployed"
   # 文件放到 .unpacked 还不够：Electron 只对 asar 头部登记过的条目做重定向。
