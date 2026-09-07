@@ -17,7 +17,9 @@ import { run } from '../esbuild-extension-common.mts';
 
 const rootDir = import.meta.dirname;
 const srcDir = path.join(rootDir, 'src');
-const outDir = path.join(rootDir, 'out');
+// 必须是 dist/：VS Code 打包内置扩展时会把 package.json 的 main 重写为
+// ./dist/extension.js，若输出到 out/ 则扩展宿主报 MODULE_NOT_FOUND。
+const outDir = path.join(rootDir, 'dist');
 const guiDir = path.join(rootDir, 'gui');
 const mediaDir = path.join(rootDir, 'media');
 

@@ -83,3 +83,5 @@ extensions/incontrol/packages/*/dist/
 extensions/incontrol/_tsc*.log
 
 _build*.log
+
+extensions/incontrol/dist/
