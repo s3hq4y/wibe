@@ -67,6 +67,23 @@ export class SidecarManager {
 	 * 若目标端口上已有健康实例（用户手动起的、或上次未清理干净的），
 	 * 直接复用而不重复 spawn —— 避免两个实例抢同一个 chrome_profile。
 	 */
+	/**
+	 * 选解释器：sidecar 自带的 venv 优先（start.py 若跑过会生成），
+	 * 否则回退到系统 Python 探测。
+	 */
+	private resolvePython(): string {
+		const venvPy = process.platform === 'win32'
+			? path.join(this.opts.sidecarRoot, 'venv', 'Scripts', 'python.exe')
+			: path.join(this.opts.sidecarRoot, 'venv', 'bin', 'python');
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+			if (require('fs').existsSync(venvPy)) {
+				return venvPy;
+			}
+		} catch { /* ignore */ }
+		return this.detectPython();
+	}
+
 	async start(): Promise<SidecarHealth> {
 		const preferred = this.opts.preferredPort ?? DEFAULT_SIDECAR_PORT;
 
@@ -83,8 +100,11 @@ export class SidecarManager {
 
 		this.port = await this.pickPort(preferred);
 
-		const python = this.opts.pythonPath ?? this.detectPython();
-		const entry = path.join(this.opts.sidecarRoot, 'start.py');
+		// start.py 是 venv 引导脚本：它会新建 venv/、联网装依赖、必要时下载
+		// Python 本体，耗时以分钟计，远超我们 15s 的探活窗口，且装出来的解释器
+		// 与我们探测到的不是同一个。main.py 才是真正的 uvicorn 服务入口。
+		const entry = path.join(this.opts.sidecarRoot, 'main.py');
+		const python = this.opts.pythonPath || this.resolvePython();
 
 		this.log(`spawning: ${python} ${entry} (port ${this.port})`);
 		this.proc = spawn(python, [entry], {
