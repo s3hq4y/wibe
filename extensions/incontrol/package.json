@@ -48,7 +48,7 @@
   "activationEvents": [
     "onUri",
     "onStartupFinished",
-    "onView:incontrolGUIView"
+    "onView:incontrol.incontrolGUIView"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -178,6 +178,11 @@
           "type": "string",
           "default": "",
           "description": "Chrome/Edge 可执行文件路径；留空自动探测"
+        },
+        "incontrol.sidecar.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "在状态栏显示 uwa sidecar 状态（点击可启动/停止）"
         }
       }
     },
@@ -407,6 +412,21 @@
         "command": "incontrol.bridge.showLogs",
         "title": "uwa: 查看 sidecar 日志",
         "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.startSidecar",
+        "title": "uwa: 启动 sidecar",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.stopSidecar",
+        "title": "uwa: 停止 sidecar",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.status",
+        "title": "uwa: 显示状态",
+        "category": "incontrol"
       }
     ],
     "keybindings": [
@@ -552,6 +572,30 @@
         },
         {
           "command": "incontrol.openInNewWindow"
+        },
+        {
+          "command": "incontrol.bridge.showConversation"
+        },
+        {
+          "command": "incontrol.bridge.compactAndMigrate"
+        },
+        {
+          "command": "incontrol.bridge.migrateOnModelSwitch"
+        },
+        {
+          "command": "incontrol.bridge.restartSidecar"
+        },
+        {
+          "command": "incontrol.bridge.showLogs"
+        },
+        {
+          "command": "incontrol.bridge.startSidecar"
+        },
+        {
+          "command": "incontrol.bridge.stopSidecar"
+        },
+        {
+          "command": "incontrol.bridge.status"
         }
       ],
       "editor/context": [

@@ -79,6 +79,27 @@ async function reportMigration(res: MigrationResult, what: string): Promise<void
 	renderStatus(bridge?.getBinding());
 }
 
+/**
+ * 状态栏渲染 sidecar 运行状态。
+ * 与 renderStatus（渲染对话绑定）分开：sidecar 未启动时对话绑定必然为空，
+ * 此时更该告诉用户「点这里可以启动」，而不是显示一个空绑定。
+ */
+function renderSidecarStatus(alive: boolean): void {
+	if (!statusItem) { return; }
+	const show = vscode.workspace
+		.getConfiguration('incontrol.sidecar')
+		.get<boolean>('showStatusBar') !== false;
+	if (!show) { statusItem.hide(); return; }
+	statusItem.text = alive ? '$(radio-tower) uwa' : '$(circle-slash) uwa';
+	statusItem.tooltip = alive
+		? 'uwa sidecar 运行中 — 点击查看状态'
+		: 'uwa sidecar 未运行 — 点击启动';
+	statusItem.backgroundColor = alive
+		? undefined
+		: new vscode.ThemeColor('statusBarItem.warningBackground');
+	statusItem.show();
+}
+
 export interface BridgeHandle {
 	dispose(): Promise<void>;
 }
@@ -115,12 +136,74 @@ export async function activateBridge(
 	});
 
 	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
-	statusItem.command = 'incontrol.bridge.showConversation';
+	statusItem.command = 'incontrol.bridge.status';
 	context.subscriptions.push(statusItem);
 	renderStatus(bridge.getBinding());
+	renderSidecarStatus(false);
 
 	// ------------------------------------------------------------ 命令注册
 	context.subscriptions.push(
+		/** 手动启动 sidecar（autoStart 关闭、或自动启动失败时使用） */
+		vscode.commands.registerCommand('incontrol.bridge.startSidecar', async () => {
+			if (!sidecar) { return; }
+			const health = await vscode.window.withProgress(
+				{ location: vscode.ProgressLocation.Notification, title: '正在启动 uwa sidecar…' },
+				() => sidecar!.start(),
+			);
+			renderSidecarStatus(health.alive);
+			if (health.alive) {
+				vscode.window.showInformationMessage(`uwa sidecar 已就绪：${sidecar!.getBaseUrl()}`);
+			} else {
+				const seeLog = '查看日志';
+				const picked = await vscode.window.showErrorMessage('uwa sidecar 启动失败。', seeLog);
+				if (picked === seeLog) { output?.show(); }
+			}
+		}),
+
+		/** 手动停止 sidecar（连同其拉起的受控浏览器） */
+		vscode.commands.registerCommand('incontrol.bridge.stopSidecar', async () => {
+			if (!sidecar) { return; }
+			await vscode.window.withProgress(
+				{ location: vscode.ProgressLocation.Notification, title: '正在停止 uwa sidecar…' },
+				() => sidecar!.stop(),
+			);
+			renderSidecarStatus(false);
+			vscode.window.showInformationMessage('uwa sidecar 已停止。');
+		}),
+
+		/** 状态面板：状态栏点击入口，按当前运行状态给出可用操作 */
+		vscode.commands.registerCommand('incontrol.bridge.status', async () => {
+			const alive = sidecar ? (await sidecar.checkHealth()).alive : false;
+			const b = bridge?.getBinding();
+			const items: vscode.QuickPickItem[] = alive
+				? [
+					{ label: '$(debug-disconnect) 停止 sidecar', description: sidecar?.getBaseUrl() },
+					{ label: '$(refresh) 重启 sidecar' },
+					{ label: '$(link-external) 查看当前网页对话', description: b?.conversationUrl ?? '尚未绑定' },
+					{ label: '$(output) 查看 sidecar 日志' },
+				]
+				: [
+					{ label: '$(play) 启动 sidecar', description: '拉起受控浏览器与 uwa 服务' },
+					{ label: '$(output) 查看 sidecar 日志' },
+				];
+			const picked = await vscode.window.showQuickPick(items, {
+				title: `uwa sidecar · ${alive ? '运行中' : '未运行'}`,
+				placeHolder: alive ? `轮次 ${b?.turn ?? 0} · 状态 ${b?.state ?? 'IDLE'}` : '当前未运行',
+			});
+			if (!picked) { return; }
+			if (picked.label.includes('启动')) {
+				await vscode.commands.executeCommand('incontrol.bridge.startSidecar');
+			} else if (picked.label.includes('停止')) {
+				await vscode.commands.executeCommand('incontrol.bridge.stopSidecar');
+			} else if (picked.label.includes('重启')) {
+				await vscode.commands.executeCommand('incontrol.bridge.restartSidecar');
+			} else if (picked.label.includes('对话')) {
+				await vscode.commands.executeCommand('incontrol.bridge.showConversation');
+			} else {
+				output?.show();
+			}
+		}),
+
 		/** 需求 1：查看/打开当前绑定的网页对话 */
 		vscode.commands.registerCommand('incontrol.bridge.showConversation', async () => {
 			const b = bridge?.getBinding();
@@ -251,6 +334,7 @@ export async function activateBridge(
 	if (cfg.get<boolean>('autoStart') !== false) {
 		void (async () => {
 			const health = await sidecar!.start();
+			renderSidecarStatus(health.alive);
 			if (health.alive) {
 				log(`sidecar ready on :${health.port}`);
 			} else {
