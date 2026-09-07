@@ -75,3 +75,9 @@ extensions/incontrol/**/node_modules/
 # uwa sidecar python bytecode
 resources/uwa-sidecar/**/__pycache__/
 resources/uwa-sidecar/**/*.pyc
+
+# incontrol build output / generated
+extensions/incontrol/out/
+extensions/incontrol/src/.buildTimestamp.ts
+extensions/incontrol/packages/*/dist/
+extensions/incontrol/_tsc*.log

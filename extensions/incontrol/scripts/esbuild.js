@@ -23,9 +23,12 @@ const esbuildConfig = {
   entryPoints: ["src/extension.ts"],
   bundle: true,
   outfile: "out/extension.js",
+  // sqlite3 is aliased to @vscode/sqlite3, a native module. Native addons
+  // cannot be bundled: keep them external so they resolve at runtime from
+  // node_modules, where the prebuilt vscode-sqlite3.node lives.
   external: isProdBuild
-    ? ["vscode", "esbuild", "./xhr-sync-worker.js", "./llamaTokenizer.cjs"]
-    : ["vscode", "esbuild", "./xhr-sync-worker.js"],
+    ? ["vscode", "esbuild", "./xhr-sync-worker.js", "./llamaTokenizer.cjs", "sqlite3", "@vscode/sqlite3"]
+    : ["vscode", "esbuild", "./xhr-sync-worker.js", "sqlite3", "@vscode/sqlite3"],
   format: "cjs",
   platform: "node",
   sourcemap: flags.includes("--sourcemap"),
