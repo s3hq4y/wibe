@@ -1,0 +1,35 @@
+This plugin (en_logs) has been DISABLED on 2026-09-02 at the user's request
+("禁用一下英文日志" -> restore native Chinese console/file logs).
+
+What was done
+  1. Folder moved out of the loader scan path:
+        uwa-plugins/en_logs  ->  uwa-plugins/_disabled/en_logs
+     plugin_host/loader.py only imports direct child dirs of uwa-plugins/ that
+     contain plugin.json, so this folder is now skipped (no import error, no log).
+  2. Removed the "early hook" snippet from main.py (per this plugin's README,
+     uninstall requires removing it). The removed block was, verbatim:
+
+        # [UWA-PLUGIN] en_logs 早期接管：让启动初期的 app 初始化日志也输出英文
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "uwa-plugins"))
+        try:
+            from en_logs import install_early
+            install_early()
+        except Exception:
+            pass
+
+     It sat between "from contextlib import asynccontextmanager" and
+     "from app import __version__ as APP_VERSION" (was main.py lines 21-27).
+     Note: that sys.path.insert was redundant - plugin_host/loader.py already
+     puts uwa-plugins/ on sys.path itself, so history_mode is unaffected.
+
+No upstream source file was ever modified by this plugin; it only monkey-patched
+secure_logger at runtime, so nothing else needs reverting.
+
+To re-enable
+  Move-Item uwa-plugins\_disabled\en_logs uwa-plugins\en_logs
+  then re-insert the snippet above into main.py (before "from app import ...")
+  and restart the service.
+
+Verified after disabling: logs/app.log from the 21:04 restart onward contains
+native Chinese messages again, and the last "[en_logs] ... translation enabled"
+marker is from the earlier 20:53:33 run.

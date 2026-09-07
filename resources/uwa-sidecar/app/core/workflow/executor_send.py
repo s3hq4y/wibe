@@ -1,0 +1,1911 @@
+"""
+Send confirmation and attachment flow mixin for WorkflowExecutor.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Any, Dict, Optional
+
+from app.core.config import BrowserConstants, WorkflowError, logger
+from app.core.elements import ElementFinder
+from app.services.arena_image_generation import is_arena_page_url
+from .attachment_monitor import AttachmentMonitor
+
+
+class WorkflowExecutorSendMixin:
+    def _probe_attachment_readiness(self, send_selector: str = "") -> Dict[str, Any]:
+        """Inspect whether attachments are still uploading and whether send looks available."""
+        if self._attachment_monitor is not None:
+            try:
+                state = self._attachment_monitor.snapshot()
+                if not isinstance(state, dict):
+                    state = {}
+                state = dict(state)
+                phase_flags = AttachmentMonitor.derive_phase_flags(
+                    state,
+                    require_send_enabled=True,
+                    require_attachment_present=self._get_attachment_monitor_flag(
+                        "require_attachment_present",
+                        False,
+                    ),
+                    require_upload_signal_before_ready=self._get_attachment_monitor_flag(
+                        "require_upload_signal_before_ready",
+                        False,
+                    ),
+                )
+                state.update(phase_flags)
+                state["ready"] = bool(phase_flags.get("upload_ready"))
+                return state
+            except Exception as e:
+                logger.debug(f"[SEND] 附件状态探测失败: {e}")
+                return {
+                    "ok": False,
+                    "attachmentCount": 0,
+                    "pendingCount": 0,
+                    "pendingText": False,
+                    "sendFound": False,
+                    "sendDisabled": False,
+                    "sendBusy": False,
+                    "upload_started": False,
+                    "uploading": False,
+                    "attachment_present": False,
+                    "ready": True,
+                }
+        selector_json = json.dumps(self._to_query_selector(send_selector), ensure_ascii=False)
+        js = f"""
+        return (function() {{
+            try {{
+                const sendSelector = {selector_json};
+                const root = document.querySelector(
+                    '.message-input-wrapper, .message-input-container, .chat-layout-input-container, '
+                    + '#dropzone-container, form:has(button[type="submit"]), '
+                    + '[class*="message-input"], [class*="input-container"], [class*="input-wrapper"]'
+                );
+                if (!root) {{
+                    return {{
+                        ok: true,
+                        attachmentCount: 0,
+                        pendingCount: 0,
+                        pendingText: false,
+                        sendFound: false,
+                        sendDisabled: false,
+                        ready: true,
+                        skipped: 'no_input_root'
+                    }};
+                }}
+
+                const attachmentSelectors = [
+                    '.file-card-list',
+                    '.fileitem-btn',
+                    '.fileitem-file-name',
+                    '.fileitem-file-name-text',
+                    '.message-input-column-file',
+                    '[class*="fileitem"]',
+                    '[class*="image-preview"]',
+                    '[data-testid*="attachment"]',
+                    '[data-testid*="preview"]',
+                    'img[src^="blob:"]',
+                    'img[src^="data:image"]'
+                ].join(',');
+
+                const pendingSelectors = [
+                    'progress',
+                    '[role="progressbar"]',
+                    '[aria-busy="true"]',
+                    '[class*="uploading"]',
+                    '[class*="pending"]'
+                ].join(',');
+
+                const attachmentCount = root.querySelectorAll(attachmentSelectors).length;
+                const pendingCount = root.querySelectorAll(pendingSelectors).length;
+                const rootText = String(root.innerText || '').toLowerCase();
+                const pendingText = /上传中|处理中|loading|uploading|processing|preparing/.test(rootText);
+
+                let sendBtn = null;
+                if (sendSelector) {{
+                    try {{
+                        sendBtn = document.querySelector(sendSelector);
+                    }} catch (e) {{}}
+                }}
+
+                const sendDisabled = !!sendBtn && (
+                    !!sendBtn.disabled
+                    || sendBtn.getAttribute('aria-disabled') === 'true'
+                    || /disable(?:d)?|loading|uploading|sending/.test(String(sendBtn.className || '').toLowerCase())
+                );
+
+                return {{
+                    ok: true,
+                    attachmentCount,
+                    pendingCount,
+                    pendingText,
+                    sendFound: !!sendBtn,
+                    sendDisabled,
+                    ready: pendingCount === 0 && !pendingText && (!sendBtn || !sendDisabled)
+                }};
+            }} catch (error) {{
+                return {{
+                    ok: false,
+                    attachmentCount: 0,
+                    pendingCount: 0,
+                    pendingText: false,
+                    sendFound: false,
+                    sendDisabled: false,
+                    ready: true,
+                    error: String(error && error.message ? error.message : error)
+                }};
+            }}
+        }})();
+        """
+
+        try:
+            return self.tab.run_js(js) or {}
+        except Exception as e:
+            logger.debug(f"[SEND] 附件状态探测失败: {e}")
+            return {
+                "ok": False,
+                "attachmentCount": 0,
+                "pendingCount": 0,
+                "pendingText": False,
+                "sendFound": False,
+                "sendDisabled": False,
+                "upload_started": False,
+                "uploading": False,
+                "attachment_present": False,
+                "ready": True,
+            }
+
+    def _recent_attachment_age_seconds(self) -> Optional[float]:
+        """Seconds since the newest attachment upload completed, if known."""
+        timestamps = []
+
+        for handler, attr in (
+            (getattr(self, "_text_handler", None), "_recent_file_upload_at"),
+            (getattr(self, "_image_handler", None), "_recent_image_upload_at"),
+        ):
+            try:
+                ts = float(getattr(handler, attr, 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts > 0:
+                timestamps.append(ts)
+
+        if not timestamps:
+            return None
+        return max(0.0, time.time() - max(timestamps))
+
+    def _wait_for_attachments_ready_before_send(self, send_selector: str = ""):
+        """Wait for file/image uploads to settle before attempting submit."""
+        if not self._should_wait_for_attachments_before_send():
+            return
+
+        if self._attachment_monitor is not None:
+            max_wait = getattr(BrowserConstants, "ATTACHMENT_READY_MAX_WAIT", 20.0)
+            check_interval = getattr(BrowserConstants, "ATTACHMENT_READY_CHECK_INTERVAL", 0.35)
+            stable_window = getattr(BrowserConstants, "ATTACHMENT_READY_STABLE_WINDOW", 0.8)
+            recent_attachment_age = self._recent_attachment_age_seconds()
+            recent_file_upload = False
+            recent_image_upload = False
+            confirmed_file_upload = False
+            try:
+                recent_file_upload = bool(self._text_handler.has_recent_attachment_upload())
+            except Exception:
+                recent_file_upload = False
+            try:
+                recent_image_upload = bool(self._image_handler.has_recent_attachment_upload())
+            except Exception:
+                recent_image_upload = False
+            if not recent_image_upload:
+                context = getattr(self, "_context", None) or {}
+                recent_image_upload = bool(context.get("images"))
+            if recent_file_upload:
+                try:
+                    confirmed_file_upload = bool(self._text_handler.has_confirmed_upload_signal())
+                except Exception:
+                    confirmed_file_upload = False
+
+            reuse_existing_tracking = recent_attachment_age is not None
+            require_attachment_confirmation = recent_image_upload or (
+                recent_file_upload and not confirmed_file_upload
+            )
+            require_send_enabled = True
+            if recent_image_upload:
+                # Arena 等站点在图片预览已就绪后仍可能短暂维持 disabled，
+                # 这里放宽 gate，后续交给发送确认阶段判定是否真正发出。
+                require_send_enabled = False
+            if reuse_existing_tracking:
+                logger.debug(
+                    "[SEND] Recent attachment upload detected before submit; "
+                    f"reusing existing attachment tracking (age={recent_attachment_age:.1f}s)"
+                )
+            if recent_file_upload and confirmed_file_upload and not recent_image_upload:
+                logger.debug(
+                    "[SEND] Recent file-paste upload was strongly confirmed; "
+                    "send gate will only wait for pending/busy signals"
+                )
+            result = self._attachment_monitor.wait_until_ready(
+                require_observed=require_attachment_confirmation,
+                require_send_enabled=require_send_enabled,
+                accept_existing=not require_attachment_confirmation,
+                start_new_tracking=not reuse_existing_tracking,
+                max_wait=max_wait,
+                poll_interval=check_interval,
+                stable_window=stable_window,
+                require_attachment_present=require_attachment_confirmation,
+                label="send-gate",
+            )
+            if result.get("success"):
+                return
+
+            continue_once = self._get_attachment_monitor_flag(
+                "continue_once_on_unconfirmed_send",
+                True,
+            )
+            if not continue_once:
+                logger.warning(
+                    "[SEND] Attachment readiness was not confirmed before submit; blocking send "
+                    f"({AttachmentMonitor.summarize(result)})"
+                )
+                raise WorkflowError("attachment_ready_unconfirmed_before_send")
+            logger.warning(
+                "[SEND] Attachment readiness was not confirmed before submit; continuing once "
+                f"({AttachmentMonitor.summarize(result)})"
+            )
+            return
+
+        max_wait = getattr(BrowserConstants, "ATTACHMENT_READY_MAX_WAIT", 20.0)
+        check_interval = getattr(BrowserConstants, "ATTACHMENT_READY_CHECK_INTERVAL", 0.35)
+        settle_floor = getattr(BrowserConstants, "ATTACHMENT_POST_UPLOAD_SETTLE", 1.8)
+        try:
+            settle_floor = max(
+                settle_floor,
+                self._text_handler.get_post_upload_settle_seconds(settle_floor)
+            )
+        except Exception:
+            pass
+
+        upload_age = self._recent_attachment_age_seconds()
+        if upload_age is not None and upload_age < settle_floor:
+            remaining = settle_floor - upload_age
+            logger.debug(f"[SEND] 附件刚上传完成，额外等待解析稳定 {remaining:.1f}s")
+            elapsed = 0.0
+            while elapsed < remaining:
+                if self._check_cancelled():
+                    return
+                step = min(check_interval, remaining - elapsed)
+                time.sleep(step)
+                elapsed += step
+
+        state = self._probe_attachment_readiness(send_selector)
+        if state.get("ready", True):
+            return
+
+        logger.debug(
+            "[SEND] 检测到附件仍在处理，发送前等待 "
+            f"(attachments={state.get('attachmentCount', 0)}, "
+            f"pending={state.get('pendingCount', 0)}, "
+            f"send_disabled={state.get('sendDisabled', False)})"
+        )
+
+        elapsed = 0.0
+        while elapsed < max_wait:
+            if self._check_cancelled():
+                return
+
+            sleep_for = min(check_interval, max_wait - elapsed)
+            time.sleep(sleep_for)
+            elapsed += sleep_for
+
+            state = self._probe_attachment_readiness(send_selector)
+            if state.get("ready", True):
+                logger.debug(
+                    "[SEND] 附件已就绪，继续发送 "
+                    f"(waited={elapsed:.1f}s, attachments={state.get('attachmentCount', 0)})"
+                )
+                return
+
+        logger.warning(
+            "[SEND] 等待附件就绪超时，继续尝试发送 "
+            f"(attachments={state.get('attachmentCount', 0)}, "
+            f"pending={state.get('pendingCount', 0)}, "
+            f"send_disabled={state.get('sendDisabled', False)})"
+        )
+
+    def _should_wait_for_attachments_before_send(self) -> bool:
+        """Only wait when this request actually attached files or images."""
+        try:
+            if self._text_handler.has_recent_attachment_upload():
+                return True
+        except Exception:
+            pass
+
+        try:
+            if self._image_handler.has_recent_attachment_upload():
+                return True
+        except Exception:
+            pass
+
+        context = getattr(self, "_context", None) or {}
+        return bool(context.get("images"))
+
+    def _has_recent_attachment_upload(self) -> bool:
+        """Whether the current turn recently attached files/images before sending."""
+        try:
+            if self._text_handler.has_recent_attachment_upload():
+                return True
+        except Exception:
+            pass
+
+        try:
+            if self._image_handler.has_recent_attachment_upload():
+                return True
+        except Exception:
+            pass
+
+        context = getattr(self, "_context", None) or {}
+        return bool(context.get("images"))
+
+    def _get_send_confirmation_config(self) -> Dict[str, Any]:
+        """Return the merged send confirmation strategy for the current site."""
+        config = {
+            "attachment_sensitivity": "medium",
+            "post_click_observe_window": float(
+                getattr(BrowserConstants, "SEND_POST_CLICK_OBSERVE_WINDOW", 1.8)
+            ),
+            "pre_retry_probe_window": 0.12,
+            "retry_observe_window": float(
+                getattr(BrowserConstants, "SEND_RETRY_OBSERVE_WINDOW", 0.9)
+            ),
+            "retry_cooldown_window": 1.5,
+            "attachment_observe_window": float(
+                getattr(BrowserConstants, "ATTACHMENT_SEND_OBSERVE_WINDOW", 6.0)
+            ),
+            "retry_action": "click_send_btn",
+            "retry_key_combo": "Enter",
+            "trust_network_activity": True,
+            "trust_generating_indicator": True,
+            "trust_send_disabled_with_input_shrink": True,
+            "pre_send_interrupt_existing_generation": True,
+            "pre_send_interrupt_cooldown": 0.4,
+        }
+
+        raw_config = {}
+        if isinstance(self._stream_config, dict):
+            raw_config = self._stream_config.get("send_confirmation", {}) or {}
+        file_paste_config = self._get_file_paste_send_confirmation_config()
+        if isinstance(file_paste_config, dict):
+            raw_config = {
+                **(raw_config if isinstance(raw_config, dict) else {}),
+                **file_paste_config,
+            }
+
+        if isinstance(raw_config, dict):
+            config.update(raw_config)
+
+        return config
+
+    def _get_raw_send_confirmation_config(self) -> Dict[str, Any]:
+        """Return only the site-provided send confirmation overrides."""
+        raw_config: Dict[str, Any] = {}
+        if isinstance(self._stream_config, dict):
+            legacy_config = self._stream_config.get("send_confirmation", {}) or {}
+            if isinstance(legacy_config, dict):
+                raw_config.update(legacy_config)
+        file_paste_config = self._get_file_paste_send_confirmation_config()
+        if isinstance(file_paste_config, dict):
+            raw_config.update(file_paste_config)
+        return raw_config
+
+    def _get_send_confirmation_window(
+        self,
+        key: str,
+        fallback: float,
+        *,
+        min_value: float = 0.0,
+        max_value: Optional[float] = None,
+        raw_only: bool = False,
+    ) -> float:
+        """Read a numeric send confirmation option with clamping."""
+        config = self._get_raw_send_confirmation_config() if raw_only else self._get_send_confirmation_config()
+        try:
+            value = float(config.get(key, fallback))
+        except (TypeError, ValueError):
+            value = float(fallback)
+
+        value = max(min_value, value)
+        if max_value is not None:
+            value = min(value, max_value)
+        return value
+
+    def _get_send_confirmation_flag(
+        self,
+        key: str,
+        fallback: bool = True,
+        *,
+        raw_only: bool = False,
+    ) -> bool:
+        """Read a boolean send confirmation option."""
+        config = self._get_raw_send_confirmation_config() if raw_only else self._get_send_confirmation_config()
+        raw_value = config.get(key, fallback)
+
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, str):
+            lowered = raw_value.strip().lower()
+            if lowered in ("1", "true", "yes", "on"):
+                return True
+            if lowered in ("0", "false", "no", "off"):
+                return False
+        return bool(raw_value)
+
+    def _get_send_confirmation_int(
+        self,
+        key: str,
+        fallback: int,
+        *,
+        min_value: int = 0,
+        max_value: Optional[int] = None,
+        raw_only: bool = False,
+    ) -> int:
+        config = self._get_raw_send_confirmation_config() if raw_only else self._get_send_confirmation_config()
+        try:
+            value = int(config.get(key, fallback))
+        except (TypeError, ValueError):
+            value = int(fallback)
+        value = max(min_value, value)
+        if max_value is not None:
+            value = min(value, max_value)
+        return value
+
+    def _get_send_retry_action_config(self) -> Dict[str, str]:
+        """Resolve the action used when automatic send retry is triggered."""
+        config = self._get_send_confirmation_config()
+        retry_action = str(config.get("retry_action") or "click_send_btn").strip().lower()
+        if retry_action not in {"click_send_btn", "key_press"}:
+            retry_action = "click_send_btn"
+
+        retry_key_combo = str(config.get("retry_key_combo") or "Enter").strip() or "Enter"
+        return {
+            "retry_action": retry_action,
+            "retry_key_combo": retry_key_combo,
+        }
+
+    @staticmethod
+    def _is_send_post_click_confirmed(state: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(state, dict):
+            return False
+        return bool(
+            state.get("generating")
+            or state.get("sendLooksLikeStop")
+            or state.get("stopBtnFound")
+        )
+
+    def _is_arena_page(self) -> bool:
+        tab = getattr(self, "tab", None)
+        if tab is None:
+            return False
+        try:
+            url = str(getattr(tab, "url", "") or "")
+            if not url and hasattr(tab, "run_js"):
+                url = str(tab.run_js("return location.href") or "")
+        except Exception:
+            url = ""
+        return is_arena_page_url(url)
+
+    def _interrupt_arena_existing_generation(self) -> bool:
+        """Actively interrupt lingering generation on arena.ai before submitting new prompt."""
+        tab = getattr(self, "tab", None)
+        if tab is None or not hasattr(tab, "run_js"):
+            return False
+        stop_selector = ""
+        selectors = getattr(self, "_selectors", None)
+        if isinstance(selectors, dict):
+            stop_selector = self._to_query_selector(selectors.get("stop_btn", ""))
+        stop_selector_json = json.dumps(stop_selector, ensure_ascii=False)
+        script = f"""
+        return (function() {{
+            let clicked = false;
+            try {{
+                if (window.__arenaHardStop && typeof window.__arenaHardStop.stop === 'function') {{
+                    window.__arenaHardStop.stop();
+                    clicked = true;
+                }}
+            }} catch (_) {{}}
+            const configuredSelector = {stop_selector_json};
+            const selectors = [
+                configuredSelector,
+                'button[aria-label="Stop generation"]',
+                'button[aria-label*="Stop"]',
+                'button[aria-label*="stop"]',
+                'button[aria-label*="停止"]',
+                '[data-arena-hard-stop-overlay="true"]'
+            ].filter(Boolean);
+            const clickedElements = new Set();
+            for (const sel of selectors) {{
+                try {{
+                    const btns = document.querySelectorAll(sel);
+                    for (const btn of btns) {{
+                        if (clickedElements.has(btn)) continue;
+                        const style = window.getComputedStyle ? window.getComputedStyle(btn) : null;
+                        const visible = !style || (style.display !== 'none' && style.visibility !== 'hidden');
+                        const rect = btn.getBoundingClientRect ? btn.getBoundingClientRect() : null;
+                        if (visible && rect && rect.width > 0 && rect.height > 0) {{
+                            btn.click();
+                            clickedElements.add(btn);
+                            clicked = true;
+                        }}
+                    }}
+                }} catch (_) {{}}
+            }}
+            return clicked;
+        }})();
+        """
+        try:
+            return bool(tab.run_js(script))
+        except Exception as exc:
+            logger.debug(f"[SEND] Arena 主动打断执行异常: {exc}")
+            return False
+
+    def _wait_for_send_idle_before_action(self, send_selector: str) -> bool:
+        """Wait out or interrupt generation owned by an earlier action before submitting this prompt."""
+        state = self._probe_send_post_click_state(send_selector)
+        if not self._is_send_post_click_confirmed(state):
+            return True
+
+        if self._is_arena_page():
+            interrupt_enabled = self._get_send_confirmation_flag(
+                "pre_send_interrupt_existing_generation",
+                True,
+                raw_only=True,
+            )
+            if interrupt_enabled:
+                logger.warning(
+                    "[SEND] 发送前检测到 Arena 页面仍处于旧生成/停止态，"
+                    "执行主动 Stop 打断以准备本次发送"
+                )
+                interrupted = self._interrupt_arena_existing_generation()
+                if interrupted:
+                    cooldown = self._get_send_confirmation_window(
+                        "pre_send_interrupt_cooldown",
+                        0.4,
+                        min_value=0.1,
+                        max_value=3.0,
+                        raw_only=True,
+                    )
+                    time.sleep(cooldown)
+                    if self._check_cancelled():
+                        return False
+                    state = self._probe_send_post_click_state(send_selector)
+                    if not self._is_send_post_click_confirmed(state):
+                        logger.info("[SEND] Arena 旧生成态已成功打断并恢复空闲，继续提交本次消息")
+                        return True
+                    logger.debug("[SEND] Arena 主动打断后页面尚未完全就绪，继续进入常规等待流程")
+
+        wait_timeout = self._get_send_confirmation_window(
+            "pre_send_idle_timeout",
+            120.0,
+            min_value=0.0,
+            max_value=300.0,
+            raw_only=True,
+        )
+        logger.warning(
+            "[SEND] 发送前检测到页面仍处于旧生成/停止态，"
+            f"等待其结束后再提交本次消息 (timeout={wait_timeout:.1f}s)"
+        )
+        deadline = time.time() + wait_timeout
+        while time.time() < deadline:
+            if self._check_cancelled():
+                return False
+            time.sleep(min(0.25, max(0.0, deadline - time.time())))
+            state = self._probe_send_post_click_state(send_selector)
+            if not self._is_send_post_click_confirmed(state):
+                logger.info("[SEND] 旧生成态已结束，继续提交本次消息")
+                return True
+
+        logger.error(
+            "[SEND] 等待旧生成态结束超时，本次发送动作尚未执行，"
+            "不会把旧生成状态误判为发送成功"
+        )
+        raise WorkflowError("send_blocked_by_preexisting_generation")
+
+    @staticmethod
+    def _require_send_action_dispatched(dispatched: Any) -> None:
+        """Reject confirmation when the click layer explicitly skipped submission."""
+        if dispatched is not False:
+            return
+        logger.error(
+            "[SEND] 本次发送动作未执行，禁止使用页面已有的生成/停止态确认发送成功"
+        )
+        raise WorkflowError("send_action_not_dispatched")
+
+    def _get_recent_fill_expected_text_length(self, max_age: float = 12.0) -> int:
+        try:
+            completed_at = float(getattr(self, "_last_fill_completed_at", 0.0) or 0.0)
+        except Exception:
+            completed_at = 0.0
+        if completed_at <= 0:
+            return 0
+
+        fill_age = time.time() - completed_at
+        if fill_age < 0 or fill_age > max(0.0, float(max_age or 0.0)):
+            return 0
+
+        try:
+            return max(0, int(getattr(self, "_last_fill_text_length", 0) or 0))
+        except Exception:
+            return 0
+
+    def _read_stable_send_input_len(
+        self,
+        target_key: str,
+        *,
+        settle_attempts: int = 2,
+        settle_interval: float = 0.05,
+        use_recent_fill_hint: bool = False,
+    ) -> int:
+        length = self._safe_get_input_len_by_key(target_key)
+        if length > 0:
+            return length
+
+        attempts = max(1, int(settle_attempts))
+        interval = max(0.0, float(settle_interval or 0.0))
+        expected_len = (
+            self._get_recent_fill_expected_text_length()
+            if use_recent_fill_hint and (target_key or "") == "input_box"
+            else 0
+        )
+        if expected_len > 0:
+            attempts = max(attempts, 5 if expected_len < 20000 else 8)
+            interval = max(interval, 0.08)
+
+        for _ in range(attempts - 1):
+            if self._check_cancelled():
+                return length
+            if interval > 0:
+                time.sleep(interval)
+            length = self._safe_get_input_len_by_key(target_key)
+            if length > 0:
+                return length
+        return length
+
+    def _format_send_retry_action(self, retry_action_config: Optional[Dict[str, str]] = None) -> str:
+        config = retry_action_config or self._get_send_retry_action_config()
+        retry_action = str(config.get("retry_action") or "click_send_btn").strip().lower()
+        if retry_action == "key_press":
+            return f"KEY_PRESS({config.get('retry_key_combo') or 'Enter'})"
+        return "CLICK(send_btn)"
+
+    def _wait_before_send_retry(
+        self,
+        *,
+        last_send_action_at: float,
+        retry_interval: float,
+        cooldown_window: float,
+        deadline: Optional[float] = None,
+    ) -> bool:
+        """Wait before a retry so slow UIs are not double-clicked immediately."""
+        interval_wait = max(0.0, float(retry_interval or 0.0))
+        cooldown_wait = 0.0
+        if cooldown_window > 0 and last_send_action_at > 0:
+            cooldown_wait = max(0.0, float(cooldown_window) - (time.time() - last_send_action_at))
+
+        wait_for = max(interval_wait, cooldown_wait)
+        if deadline is not None:
+            wait_for = min(wait_for, max(0.0, float(deadline) - time.time()))
+
+        if wait_for <= 0:
+            return True
+
+        if cooldown_wait > interval_wait + 0.01:
+            logger.debug(f"[SEND] 发送重试冷却等待 {cooldown_wait:.2f}s")
+
+        end_at = time.time() + wait_for
+        while time.time() < end_at:
+            if self._check_cancelled():
+                return False
+            time.sleep(min(0.1, max(0.0, end_at - time.time())))
+        return True
+
+    def _execute_send_retry_action(
+        self,
+        selector: str,
+        target_key: str,
+        optional: bool,
+        *,
+        retry_action_config: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        config = retry_action_config or self._get_send_retry_action_config()
+        retry_action = str(config.get("retry_action") or "click_send_btn").strip().lower()
+        if self._network_monitor is not None:
+            self._network_monitor.mark_send_attempt()
+
+        if retry_action == "key_press":
+            key_combo = str(config.get("retry_key_combo") or "Enter").strip() or "Enter"
+            self._execute_keypress_combo(key_combo)
+            return True
+
+        return self._execute_click(selector, target_key, optional)
+
+    def _get_attachment_send_confirmation_profile(self) -> Dict[str, Any]:
+        """Resolve the 3-level attachment send sensitivity profile."""
+        raw_value = str(
+            self._get_raw_send_confirmation_config().get("attachment_sensitivity")
+            or self._get_send_confirmation_config().get("attachment_sensitivity")
+            or "medium"
+        ).strip().lower()
+        level = raw_value if raw_value in {"low", "medium", "high"} else "medium"
+
+        profiles = {
+            "low": {
+                "attachment_observe_window": 4.0,
+                "trust_network_activity": True,
+                "trust_generating_indicator": True,
+                "trust_send_disabled_with_input_shrink": False,
+            },
+            "medium": {
+                "attachment_observe_window": 6.0,
+                "trust_network_activity": True,
+                "trust_generating_indicator": True,
+                "trust_send_disabled_with_input_shrink": True,
+            },
+            "high": {
+                "attachment_observe_window": 8.0,
+                "trust_network_activity": True,
+                "trust_generating_indicator": True,
+                "trust_send_disabled_with_input_shrink": True,
+            },
+        }
+        return {
+            "level": level,
+            **profiles[level],
+        }
+
+    @staticmethod
+    def _to_query_selector(selector: Any) -> str:
+        """Convert a configured selector into querySelector-compatible CSS when possible."""
+        value = str(selector or "").strip()
+        if not value:
+            return ""
+
+        groups = ElementFinder._split_css_selector_groups(value)
+        if len(groups) > 1:
+            valid_groups = []
+            for group in groups:
+                css_group = WorkflowExecutorSendMixin._to_query_selector(group)
+                if css_group:
+                    valid_groups.append(css_group)
+            return ", ".join(valid_groups)
+
+        lowered = value.lower()
+        if lowered.startswith("css:"):
+            return value[4:].strip()
+
+        if lowered.startswith(("xpath:", "tag:")) or value.startswith("@") or "@@" in value:
+            return ""
+
+        return value
+
+    def _probe_send_post_click_state(self, send_selector: str = "") -> Dict[str, Any]:
+        """Passively inspect whether the page has transitioned into generating state."""
+        selector_json = json.dumps(self._to_query_selector(send_selector), ensure_ascii=False)
+        generating_selector = ""
+        stop_btn_selector = ""
+        selectors = getattr(self, "_selectors", None)
+        if isinstance(selectors, dict):
+            generating_selector = self._to_query_selector(
+                selectors.get("generating_indicator", "")
+            )
+            stop_btn_selector = self._to_query_selector(
+                selectors.get("stop_btn", "")
+            )
+        generating_selector_json = json.dumps(generating_selector, ensure_ascii=False)
+        stop_btn_selector_json = json.dumps(stop_btn_selector, ensure_ascii=False)
+        js = f"""
+        return (function() {{
+            try {{
+                const sendSelector = {selector_json};
+                const configuredGeneratingSelector = {generating_selector_json};
+                const configuredStopSelector = {stop_btn_selector_json};
+                const indicators = [
+                    configuredGeneratingSelector,
+                    configuredStopSelector,
+                    'button[aria-label*="Stop"]',
+                    'button[aria-label*="stop"]',
+                    'button[aria-label*="停止"]',
+                    '[data-state="streaming"]',
+                    '.stop-generating'
+                ].filter(Boolean);
+
+                function lowered(value) {{
+                    return String(value || '').toLowerCase();
+                }}
+
+                function getNodeClassName(node) {{
+                    if (!node) return '';
+                    if (typeof node.className === 'string') return node.className;
+                    if (node.className && typeof node.className.baseVal === 'string') return node.className.baseVal;
+                    return '';
+                }}
+
+                function isVisible(node) {{
+                    if (!node) return false;
+                    const style = window.getComputedStyle ? window.getComputedStyle(node) : null;
+                    if (style && (style.display === 'none' || style.visibility === 'hidden')) {{
+                        return false;
+                    }}
+                    const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+                    return !rect || (rect.width > 0 && rect.height > 0);
+                }}
+
+                function extractNodeInfo(node, label) {{
+                    if (!node) return null;
+                    const visible = isVisible(node);
+                    return {{
+                        label: label || '',
+                        tag: node.tagName || '',
+                        type: node.getAttribute ? (node.getAttribute('type') || '') : '',
+                        id: node.id || '',
+                        className: getNodeClassName(node).slice(0, 100),
+                        ariaLabel: node.getAttribute ? (node.getAttribute('aria-label') || '') : '',
+                        title: node.getAttribute ? (node.getAttribute('title') || '') : '',
+                        dataTestid: node.getAttribute ? (node.getAttribute('data-testid') || '') : '',
+                        disabled: !!node.disabled || (node.getAttribute ? node.getAttribute('aria-disabled') === 'true' : false),
+                        text: (node.innerText || node.textContent || '').trim().slice(0, 50),
+                        visible: visible
+                    }};
+                }}
+
+                const details = [];
+
+                let sendBtn = null;
+                if (sendSelector) {{
+                    try {{
+                        sendBtn = document.querySelector(sendSelector);
+                        if (sendBtn) {{
+                            details.push(extractNodeInfo(sendBtn, 'send_btn'));
+                        }}
+                    }} catch (e) {{}}
+                }}
+
+                let stopBtnNode = null;
+                let stopBtnFound = false;
+                if (configuredStopSelector) {{
+                    try {{
+                        const nodes = document.querySelectorAll(configuredStopSelector);
+                        for (const n of nodes) {{
+                            const info = extractNodeInfo(n, 'configured_stop_btn');
+                            if (info) details.push(info);
+                            if (info && info.visible) {{
+                                stopBtnNode = n;
+                                stopBtnFound = true;
+                                break;
+                            }}
+                        }}
+                    }} catch (e) {{}}
+                }}
+
+                let configuredGenFound = false;
+                if (configuredGeneratingSelector) {{
+                    try {{
+                        const nodes = document.querySelectorAll(configuredGeneratingSelector);
+                        for (const n of nodes) {{
+                            const info = extractNodeInfo(n, 'configured_generating_indicator');
+                            if (info) details.push(info);
+                            if (info && info.visible) {{
+                                configuredGenFound = true;
+                                break;
+                            }}
+                        }}
+                    }} catch (e) {{}}
+                }}
+
+                const sendMeta = sendBtn ? [
+                    sendBtn.getAttribute ? sendBtn.getAttribute('aria-label') : '',
+                    sendBtn.getAttribute ? sendBtn.getAttribute('title') : '',
+                    sendBtn.getAttribute ? sendBtn.getAttribute('data-testid') : '',
+                    getNodeClassName(sendBtn),
+                    sendBtn.innerText,
+                    sendBtn.textContent
+                ].map(lowered).join(' ') : '';
+
+                let matchedIndicatorSelector = '';
+                const generatingIndicator = indicators.some(selector => {{
+                    try {{
+                        const nodes = document.querySelectorAll(selector);
+                        for (const node of nodes) {{
+                            if (isVisible(node)) {{
+                                matchedIndicatorSelector = selector;
+                                const info = extractNodeInfo(node, 'matched_indicator:' + selector);
+                                if (info) details.push(info);
+                                return true;
+                            }}
+                        }}
+                        return false;
+                    }} catch (e) {{
+                        return false;
+                    }}
+                }});
+
+                const sendLooksLikeStop = !!sendMeta && (
+                    /\bstop\b|\bstopping\b|\bcancel\b|\babort\b/.test(sendMeta)
+                    || /停止|中止|取消/.test(sendMeta)
+                );
+
+                const sendDisabled = !!sendBtn && (
+                    !!sendBtn.disabled
+                    || (sendBtn.getAttribute ? sendBtn.getAttribute('aria-disabled') === 'true' : false)
+                    || /disable(?:d)?|loading|uploading|sending/.test(sendMeta)
+                );
+
+                // 搜集页面上可见的相关按钮快照（最多 8 个），用于详细日志排查
+                const visibleButtons = [];
+                try {{
+                    const allBtns = document.querySelectorAll('button, [role="button"]');
+                    let count = 0;
+                    for (const btn of allBtns) {{
+                        if (isVisible(btn)) {{
+                            visibleButtons.push(extractNodeInfo(btn, 'page_button'));
+                            count++;
+                            if (count >= 8) break;
+                        }}
+                    }}
+                }} catch (e) {{}}
+
+                const isGenerating = stopBtnFound || configuredGenFound || generatingIndicator || sendLooksLikeStop;
+
+                return {{
+                    ok: true,
+                    sendFound: !!sendBtn,
+                    sendDisabled,
+                    sendLooksLikeStop,
+                    stopBtnFound,
+                    configuredGenFound,
+                    matchedIndicatorSelector,
+                    generating: isGenerating,
+                    details: details,
+                    visibleButtons: visibleButtons
+                }};
+            }} catch (error) {{
+                return {{
+                    ok: false,
+                    sendFound: false,
+                    sendDisabled: false,
+                    sendLooksLikeStop: false,
+                    stopBtnFound: false,
+                    configuredGenFound: false,
+                    generating: false,
+                    error: String(error && error.message ? error.message : error),
+                    details: [],
+                    visibleButtons: []
+                }};
+            }}
+        }})();
+        """
+
+        try:
+            res = self.tab.run_js(js) or {}
+            logger.debug(
+                f"[SEND] 探测页面状态: generating={res.get('generating')}, "
+                f"stopBtnFound={res.get('stopBtnFound')}, "
+                f"sendLooksLikeStop={res.get('sendLooksLikeStop')}, "
+                f"sendFound={res.get('sendFound')}, "
+                f"matchedIndicator={res.get('matchedIndicatorSelector')!r}"
+            )
+            return res
+        except Exception as e:
+            logger.debug(f"[SEND] 发送后状态探测失败: {e}")
+            return {
+                "ok": False,
+                "sendFound": False,
+                "sendDisabled": False,
+                "sendLooksLikeStop": False,
+                "stopBtnFound": False,
+                "generating": False,
+                "details": [],
+                "visibleButtons": [],
+            }
+
+    def _observe_send_without_retry(
+        self,
+        send_selector: str,
+        before_len: int,
+        *,
+        max_wait: Optional[float] = None,
+        trust_network_activity: Optional[bool] = None,
+        trust_generating_indicator: Optional[bool] = None,
+        trust_send_disabled_with_input_shrink: Optional[bool] = None,
+    ) -> bool:
+        """Observe post-click send signals without issuing another click."""
+        observe_window = self._get_send_confirmation_window(
+            "attachment_observe_window",
+            getattr(BrowserConstants, "ATTACHMENT_SEND_OBSERVE_WINDOW", 6.0),
+            min_value=0.0,
+            max_value=60.0,
+        ) if max_wait is None else float(max_wait)
+        if trust_network_activity is None:
+            trust_network_activity = self._get_send_confirmation_flag(
+                "trust_network_activity",
+                True,
+            )
+        if trust_generating_indicator is None:
+            trust_generating_indicator = self._get_send_confirmation_flag(
+                "trust_generating_indicator",
+                True,
+            )
+        if trust_send_disabled_with_input_shrink is None:
+            trust_send_disabled_with_input_shrink = self._get_send_confirmation_flag(
+                "trust_send_disabled_with_input_shrink",
+                True,
+            )
+        if observe_window <= 0:
+            return False
+        poll_interval = 0.25
+        elapsed = 0.0
+        last_len = before_len
+
+        while elapsed < observe_window:
+            if self._check_cancelled():
+                return True
+
+            step = min(poll_interval, observe_window - elapsed)
+            network_state = {"matched": False}
+            if self._network_monitor is not None:
+                try:
+                    network_state = self._network_monitor.poll_send_activity(timeout=step) or {"matched": False}
+                except Exception as e:
+                    logger.debug_throttled(
+                        "send.network_pre_read_failed",
+                        f"[SEND] 网络活动预读失败: {e}",
+                        interval_sec=5.0,
+                    )
+                    time.sleep(step)
+            else:
+                time.sleep(step)
+            elapsed += step
+
+            if trust_network_activity and network_state.get("matched"):
+                logger.debug(
+                    "[SEND] 已通过网络监听捕获到发送后的目标流事件 "
+                    f"(source={network_state.get('source') or '-'}, "
+                    f"targets={network_state.get('running_targets', 0)}, "
+                    f"requests={network_state.get('running_requests', 0)})"
+                )
+                return True
+
+            current_len = self._read_stable_send_input_len("input_box")
+            if self._is_send_success(before_len, current_len) or self._is_send_success(last_len, current_len):
+                return True
+
+            state = self._probe_send_post_click_state(send_selector)
+            if trust_generating_indicator and self._is_send_post_click_confirmed(state):
+                return True
+
+            if (
+                trust_send_disabled_with_input_shrink
+                and state.get("sendDisabled")
+                and current_len < before_len
+            ):
+                return True
+
+            last_len = current_len
+
+        return False
+
+    def _probe_attachment_state_probe(self, state: Optional[Dict[str, Any]], stage: str) -> Dict[str, Any]:
+        if self._attachment_monitor is None:
+            return {
+                "enabled": False,
+                "ok": False,
+                "hit": False,
+                "result": {},
+                "summary": "",
+            }
+        try:
+            return self._attachment_monitor.run_state_probe(state=state, stage=stage)
+        except Exception as e:
+            logger.debug(f"[SEND] 附件 state probe 执行失败 ({stage}): {e}")
+            return {
+                "enabled": True,
+                "ok": False,
+                "hit": False,
+                "result": {},
+                "summary": str(e)[:240],
+            }
+
+    def _build_send_attempt_state(
+        self,
+        *,
+        send_selector: str,
+        before_len: int,
+        after_len: int,
+        baseline_attachment_state: Optional[Dict[str, Any]] = None,
+        attachment_state: Optional[Dict[str, Any]] = None,
+        network_state: Optional[Dict[str, Any]] = None,
+        post_click_state: Optional[Dict[str, Any]] = None,
+        probe_info: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        base_attachment_state = dict(baseline_attachment_state or {})
+        current_attachment_state = dict(attachment_state or {})
+        def _to_int(v: Any) -> int:
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        attachment_delta = {
+            "attachmentCount": _to_int(current_attachment_state.get("attachmentCount", 0))
+            - _to_int(base_attachment_state.get("attachmentCount", 0)),
+            "previewCount": _to_int(current_attachment_state.get("previewCount", 0))
+            - _to_int(base_attachment_state.get("previewCount", 0)),
+            "fileInputCount": _to_int(current_attachment_state.get("fileInputCount", 0))
+            - _to_int(base_attachment_state.get("fileInputCount", 0)),
+        }
+        attachment_changed = bool(
+            current_attachment_state.get("attachmentFingerprint")
+            and current_attachment_state.get("attachmentFingerprint") != base_attachment_state.get("attachmentFingerprint")
+        ) or any(delta != 0 for delta in attachment_delta.values())
+        attachment_disappeared = bool(
+            AttachmentMonitor._attachment_present(base_attachment_state)
+            and not AttachmentMonitor._attachment_present(current_attachment_state)
+        )
+
+        state = {
+            "before_input_length": int(before_len or 0),
+            "after_input_length": int(after_len or 0),
+            "input_shrunk": int(after_len or 0) < int(before_len or 0),
+            "attachment_before": base_attachment_state,
+            "attachment_after": current_attachment_state,
+            "attachment_delta": attachment_delta,
+            "attachment_changed_after_send": attachment_changed,
+            "attachment_disappeared_after_send": attachment_disappeared,
+            "network": dict(network_state or {}),
+            "post_click": dict(post_click_state or {}),
+            "probe": dict(probe_info or {}),
+        }
+
+        accepted_signals = []
+        if state["input_shrunk"]:
+            accepted_signals.append("input_shrunk")
+        if bool((state["network"] or {}).get("matched")):
+            accepted_signals.append("network_activity")
+        if bool((state["post_click"] or {}).get("generating")):
+            accepted_signals.append("generating")
+        if bool((state["post_click"] or {}).get("stopBtnFound")):
+            accepted_signals.append("stop_btn_found")
+        if bool((state["post_click"] or {}).get("sendLooksLikeStop")):
+            accepted_signals.append("send_became_stop")
+        if bool((state["post_click"] or {}).get("sendDisabled")) and state["input_shrunk"]:
+            accepted_signals.append("send_disabled_with_input_shrink")
+        if attachment_changed:
+            accepted_signals.append("attachment_changed")
+        if attachment_disappeared:
+            accepted_signals.append("attachment_disappeared")
+        probe_result = (probe_info or {}).get("result") if isinstance(probe_info, dict) else {}
+        if isinstance(probe_result, dict) and bool(probe_result.get("accepted")):
+            accepted_signals.append("probe_accepted")
+        if isinstance(probe_result, dict) and bool(probe_result.get("confirmed")):
+            accepted_signals.append("probe_confirmed")
+        if isinstance(probe_result, dict) and bool(probe_result.get("retry")):
+            state["probe_retry"] = True
+        if isinstance(probe_result, dict) and bool(probe_result.get("uploading")):
+            state["probe_uploading"] = True
+        if isinstance(probe_result, dict) and bool(probe_result.get("ready")):
+            state["probe_ready"] = True
+
+        state["accepted_signals"] = accepted_signals
+        state["accepted"] = bool(accepted_signals)
+        return state
+
+    @staticmethod
+    def _format_send_attempt_state(attempt_state: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(attempt_state, dict) or not attempt_state:
+            return "state=-"
+
+        accepted_signals = [
+            str(item).strip()
+            for item in (attempt_state.get("accepted_signals") or [])
+            if str(item).strip()
+        ]
+        signals_text = "|".join(accepted_signals) if accepted_signals else "-"
+        post_click = attempt_state.get("post_click") or {}
+        network = attempt_state.get("network") or {}
+        attachment_delta = attempt_state.get("attachment_delta") or {}
+        probe = attempt_state.get("probe") or {}
+        probe_result = probe.get("result") if isinstance(probe, dict) else {}
+
+        probe_flags = []
+        if isinstance(probe_result, dict):
+            for key, label in (
+                ("retry", "retry"),
+                ("accepted", "accepted"),
+                ("confirmed", "confirmed"),
+                ("uploading", "uploading"),
+                ("ready", "ready"),
+            ):
+                if probe_result.get(key):
+                    probe_flags.append(label)
+
+        parts = [
+            f"signals={signals_text}",
+            f"input={int(attempt_state.get('before_input_length') or 0)}->{int(attempt_state.get('after_input_length') or 0)}",
+            f"network={bool(network.get('matched'))}",
+            f"network_source={str(network.get('source') or '-')}",
+            f"generating={bool(post_click.get('generating'))}",
+            f"stop={bool(post_click.get('sendLooksLikeStop'))}",
+            f"disabled={bool(post_click.get('sendDisabled'))}",
+            "attachment_delta="
+            f"a{int(attachment_delta.get('attachmentCount', 0) or 0)}/"
+            f"p{int(attachment_delta.get('previewCount', 0) or 0)}/"
+            f"f{int(attachment_delta.get('fileInputCount', 0) or 0)}",
+        ]
+
+        if probe_flags:
+            parts.append(f"probe={'+'.join(probe_flags)}")
+
+        probe_summary = str(probe.get("summary") or "").strip() if isinstance(probe, dict) else ""
+        if probe_summary:
+            parts.append(f"probe_summary={probe_summary[:80]}")
+
+        return ", ".join(parts)
+
+    def _evaluate_attachment_retry_decision(
+        self,
+        attempt_state: Dict[str, Any],
+        *,
+        retry_index: int,
+        max_retry_count: int,
+    ) -> Dict[str, Any]:
+        decision = {
+            "should_retry": False,
+            "reason": "unknown",
+        }
+
+        if retry_index >= max_retry_count:
+            decision["reason"] = f"max_retry_count_reached({retry_index}/{max_retry_count})"
+            return decision
+
+        retry_on_unconfirmed = self._get_send_confirmation_flag(
+            "retry_on_unconfirmed_send",
+            True,
+            raw_only=True,
+        )
+        if not retry_on_unconfirmed:
+            decision["reason"] = "retry_disabled"
+            return decision
+
+        if self._get_send_confirmation_flag("retry_block_if_generating", True, raw_only=True):
+            if bool((attempt_state.get("post_click") or {}).get("generating")):
+                decision["reason"] = "page_generating"
+                return decision
+
+        if self._get_send_confirmation_flag("retry_block_on_stop_button", True, raw_only=True):
+            if bool((attempt_state.get("post_click") or {}).get("sendLooksLikeStop")):
+                decision["reason"] = "send_button_became_stop"
+                return decision
+
+        probe_result = (attempt_state.get("probe") or {}).get("result") if isinstance(attempt_state.get("probe"), dict) else {}
+        if isinstance(probe_result, dict):
+            if probe_result.get("shouldRetry") is False:
+                decision["reason"] = "probe_blocked_retry"
+                return decision
+            if probe_result.get("retry") is True:
+                decision["should_retry"] = True
+                decision["reason"] = "probe_requested_retry"
+                return decision
+            if probe_result.get("accepted") is True or probe_result.get("confirmed") is True:
+                decision["reason"] = "probe_confirmed_send"
+                return decision
+
+        if bool((attempt_state.get("network") or {}).get("matched")):
+            decision["reason"] = "network_activity_seen"
+            return decision
+
+        if bool(attempt_state.get("accepted")):
+            accepted_signals = attempt_state.get("accepted_signals") or []
+            if self._get_send_confirmation_flag("accept_attachment_change", False, raw_only=True):
+                if "attachment_changed" in accepted_signals:
+                    decision["reason"] = "attachment_changed_accepted"
+                    return decision
+            if self._get_send_confirmation_flag("accept_attachment_disappear", False, raw_only=True):
+                if "attachment_disappeared" in accepted_signals:
+                    decision["reason"] = "attachment_disappeared_accepted"
+                    return decision
+            if self._get_send_confirmation_flag("accept_probe_confirmation", True, raw_only=True):
+                if any(
+                    signal in accepted_signals
+                    for signal in ("probe_accepted", "probe_confirmed")
+                ):
+                    decision["reason"] = "probe_confirmed_send"
+                    return decision
+            if "input_shrunk" in accepted_signals:
+                decision["reason"] = "input_shrunk"
+                return decision
+            if "generating" in accepted_signals:
+                decision["reason"] = "page_generating"
+                return decision
+            if "send_became_stop" in accepted_signals:
+                decision["reason"] = "send_button_became_stop"
+                return decision
+            if "network_activity" in accepted_signals:
+                decision["reason"] = "network_activity_seen"
+                return decision
+            if "send_disabled_with_input_shrink" in accepted_signals:
+                decision["reason"] = "send_disabled_with_input_shrink"
+                return decision
+            decision["reason"] = f"accepted_signal:{'|'.join(str(item) for item in accepted_signals)}"
+            return decision
+
+        decision["should_retry"] = True
+        decision["reason"] = "unconfirmed_no_success_signal"
+        return decision
+
+    def _execute_click_send_reliably(self, selector: str, target_key: str, optional: bool):
+        """
+        可靠发送（v5.6 隐身模式增强版）
+
+        - 隐身模式：零 JS 注入，盲等待+重试
+        - 普通模式：保持 JS 检查逻辑
+        """
+        if self._check_cancelled():
+            return
+
+        # ===== 隐身模式：无 JS 注入路径 =====
+        if self.stealth_mode:
+            self._execute_click_send_stealth(selector, target_key, optional)
+            return
+
+        # ===== 普通模式：原有逻辑 =====
+        max_wait = getattr(BrowserConstants, "IMAGE_SEND_MAX_WAIT", 12.0)
+        avoid_repeat_click = self._has_recent_attachment_upload()
+        attachment_profile = self._get_attachment_send_confirmation_profile()
+        max_retry_count = self._get_send_confirmation_int(
+            "max_retry_count",
+            2,
+            min_value=0,
+            max_value=10,
+            raw_only=True,
+        )
+        retry_interval = self._get_send_confirmation_window(
+            "retry_interval",
+            getattr(BrowserConstants, "IMAGE_SEND_RETRY_INTERVAL", 0.6),
+            min_value=0.0,
+            max_value=max_wait,
+            raw_only=True,
+        )
+        retry_cooldown_window = self._get_send_confirmation_window(
+            "retry_cooldown_window",
+            1.5,
+            min_value=0.0,
+            max_value=max_wait,
+            raw_only=True,
+        )
+        send_observe_window = self._get_send_confirmation_window(
+            "post_click_observe_window",
+            getattr(BrowserConstants, "SEND_POST_CLICK_OBSERVE_WINDOW", 1.8),
+            min_value=0.0,
+            max_value=max_wait,
+        )
+        retry_probe_window = self._get_send_confirmation_window(
+            "pre_retry_probe_window",
+            0.12,
+            min_value=0.0,
+            max_value=max_wait,
+        )
+        retry_observe_window = self._get_send_confirmation_window(
+            "retry_observe_window",
+            getattr(BrowserConstants, "SEND_RETRY_OBSERVE_WINDOW", 0.9),
+            min_value=0.0,
+            max_value=max_wait,
+        )
+        attachment_observe_window = self._get_send_confirmation_window(
+            "attachment_observe_window",
+            attachment_profile["attachment_observe_window"],
+            min_value=0.0,
+            max_value=max_wait,
+            raw_only=True,
+        )
+        attachment_trust_network_activity = self._get_send_confirmation_flag(
+            "trust_network_activity",
+            attachment_profile["trust_network_activity"],
+            raw_only=True,
+        )
+        attachment_trust_generating_indicator = self._get_send_confirmation_flag(
+            "trust_generating_indicator",
+            attachment_profile["trust_generating_indicator"],
+            raw_only=True,
+        )
+        attachment_trust_send_disabled_with_input_shrink = self._get_send_confirmation_flag(
+            "trust_send_disabled_with_input_shrink",
+            attachment_profile["trust_send_disabled_with_input_shrink"],
+            raw_only=True,
+        )
+        retry_action_config = self._get_send_retry_action_config()
+        retry_action_desc = self._format_send_retry_action(retry_action_config)
+        trust_generating_indicator = self._get_send_confirmation_flag(
+            "trust_generating_indicator",
+            True,
+        )
+
+        before_len = self._read_stable_send_input_len(
+            "input_box",
+            use_recent_fill_hint=True,
+        )
+        baseline_attachment_state = self._probe_attachment_readiness(selector) if avoid_repeat_click else {}
+        if not self._wait_for_send_idle_before_action(selector):
+            return
+        if self._network_monitor is not None:
+            self._network_monitor.mark_send_attempt()
+        send_dispatched = self._execute_click(selector, target_key, optional)
+        self._require_send_action_dispatched(send_dispatched)
+        last_send_action_at = time.time()
+
+        time.sleep(0.25)
+        after_len = self._read_stable_send_input_len("input_box")
+
+        if self._is_send_success(before_len, after_len):
+            logger.info("发送成功")
+            return
+        post_click_state = self._probe_send_post_click_state(selector)
+        if trust_generating_indicator and self._is_send_post_click_confirmed(post_click_state):
+            logger.info("发送成功（按钮态已进入生成/停止态）")
+            return
+
+        if avoid_repeat_click:
+            network_probe = {"matched": False}
+            if attachment_trust_network_activity and self._network_monitor is not None:
+                try:
+                    network_probe = self._network_monitor.poll_send_activity(timeout=min(0.3, attachment_observe_window)) or {"matched": False}
+                except Exception as e:
+                    logger.debug_throttled(
+                        "send.attachment_network_probe_failed",
+                        f"[SEND] 附件发送网络探测失败: {e}",
+                        interval_sec=5.0,
+                    )
+            post_click_state = self._probe_send_post_click_state(selector)
+            attachment_state_after_send = self._probe_attachment_readiness(selector)
+            probe_info = self._probe_attachment_state_probe(attachment_state_after_send, "after_send")
+            attempt_state = self._build_send_attempt_state(
+                send_selector=selector,
+                before_len=before_len,
+                after_len=after_len,
+                baseline_attachment_state=baseline_attachment_state,
+                attachment_state=attachment_state_after_send,
+                network_state=network_probe,
+                post_click_state=post_click_state,
+                probe_info=probe_info,
+            )
+            self._last_send_attempt_state = attempt_state
+
+            accept_unconfirmed = False
+            if self._get_send_confirmation_flag("accept_attachment_change", False, raw_only=True):
+                accept_unconfirmed = accept_unconfirmed or bool(attempt_state.get("attachment_changed_after_send"))
+            if self._get_send_confirmation_flag("accept_attachment_disappear", False, raw_only=True):
+                accept_unconfirmed = accept_unconfirmed or bool(attempt_state.get("attachment_disappeared_after_send"))
+            if self._get_send_confirmation_flag("accept_probe_confirmation", True, raw_only=True):
+                accept_unconfirmed = accept_unconfirmed or any(
+                    signal in (attempt_state.get("accepted_signals") or [])
+                    for signal in ("probe_accepted", "probe_confirmed")
+                )
+
+            if self._observe_send_without_retry(
+                selector,
+                before_len,
+                max_wait=attachment_observe_window,
+                trust_network_activity=attachment_trust_network_activity,
+                trust_generating_indicator=attachment_trust_generating_indicator,
+                trust_send_disabled_with_input_shrink=attachment_trust_send_disabled_with_input_shrink,
+            ):
+                logger.info(
+                    f"发送成功（附件场景，已避免重复点击发送按钮，sensitivity={attachment_profile['level']}）"
+                )
+            elif accept_unconfirmed:
+                logger.info(
+                    "发送成功（附件场景，通过补充信号确认，"
+                    f"{self._format_send_attempt_state(attempt_state)}）"
+                )
+            else:
+                retry_decision = self._evaluate_attachment_retry_decision(
+                    attempt_state,
+                    retry_index=0,
+                    max_retry_count=max_retry_count,
+                )
+                if max_retry_count > 0 and retry_decision["should_retry"]:
+                    logger.warning(
+                        "[SEND] 附件发送首轮未确认，准备自动重试 "
+                        f"(next_retry=1/{max_retry_count}, action={retry_action_desc}, "
+                        f"reason={retry_decision['reason']}, "
+                        f"sensitivity={attachment_profile['level']}, "
+                        f"{self._format_send_attempt_state(attempt_state)})"
+                    )
+
+                    for retry_index in range(1, max_retry_count + 1):
+                        if self._check_cancelled():
+                            return
+
+                        if not self._wait_before_send_retry(
+                            last_send_action_at=last_send_action_at,
+                            retry_interval=retry_interval,
+                            cooldown_window=retry_cooldown_window,
+                        ):
+                            return
+
+                        pre_retry_probe_window = min(
+                            max(0.0, retry_probe_window),
+                            max(0.0, max_wait),
+                        )
+                        if pre_retry_probe_window > 0 and self._observe_send_without_retry(
+                            selector,
+                            before_len,
+                            max_wait=pre_retry_probe_window,
+                            trust_network_activity=attachment_trust_network_activity,
+                            trust_generating_indicator=attachment_trust_generating_indicator,
+                            trust_send_disabled_with_input_shrink=attachment_trust_send_disabled_with_input_shrink,
+                        ):
+                            logger.info(
+                                f"发送成功（附件重试前观察确认，第 {retry_index} 轮，无需执行重试动作，action={retry_action_desc}）"
+                            )
+                            return
+
+                        logger.warning(
+                            "[SEND] 执行附件重试动作 "
+                            f"(retry={retry_index}/{max_retry_count}, action={retry_action_desc})"
+                        )
+                        self._execute_send_retry_action(
+                            selector,
+                            target_key,
+                            optional,
+                            retry_action_config=retry_action_config,
+                        )
+                        last_send_action_at = time.time()
+                        time.sleep(0.25)
+                        retry_after_len = self._read_stable_send_input_len("input_box")
+                        retry_network_probe = {"matched": False}
+                        if attachment_trust_network_activity and self._network_monitor is not None:
+                            try:
+                                retry_network_probe = self._network_monitor.poll_send_activity(
+                                    timeout=min(0.3, attachment_observe_window)
+                                ) or {"matched": False}
+                            except Exception as e:
+                                logger.debug_throttled(
+                                    "send.attachment_network_retry_probe_failed",
+                                    f"[SEND] 附件重试网络探测失败: {e}",
+                                    interval_sec=5.0,
+                                )
+                        retry_post_click_state = self._probe_send_post_click_state(selector)
+                        retry_attachment_state = self._probe_attachment_readiness(selector)
+                        retry_probe_info = self._probe_attachment_state_probe(
+                            retry_attachment_state,
+                            f"retry_{retry_index}",
+                        )
+                        retry_attempt_state = self._build_send_attempt_state(
+                            send_selector=selector,
+                            before_len=before_len,
+                            after_len=retry_after_len,
+                            baseline_attachment_state=baseline_attachment_state,
+                            attachment_state=retry_attachment_state,
+                            network_state=retry_network_probe,
+                            post_click_state=retry_post_click_state,
+                            probe_info=retry_probe_info,
+                        )
+                        self._last_send_attempt_state = retry_attempt_state
+
+                        if self._observe_send_without_retry(
+                            selector,
+                            before_len,
+                            max_wait=min(retry_observe_window, max_wait),
+                            trust_network_activity=attachment_trust_network_activity,
+                            trust_generating_indicator=attachment_trust_generating_indicator,
+                            trust_send_disabled_with_input_shrink=attachment_trust_send_disabled_with_input_shrink,
+                        ):
+                            logger.info(
+                                f"发送成功（附件重试后观察确认，第 {retry_index} 轮，action={retry_action_desc}）"
+                            )
+                            return
+
+                        retry_decision = self._evaluate_attachment_retry_decision(
+                            retry_attempt_state,
+                            retry_index=retry_index,
+                            max_retry_count=max_retry_count,
+                        )
+                        if not retry_decision["should_retry"]:
+                            logger.warning(
+                                "[SEND] 附件重试停止 "
+                                f"(retry={retry_index}/{max_retry_count}, action={retry_action_desc}, "
+                                f"reason={retry_decision['reason']}, "
+                                f"{self._format_send_attempt_state(retry_attempt_state)})"
+                            )
+                            return
+
+                    logger.warning(
+                        "[SEND] 附件发送重试已达到上限，停止自动补发 "
+                        f"(max_retry_count={max_retry_count}, action={retry_action_desc})"
+                    )
+                else:
+                    logger.warning(
+                        "[SEND] 附件发送未确认，但当前不执行自动重试 "
+                        f"(action={retry_action_desc}, reason={retry_decision['reason']}, "
+                        f"sensitivity={attachment_profile['level']}, "
+                        f"{self._format_send_attempt_state(attempt_state)})"
+                    )
+            return
+
+        if self._observe_send_without_retry(selector, before_len, max_wait=send_observe_window):
+            logger.info("发送成功（首次点击后观察确认）")
+            return
+
+        retry_action_config = self._get_send_retry_action_config()
+        retry_action_desc = self._format_send_retry_action(retry_action_config)
+        logger.warning(
+            f"[SEND] 发送未成功，进入重试窗口 (max_wait={max_wait}s, action={retry_action_desc})"
+        )
+
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            if self._check_cancelled():
+                return
+
+            if not self._wait_before_send_retry(
+                last_send_action_at=last_send_action_at,
+                retry_interval=retry_interval,
+                cooldown_window=retry_cooldown_window,
+                deadline=deadline,
+            ):
+                return
+
+            remaining = max(0.0, deadline - time.time())
+            if remaining > 0 and self._observe_send_without_retry(
+                selector,
+                before_len,
+                max_wait=min(retry_probe_window, remaining),
+            ):
+                elapsed = max_wait - max(0.0, deadline - time.time())
+                logger.info(
+                    f"发送成功（重试前观察确认，elapsed={elapsed:.1f}s, action={retry_action_desc} 未执行）"
+                )
+                return
+
+            logger.warning(
+                f"[SEND] 执行发送重试动作 (elapsed={max_wait - remaining:.1f}s, action={retry_action_desc})"
+            )
+            self._execute_send_retry_action(
+                selector,
+                target_key,
+                optional,
+                retry_action_config=retry_action_config,
+            )
+            last_send_action_at = time.time()
+
+            if time.time() < deadline:
+                time.sleep(min(0.25, max(0.0, deadline - time.time())))
+            new_len = self._read_stable_send_input_len("input_box")
+
+            if self._is_send_success(after_len, new_len) or self._is_send_success(before_len, new_len):
+                elapsed = max_wait - max(0.0, deadline - time.time())
+                logger.info(f"发送成功（重试动作后确认，elapsed={elapsed:.1f}s, action={retry_action_desc}）")
+                return
+
+            remaining = max(0.0, deadline - time.time())
+            if remaining > 0 and self._observe_send_without_retry(
+                selector,
+                before_len,
+                max_wait=min(retry_observe_window, remaining),
+            ):
+                elapsed = max_wait - max(0.0, deadline - time.time())
+                logger.info(
+                    f"发送成功（重试后观察确认，elapsed={elapsed:.1f}s, action={retry_action_desc}）"
+                )
+                return
+
+            after_len = new_len
+
+        logger.error(f"[SEND] 发送重试超时 (action={retry_action_desc})")
+        if not optional:
+            raise WorkflowError("send_btn_click_failed_due_to_uploading")
+
+    def _execute_click_send_stealth(self, selector: str, target_key: str, optional: bool):
+        """
+        隐身模式发送（零 JS 注入）
+        
+        - 无图片：直接点击
+        - 有图片：先单击并观察发送信号，仅在未确认时做少量重试
+        """
+        has_images = False
+        if hasattr(self, '_context') and self._context:
+            has_images = bool(self._context.get('images'))
+        trust_generating_indicator = self._get_send_confirmation_flag(
+            "trust_generating_indicator",
+            True,
+            raw_only=True,
+        )
+
+        if not has_images:
+            before_len = self._read_stable_send_input_len(
+                "input_box",
+                use_recent_fill_hint=True,
+            )
+            if not self._wait_for_send_idle_before_action(selector):
+                return
+            if self._network_monitor is not None:
+                self._network_monitor.mark_send_attempt()
+            send_dispatched = self._execute_click(selector, target_key, optional)
+            self._require_send_action_dispatched(send_dispatched)
+            time.sleep(0.25)
+            after_len = self._read_stable_send_input_len("input_box")
+            post_state = self._probe_send_post_click_state(selector)
+            if self._is_send_success(before_len, after_len):
+                logger.info("[STEALTH] 发送完成（无图片，输入框已缩短）")
+                return
+            if trust_generating_indicator and self._is_send_post_click_confirmed(post_state):
+                logger.info("[STEALTH] 发送完成（无图片，按钮态已进入生成/停止态）")
+                return
+            if self._observe_send_without_retry(
+                selector,
+                before_len,
+                max_wait=self._get_send_confirmation_window(
+                    "post_click_observe_window",
+                    getattr(BrowserConstants, "SEND_POST_CLICK_OBSERVE_WINDOW", 1.8),
+                    min_value=0.0,
+                    max_value=15.0,
+                    raw_only=True,
+                ),
+            ):
+                logger.info("[STEALTH] 发送完成（无图片，首击后信号确认）")
+                return
+            logger.warning("[STEALTH] 无图片发送未拿到确认信号，触发工作流重试")
+            raise WorkflowError("send_unconfirmed")
+
+        default_wait = float(BrowserConstants.get('STEALTH_SEND_IMAGE_WAIT') or 8.0)
+        observe_window = self._get_send_confirmation_window(
+            "attachment_observe_window",
+            default_wait,
+            min_value=0.0,
+            max_value=60.0,
+            raw_only=True,
+        )
+        retry_interval = self._get_send_confirmation_window(
+            "retry_interval",
+            float(BrowserConstants.get('STEALTH_SEND_IMAGE_RETRY_INTERVAL') or 1.2),
+            min_value=0.0,
+            max_value=30.0,
+            raw_only=True,
+        )
+        retry_cooldown_window = self._get_send_confirmation_window(
+            "retry_cooldown_window",
+            1.5,
+            min_value=0.0,
+            max_value=30.0,
+            raw_only=True,
+        )
+        pre_retry_probe_window = self._get_send_confirmation_window(
+            "pre_retry_probe_window",
+            0.12,
+            min_value=0.0,
+            max_value=5.0,
+            raw_only=True,
+        )
+        retry_observe_window = self._get_send_confirmation_window(
+            "retry_observe_window",
+            float(getattr(BrowserConstants, "SEND_RETRY_OBSERVE_WINDOW", 0.9)),
+            min_value=0.0,
+            max_value=15.0,
+            raw_only=True,
+        )
+        max_retry_count = self._get_send_confirmation_int(
+            "max_retry_count",
+            1,
+            min_value=0,
+            max_value=3,
+            raw_only=True,
+        )
+        trust_network_activity = self._get_send_confirmation_flag(
+            "trust_network_activity",
+            True,
+            raw_only=True,
+        )
+        trust_generating_indicator = self._get_send_confirmation_flag(
+            "trust_generating_indicator",
+            True,
+            raw_only=True,
+        )
+        trust_send_disabled_with_input_shrink = self._get_send_confirmation_flag(
+            "trust_send_disabled_with_input_shrink",
+            True,
+            raw_only=True,
+        )
+        before_len = self._read_stable_send_input_len(
+            "input_box",
+            use_recent_fill_hint=True,
+        )
+        if not self._wait_for_send_idle_before_action(selector):
+            return
+        if self._network_monitor is not None:
+            self._network_monitor.mark_send_attempt()
+
+        logger.info(
+            "[STEALTH] 有图片，发送后观察确认 "
+            f"(observe={observe_window:.1f}s, max_retry={max_retry_count})"
+        )
+
+        send_dispatched = self._execute_click(selector, target_key, optional)
+        self._require_send_action_dispatched(send_dispatched)
+        last_send_action_at = time.time()
+        time.sleep(0.25)
+        after_len = self._read_stable_send_input_len("input_box")
+        if self._is_send_success(before_len, after_len):
+            logger.info("[STEALTH] 发送成功（输入框已缩短）")
+            return
+        if self._observe_send_without_retry(
+            selector,
+            before_len,
+            max_wait=observe_window,
+            trust_network_activity=trust_network_activity,
+            trust_generating_indicator=trust_generating_indicator,
+            trust_send_disabled_with_input_shrink=trust_send_disabled_with_input_shrink,
+        ):
+            logger.info("[STEALTH] 发送成功（首击后信号确认）")
+            return
+        
+        for retry_count in range(1, max_retry_count + 1):
+            if self._check_cancelled():
+                return
+
+            if not self._wait_before_send_retry(
+                last_send_action_at=last_send_action_at,
+                retry_interval=retry_interval,
+                cooldown_window=retry_cooldown_window,
+            ):
+                return
+
+            if pre_retry_probe_window > 0 and self._observe_send_without_retry(
+                selector,
+                before_len,
+                max_wait=pre_retry_probe_window,
+                trust_network_activity=trust_network_activity,
+                trust_generating_indicator=trust_generating_indicator,
+                trust_send_disabled_with_input_shrink=trust_send_disabled_with_input_shrink,
+            ):
+                logger.info(f"[STEALTH] 发送成功（重试前观察确认，第 {retry_count} 轮）")
+                return
+
+            post_state = self._probe_send_post_click_state(selector)
+            if bool(post_state.get("generating")) or bool(post_state.get("sendLooksLikeStop")):
+                logger.info(
+                    f"[STEALTH] 检测到页面进入生成态，停止重试 (retry={retry_count}/{max_retry_count})"
+                )
+                return
+
+            try:
+                self._execute_click(selector, target_key, True)
+                last_send_action_at = time.time()
+                logger.debug(f"[STEALTH] 发送重试 #{retry_count}")
+            except Exception:
+                logger.debug(f"[STEALTH] 发送重试 #{retry_count} 执行失败，继续观察")
+
+            time.sleep(0.25)
+            retry_after_len = self._read_stable_send_input_len("input_box")
+            if self._is_send_success(before_len, retry_after_len):
+                logger.info(f"[STEALTH] 发送成功（第 {retry_count} 次重试后输入框缩短）")
+                return
+            retry_post_state = self._probe_send_post_click_state(selector)
+            if trust_generating_indicator and self._is_send_post_click_confirmed(retry_post_state):
+                logger.info(f"[STEALTH] 发送成功（第 {retry_count} 次重试后按钮态进入生成/停止态）")
+                return
+
+            if self._observe_send_without_retry(
+                selector,
+                before_len,
+                max_wait=retry_observe_window,
+                trust_network_activity=trust_network_activity,
+                trust_generating_indicator=trust_generating_indicator,
+                trust_send_disabled_with_input_shrink=trust_send_disabled_with_input_shrink,
+            ):
+                logger.info(f"[STEALTH] 发送成功（第 {retry_count} 次重试后信号确认）")
+                return
+
+        logger.warning(
+            "[STEALTH] 图片发送未拿到确认信号，结束重试并交由后续监听 "
+            f"(max_retry={max_retry_count}, observe={observe_window:.1f}s)"
+        )
+    

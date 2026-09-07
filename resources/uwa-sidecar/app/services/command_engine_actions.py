@@ -1,0 +1,3111 @@
+import ast
+import copy
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import string
+import time
+from datetime import date, timedelta
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, TYPE_CHECKING
+from urllib.parse import urlsplit
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+from app.core.config import get_logger
+from app.core.page_lifecycle import BACKGROUND_WAKE_CDP_TIMEOUT
+from app.core.request_transport import (
+    execute_request_transport,
+    get_default_request_transport_config,
+)
+from app.services.command_defs import ACTION_TYPES, TRIGGER_TYPES, CommandFlowAbort
+from app.services.arena_rule_service import record_arena_rule_candidates
+from app.services.sse_utils import iter_sse_payloads
+from app.services.transport_profile_handlers import (
+    get_transport_profile_handler,
+    register_transport_profile_handler,
+)
+from app.utils.browser_profile_identity import resolve_tab_browser_profile
+from app.utils.site_url import extract_remote_site_domain
+
+if TYPE_CHECKING:
+    from app.core.tab_pool import TabSession
+
+
+logger = get_logger("CMD_ENG")
+
+MAX_COMMAND_WORKFLOW_SSE_BUFFER_CHARS = 262144
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_BASE_PYTHON_SANDBOX_ALLOWED_IMPORTS = frozenset({
+    "datetime",
+    "json",
+    "math",
+    "random",
+    "time",
+})
+_REGISTERED_SANDBOX_ALLOWED_IMPORTS: set[str] = set()
+
+
+def register_sandbox_allowed_import(module_name: str) -> None:
+    """动态注册允许在 Python 沙箱中导入的模块。"""
+    normalized = str(module_name or "").strip()
+    if normalized:
+        _REGISTERED_SANDBOX_ALLOWED_IMPORTS.add(normalized)
+
+
+def register_sandbox_allowed_imports(module_names: Iterable[str]) -> None:
+    """批量动态注册允许在 Python 沙箱中导入的模块。"""
+    for name in module_names:
+        register_sandbox_allowed_import(name)
+
+
+def get_sandbox_allowed_imports() -> set[str]:
+    """获取所有已注册的沙箱导入模块。"""
+    return set(_REGISTERED_SANDBOX_ALLOWED_IMPORTS)
+
+
+# 注册辅助服务默认导入
+register_sandbox_allowed_imports([
+    "app.services.arena_cf_solver",
+    "app.services.cf_turnstile_solver",
+    "app.services.arena_proxy_rotation",
+    "app.services.arena_rule_service",
+    "app.services.command_result_store",
+    "app.utils.human_mouse",
+])
+
+
+class CommandEngineActionsMixin:
+    _ACTION_SOFT_FAILURE_PREFIXES = (
+        "cookies_clear_failed:",
+        "refresh_failed:",
+        "new_chat_button_not_found",
+        "new_chat_selector_missing",
+        "new_chat_failed:",
+        "js_failed:",
+        "js_file_read_failed:",
+        "js_file_preinject_failed:",
+        "js_file_run_failed:",
+        "element_not_found:",
+        "click_element_failed:",
+        "click_element_skipped_no_selector",
+        "coordinates_click_failed:",
+        "navigate_failed:",
+        "navigate_skipped",
+    )
+    _BASE_PYTHON_SANDBOX_ALLOWED_IMPORTS = _BASE_PYTHON_SANDBOX_ALLOWED_IMPORTS
+    _PYTHON_SANDBOX_ALLOWED_IMPORTS = frozenset({
+        "app.services.arena_cf_solver",
+        "app.services.cf_turnstile_solver",
+        "app.services.arena_proxy_rotation",
+        "app.services.arena_rule_service",
+        "app.services.command_result_store",
+        "app.utils.human_mouse",
+        "datetime",
+        "json",
+        "math",
+        "random",
+        "time",
+    })
+    _PYTHON_SANDBOX_BLOCKED_CALLS = frozenset({
+        "__import__",
+        "breakpoint",
+        "compile",
+        "dir",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "input",
+        "locals",
+        "open",
+        "setattr",
+        "vars",
+    })
+
+    @staticmethod
+    def _is_action_soft_failure(action_result: Any) -> bool:
+        if isinstance(action_result, dict):
+            return action_result.get("ok") is False
+        if isinstance(action_result, str):
+            return action_result.startswith(
+                CommandEngineActionsMixin._ACTION_SOFT_FAILURE_PREFIXES
+            )
+        return False
+
+    @staticmethod
+    def _wrap_run_js_for_return(code: Any) -> Optional[str]:
+        stripped = str(code or "").strip()
+        if not stripped:
+            return None
+        if re.match(r"^return\b", stripped):
+            return None
+
+        normalized = stripped.rstrip(";").strip()
+        looks_like_iife = (
+            normalized.startswith("(()")
+            or normalized.startswith("((async")
+            or normalized.startswith("(function")
+            or normalized.startswith("(async function")
+        )
+        if not looks_like_iife:
+            return None
+        if not normalized.endswith(")()"):
+            return None
+
+        return f"return {normalized};"
+
+    @staticmethod
+    def _wait_for_command_retry(condition: Any, timeout: float = 0.5):
+        wait_timeout = max(0.05, float(timeout or 0.5))
+        if condition is not None:
+            try:
+                with condition:
+                    condition.wait(timeout=wait_timeout)
+                return
+            except Exception:
+                pass
+        time.sleep(wait_timeout)
+
+    @staticmethod
+    def _coerce_action_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
+    @staticmethod
+    def _resolve_action_file_path(file_path: Any) -> str:
+        raw = str(file_path or "").strip()
+        if not raw:
+            return ""
+        expanded = os.path.expandvars(os.path.expanduser(raw))
+        if os.path.isabs(expanded):
+            return os.path.normpath(expanded)
+        return os.path.normpath(os.path.join(_PROJECT_ROOT, expanded))
+
+    @staticmethod
+    def _load_action_text_file(file_path: Any, encoding: str = "utf-8-sig") -> tuple[str, str]:
+        resolved = CommandEngineActionsMixin._resolve_action_file_path(file_path)
+        if not resolved:
+            raise ValueError("missing_file_path")
+        if not os.path.isfile(resolved):
+            raise ValueError(f"file_not_found: {resolved}")
+        with open(resolved, "r", encoding=encoding or "utf-8-sig") as f:
+            return resolved, f.read()
+
+    @staticmethod
+    def _ensure_command_init_script_registry(owner: Any) -> Dict[str, Dict[str, Any]]:
+        registry = getattr(owner, "_command_init_js_registry", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            setattr(owner, "_command_init_js_registry", registry)
+        return registry
+
+    def _cleanup_run_js_file_action(
+        self,
+        session: 'TabSession',
+        action: Dict[str, Any],
+        *,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        tab = getattr(session, "tab", None)
+        if tab is None:
+            return {
+                "ok": False,
+                "path": "",
+                "removed_init_script": False,
+                "ran_teardown": False,
+                "reason": "missing_tab",
+            }
+
+        resolved_path = self._resolve_action_file_path(action.get("file_path", ""))
+        registry_key = resolved_path.lower() if resolved_path else ""
+        registry = getattr(session, "_command_init_js_registry", None)
+        registry_entry = registry.get(registry_key) if isinstance(registry, dict) and registry_key else None
+        removed_init_script = False
+        errors: List[str] = []
+
+        script_identifier = str((registry_entry or {}).get("identifier", "") or "").strip()
+        if script_identifier:
+            try:
+                tab.run_cdp(
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    identifier=script_identifier,
+                    _timeout=BACKGROUND_WAKE_CDP_TIMEOUT,
+                )
+                removed_init_script = True
+            except Exception as e:
+                errors.append(f"remove_init_script_failed: {e}")
+        if isinstance(registry, dict) and registry_key:
+            registry.pop(registry_key, None)
+
+        # A removed init script must be eligible for bootstrap again. The
+        # session cache stores source mtimes and would otherwise keep treating
+        # the removed registration as current after a command is re-enabled.
+        bootstrap_state = getattr(session, "_command_bootstrap_js_files", None)
+        if isinstance(bootstrap_state, dict):
+            bootstrap_state.clear()
+
+        teardown_js = str(
+            action.get("teardown_js", "")
+            or action.get("cleanup_js", "")
+            or ""
+        ).strip()
+        teardown_result = None
+        ran_teardown = False
+        if teardown_js:
+            try:
+                teardown_result = self._run_command_js(tab, teardown_js)
+                ran_teardown = True
+            except Exception as e:
+                errors.append(f"teardown_js_failed: {e}")
+
+        return {
+            "ok": not errors,
+            "path": resolved_path,
+            "removed_init_script": removed_init_script,
+            "ran_teardown": ran_teardown,
+            "teardown_result": teardown_result,
+            "reason": str(reason or "").strip(),
+            "errors": errors,
+        }
+
+    def _run_command_js(self, tab: Any, code: Any) -> Any:
+        wrapped_code = self._wrap_run_js_for_return(code)
+        return tab.run_js(wrapped_code if wrapped_code is not None else code)
+
+    def _execute_command_async(
+        self,
+        command: Dict,
+        session: 'TabSession',
+        chain: Optional[List[str]] = None,
+        interrupt_context: Optional[Dict[str, Any]] = None,
+        trigger_rollback: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        command = copy.deepcopy(command)
+        exec_key = (command["id"], session.id)
+        priority = self._get_command_priority(command)
+        baseline = self._get_request_priority_baseline()
+        is_high = priority > baseline
+        domain = self._get_session_domain(session)
+        domain_sensitive = bool(domain) and self._command_affects_domain(command)
+
+        should_rollback_immediately = False
+        with self._lock:
+            if exec_key in self._executing:
+                should_rollback_immediately = True
+            else:
+                self._executing.add(exec_key)
+                if is_high:
+                    self._counter_inc(self._pending_high_by_session, session.id)
+                    if domain_sensitive:
+                        self._counter_inc(self._pending_high_by_domain, domain)
+        if should_rollback_immediately:
+            if trigger_rollback:
+                self._rollback_trigger_consumption(command, session, trigger_rollback)
+            return False
+
+        def _run_impl():
+            acquired = False
+            moved_running = False
+            focus_emulation_applied = False
+            cmd_task_id = f"cmd_{command['id'][:8]}_{time.time_ns()}"
+            trigger = command.get("trigger", {}) or {}
+            acquire_timeout = max(1.0, self._coerce_float(trigger.get("acquire_timeout_sec", 20), 20.0))
+            deadline = time.time() + acquire_timeout
+            retry_condition = None
+            try:
+                browser = self._get_browser()
+                pool = getattr(browser, "_tab_pool", None)
+                retry_condition = getattr(pool, "_condition", None)
+            except Exception:
+                retry_condition = None
+
+            try:
+                while time.time() < deadline:
+                    if is_high and domain_sensitive:
+                        if self._has_busy_peer_on_domain(domain, exclude_session_id=session.id):
+                            self._wait_for_command_retry(retry_condition)
+                            continue
+
+                    if not is_high:
+                        try:
+                            from app.services.request_manager import request_manager
+                            status_counts = (request_manager.get_status() or {}).get("status_counts", {})
+                            queued_count = int(status_counts.get("queued", 0) or 0)
+                            running_count = int(status_counts.get("running", 0) or 0)
+                            if queued_count > 0 or running_count > 0:
+                                self._wait_for_command_retry(retry_condition)
+                                continue
+                        except Exception:
+                            pass
+
+                    if hasattr(session, "acquire_for_command") and session.acquire_for_command(cmd_task_id):
+                        acquired = True
+                        break
+                    status_value = str(getattr(getattr(session, "status", None), "value", "")).lower()
+                    if status_value in {"closed", "error"}:
+                        break
+                    self._wait_for_command_retry(retry_condition)
+
+                if not acquired:
+                    logger.info(
+                        f"[CMD] 跳过执行（标签页忙碌或等待超时）: {command.get('name')} "
+                        f"优先级={priority}, 等待超时={acquire_timeout}秒, 标签页={session.id}"
+                    )
+                    self._finalize_request_count_trigger_state(command, session, rollback=True)
+                    self._reset_page_check_latch(command, session, reason="acquire_timeout")
+                    if trigger_rollback:
+                        self._rollback_trigger_consumption(command, session, trigger_rollback)
+                    return
+
+                self._finalize_request_count_trigger_state(command, session, rollback=False)
+
+                # Optional focus behavior: disabled by default to avoid stealing user focus.
+                if self._activate_tab_on_command:
+                    try:
+                        browser = self._get_browser()
+                        pool = getattr(browser, "_tab_pool", None)
+                        active_id = getattr(pool, "_active_session_id", None) if pool is not None else None
+                        if active_id != session.id and hasattr(session, "activate"):
+                            session.activate()
+                            if pool is not None:
+                                pool._active_session_id = session.id
+                    except Exception as e:
+                        logger.debug(f"[CMD] 激活目标标签页失败（忽略）: {e}")
+                elif self._use_focus_emulation_on_command:
+                    self._set_focus_emulation(session, True)
+                    focus_emulation_applied = True
+
+                if is_high:
+                    with self._lock:
+                        self._counter_dec(self._pending_high_by_session, session.id)
+                        self._counter_inc(self._running_high_by_session, session.id)
+                        if domain_sensitive:
+                            self._counter_dec(self._pending_high_by_domain, domain)
+                            self._counter_inc(self._running_high_by_domain, domain)
+                    moved_running = True
+
+                execution_result = self._execute_command(
+                    command,
+                    session,
+                    chain=chain,
+                    interrupt_context=interrupt_context,
+                )
+                if self._execution_needs_page_check_retry(execution_result):
+                    self._reset_page_check_latch(command, session, reason="execution_not_ok")
+            except Exception as e:
+                logger.error(f"[CMD] 命令执行失败 [{command.get('name')}]: {e}")
+                if not acquired:
+                    self._finalize_request_count_trigger_state(command, session, rollback=True)
+                    if trigger_rollback:
+                        self._rollback_trigger_consumption(command, session, trigger_rollback)
+                self._reset_page_check_latch(command, session, reason="execution_exception")
+            finally:
+                if focus_emulation_applied:
+                    self._set_focus_emulation(session, False)
+                if acquired:
+                    try:
+                        browser = self._get_browser()
+                        pool = getattr(browser, "_tab_pool", None)
+                        if pool is not None and hasattr(pool, "release"):
+                            pool.release(
+                                session.id,
+                                check_triggers=False,
+                                expected_task_id=cmd_task_id,
+                            )
+                        else:
+                            session.release(
+                                clear_page=False,
+                                check_triggers=False,
+                                expected_task_id=cmd_task_id,
+                            )
+                    except Exception as e:
+                        logger.debug(f"[CMD] 命令释放标签页失败（忽略）: {e}")
+                    try:
+                        self.flush_deferred_workflow_commands(session)
+                    except Exception as e:
+                        logger.debug(f"[CMD] 补跑延后命令失败（忽略）: {e}")
+
+                with self._lock:
+                    if is_high:
+                        if moved_running:
+                            self._counter_dec(self._running_high_by_session, session.id)
+                            if domain_sensitive:
+                                self._counter_dec(self._running_high_by_domain, domain)
+                        else:
+                            self._counter_dec(self._pending_high_by_session, session.id)
+                            if domain_sensitive:
+                                self._counter_dec(self._pending_high_by_domain, domain)
+                    self._executing.discard(exec_key)
+
+        def _run():
+            with self._command_logging_context(command):
+                _run_impl()
+
+        try:
+            self._command_executor.submit(_run)
+        except Exception:
+            with self._lock:
+                if is_high:
+                    self._counter_dec(self._pending_high_by_session, session.id)
+                    if domain_sensitive:
+                        self._counter_dec(self._pending_high_by_domain, domain)
+                self._executing.discard(exec_key)
+            if trigger_rollback:
+                self._rollback_trigger_consumption(command, session, trigger_rollback)
+            raise
+        return True
+
+    def _execute_command(
+        self,
+        command: Dict,
+        session: 'TabSession',
+        chain: Optional[List[str]] = None,
+        interrupt_context: Optional[Dict[str, Any]] = None,
+        record_result: bool = True,
+        emit_followups: bool = True,
+        update_trigger_stats: bool = True,
+    ) -> Dict[str, Any]:
+        with self._command_logging_context(command):
+            return self._execute_command_impl(
+                command,
+                session,
+                chain=chain,
+                interrupt_context=interrupt_context,
+                record_result=record_result,
+                emit_followups=emit_followups,
+                update_trigger_stats=update_trigger_stats,
+            )
+
+    def _execute_command_impl(
+        self,
+        command: Dict,
+        session: 'TabSession',
+        chain: Optional[List[str]] = None,
+        interrupt_context: Optional[Dict[str, Any]] = None,
+        record_result: bool = True,
+        emit_followups: bool = True,
+        update_trigger_stats: bool = True,
+    ) -> Dict[str, Any]:
+        cmd_name = command.get("name", "未命名")
+        mode = command.get("mode", "simple")
+        previous_command_priority = getattr(session, "_current_command_priority", None)
+        previous_command_id = getattr(session, "_current_command_id", None)
+        previous_command_chain = getattr(session, "_current_command_chain", None)
+        previous_command_context = getattr(session, "_current_command_context", None)
+        previous_command_name = getattr(session, "current_command_name", None)
+        session._current_command_priority = self._get_command_priority(command)
+        session._current_command_id = command.get("id")
+        session.current_command_name = cmd_name
+        current_chain = list(chain or [])
+        command_id = str(command.get("id", "") or "").strip()
+        if command_id:
+            current_chain.append(command_id)
+        session._current_command_chain = current_chain
+        session._current_command_context = copy.deepcopy(interrupt_context) if interrupt_context else None
+        previous_current_command = getattr(session, "_current_command", None)
+        session._current_command = copy.deepcopy(command)
+
+        mode_label = "高级模式" if mode == "advanced" else "简易模式"
+        logger.debug(f"[CMD] ▶ 执行: {cmd_name} (模式={mode_label}, 标签页={session.id})")
+        self._suspend_tab_global_network(session, reason=f"command:{command.get('id', '')}")
+        try:
+            if update_trigger_stats:
+                self._update_trigger_stats(command["id"])
+
+            execution_result: Dict[str, Any]
+            if mode == "advanced":
+                execution_result = self._execute_advanced(command, session)
+            else:
+                execution_result = self._execute_simple(command, session)
+
+            if record_result:
+                self._record_command_result(command, session, execution_result)
+
+            logger.debug(f"[CMD] ✅ 完成: {cmd_name}")
+            if emit_followups:
+                self._trigger_chained_commands(
+                    command, session, chain=chain, interrupt_context=interrupt_context
+                )
+                self._trigger_result_match_commands(
+                    command, session, chain=chain, interrupt_context=interrupt_context
+                )
+                self._trigger_result_event_commands(
+                    command, session, chain=chain, interrupt_context=interrupt_context
+                )
+            return execution_result
+        finally:
+            session._current_command_priority = previous_command_priority
+            session._current_command_id = previous_command_id
+            session._current_command_chain = previous_command_chain
+            session._current_command_context = previous_command_context
+            session._current_command = previous_current_command
+            session.current_command_name = previous_command_name
+            self._resume_tab_global_network(session, reason=f"command:{command.get('id', '')}")
+
+    def _execute_simple(self, command: Dict, session: 'TabSession') -> Dict[str, Any]:
+        actions = command.get("actions", [])
+        step_results: List[Dict[str, Any]] = []
+        last_result: Any = ""
+        stop_on_error = bool(command.get("stop_on_error", False))
+        stopped_on_error = False
+
+        for i, action in enumerate(actions):
+            action_type = action.get("type", "")
+            action_ref = str(action.get("action_id") or f"step_{i + 1}")
+            action_label = ACTION_TYPES.get(action_type, action_type)
+            logger.debug(f"[CMD] 步骤 {i + 1}/{len(actions)}: {action_label}")
+            try:
+                action_result = self._execute_action(action, session)
+                last_result = action_result
+                step_ok = not self._is_action_soft_failure(action_result)
+                step_results.append({
+                    "index": i,
+                    "action_ref": action_ref,
+                    "type": action_type,
+                    "result": action_result,
+                    "ok": step_ok,
+                })
+                if not step_ok and stop_on_error:
+                    stopped_on_error = True
+                    logger.info(f"[CMD] 动作链因 stop_on_error 提前结束: 步骤={action_ref}")
+                    break
+            except CommandFlowAbort as e:
+                last_result = str(e)
+                step_results.append({
+                    "index": i,
+                    "action_ref": action_ref,
+                    "type": action_type,
+                    "result": last_result,
+                    "ok": False,
+                })
+                logger.info(f"[CMD] 动作链提前结束: {e}")
+                break
+            except Exception as e:
+                logger.error(f"[CMD] 步骤 {i + 1} 失败（{action_label}）: {e}")
+                last_result = f"ERROR: {e}"
+                step_results.append({
+                    "index": i,
+                    "action_ref": action_ref,
+                    "type": action_type,
+                    "result": last_result,
+                    "ok": False,
+                })
+                if stop_on_error:
+                    stopped_on_error = True
+                    logger.info(f"[CMD] 动作链因 stop_on_error 提前结束: 步骤={action_ref}")
+                    break
+
+        return {
+            "mode": "simple",
+            "result": last_result,
+            "steps": step_results,
+            "stopped_on_error": stopped_on_error,
+        }
+
+    @staticmethod
+    def _captcha_click_point_script() -> str:
+        return r"""
+return (() => {
+  const visibleRect = (el) => {
+    if (!el) return null;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      Number(style.opacity || 1) <= 0.02 ||
+      rect.width < 8 ||
+      rect.height < 8
+    ) {
+      return null;
+    }
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    if (rect.right < 0 || rect.bottom < 0 || rect.left > vw || rect.top > vh) {
+      return null;
+    }
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(vw, rect.right);
+    const bottom = Math.min(vh, rect.bottom);
+    const width = right - left;
+    const height = bottom - top;
+    if (width < 4 || height < 4) {
+      return null;
+    }
+    return {
+      left,
+      top,
+      right,
+      bottom,
+      width,
+      height,
+      rawWidth: rect.width,
+      rawHeight: rect.height
+    };
+  };
+
+  const describe = (el) => {
+    const attrs = [
+      el.getAttribute('src'),
+      el.getAttribute('title'),
+      el.getAttribute('aria-label'),
+      el.getAttribute('name'),
+      el.id,
+      el.className
+    ];
+    return attrs.map((v) => String(v || '')).join(' ').toLowerCase();
+  };
+
+  const candidates = [];
+  const pushCandidate = (el, kind, score) => {
+    const rect = visibleRect(el);
+    if (!rect) return;
+    const text = describe(el);
+    const checkboxLike = /checkbox|anchor|recaptcha|hcaptcha|turnstile|challenge|cloudflare/.test(text);
+    let clickX = rect.left + rect.width / 2;
+    let clickY = rect.top + rect.height / 2;
+    if (checkboxLike || rect.width >= 120) {
+      clickX = rect.left + Math.min(Math.max(rect.width * 0.16, 24), 46);
+    }
+    const insetX = Math.min(4, Math.max(0, (rect.width - 1) / 2));
+    const insetY = Math.min(4, Math.max(0, (rect.height - 1) / 2));
+    clickX = Math.max(rect.left + insetX, Math.min(rect.left + rect.width - 1 - insetX, clickX));
+    clickY = Math.max(rect.top + insetY, Math.min(rect.top + rect.height - 1 - insetY, clickY));
+    candidates.push({
+      kind,
+      score: score + (checkboxLike ? 20 : 0) + Math.min(rect.width, 320) / 100,
+      x: Math.round(clickX),
+      y: Math.round(clickY),
+      rect,
+      hint: text.slice(0, 160)
+    });
+  };
+
+  for (const el of document.querySelectorAll('iframe')) {
+    const text = describe(el);
+    const rect = visibleRect(el);
+    const isExpandedImageChallenge = !!rect && rect.width >= 360 && rect.height >= 300;
+    if (isExpandedImageChallenge) continue;
+    if (/recaptcha|google\.com\/recaptcha/.test(text)) pushCandidate(el, 'recaptcha_iframe', 100);
+    else if (/hcaptcha|hcaptcha\.com/.test(text)) pushCandidate(el, 'hcaptcha_iframe', 95);
+    else if (/turnstile|challenges\.cloudflare\.com|cloudflare|challenge/.test(text)) pushCandidate(el, 'cloudflare_iframe', 90);
+  }
+
+  for (const selector of [
+    '.g-recaptcha',
+    '.h-captcha',
+    '.cf-turnstile',
+    '[data-sitekey]',
+    '[role="checkbox"]',
+    'input[type="checkbox"]'
+  ]) {
+    for (const el of document.querySelectorAll(selector)) {
+      pushCandidate(el, selector, 50);
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  const target = candidates[0];
+  if (!target) return { ok: false, reason: 'captcha_target_not_found' };
+  return { ok: true, ...target, viewport: { width: window.innerWidth, height: window.innerHeight } };
+})();
+"""
+
+    def _execute_captcha_challenge_click_action(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        timeout_sec = max(0.5, self._coerce_float(action.get("timeout_sec", 6), 6.0))
+        random_radius = max(0, self._coerce_int(action.get("random_radius", 4), 4))
+        deadline = time.time() + timeout_sec
+        
+        max_attempts = action.get("max_attempts")
+        if max_attempts is not None:
+            try:
+                max_attempts = max(1, int(max_attempts))
+            except Exception:
+                max_attempts = None
+
+        last_probe: Any = None
+        last_error = ""
+        attempt_count = 0
+
+        while time.time() < deadline:
+            attempt_count += 1
+            try:
+                probe = session.tab.run_js(self._captcha_click_point_script())
+            except Exception as e:
+                last_error = f"captcha_probe_failed:{e}"
+                logger.warning(f"[CMD] 人机验证目标探测失败，继续重试: {e}")
+                if max_attempts is not None and attempt_count >= max_attempts:
+                    break
+                time.sleep(0.25)
+                continue
+
+            last_probe = probe
+            if isinstance(probe, dict) and probe.get("ok"):
+                try:
+                    click_x = int(probe.get("x"))
+                    click_y = int(probe.get("y"))
+                except Exception:
+                    last_error = "captcha_click_point_invalid"
+                    logger.warning(
+                        f"[CMD] 人机验证坐标解析失败，继续重试: probe={str(probe)[:160]}"
+                    )
+                    if max_attempts is not None and attempt_count >= max_attempts:
+                        break
+                    time.sleep(0.25)
+                    continue
+
+                if random_radius > 0:
+                    click_x += random.randint(-random_radius, random_radius)
+                    click_y += random.randint(-max(1, random_radius // 2), max(1, random_radius // 2))
+                rect = probe.get("rect") if isinstance(probe.get("rect"), dict) else {}
+                try:
+                    rect_left = float(rect.get("left") or 0.0)
+                    rect_top = float(rect.get("top") or 0.0)
+                    rect_width = float(rect.get("width") or 0.0)
+                    rect_height = float(rect.get("height") or 0.0)
+                except Exception:
+                    rect_width = 0.0
+                    rect_height = 0.0
+                if rect_width > 0 and rect_height > 0:
+                    inset = min(4.0, max(0.0, min(rect_width, rect_height) / 4.0))
+                    min_x = int(math.ceil(rect_left + inset))
+                    max_x = int(math.floor(rect_left + rect_width - 1.0 - inset))
+                    min_y = int(math.ceil(rect_top + inset))
+                    max_y = int(math.floor(rect_top + rect_height - 1.0 - inset))
+                    if min_x <= max_x:
+                        click_x = max(min_x, min(max_x, click_x))
+                    if min_y <= max_y:
+                        click_y = max(min_y, min(max_y, click_y))
+                viewport = probe.get("viewport") if isinstance(probe.get("viewport"), dict) else {}
+                viewport_width = max(1, int(viewport.get("width") or 1))
+                viewport_height = max(1, int(viewport.get("height") or 1))
+                click_x = max(0, min(viewport_width - 1, click_x))
+                click_y = max(0, min(viewport_height - 1, click_y))
+
+                try:
+                    from app.utils.human_mouse import cdp_precise_click, smooth_move_mouse
+
+                    smooth_move_mouse(
+                        session.tab,
+                        (max(0, click_x - 60), max(0, click_y - 40)),
+                        (click_x, click_y),
+                    )
+                    success = bool(cdp_precise_click(session.tab, click_x, click_y))
+                except Exception as e:
+                    last_error = f"captcha_click_failed:{e}"
+                    logger.warning(f"[CMD] 人机验证 CDP 点击失败，继续重试: {e}")
+                    if max_attempts is not None and attempt_count >= max_attempts:
+                        break
+                    time.sleep(0.25)
+                    continue
+
+                if not success:
+                    last_error = "captcha_click_failed"
+                    logger.warning(
+                        f"[CMD] 人机验证 CDP 点击未确认，继续重试: x={click_x}, y={click_y}"
+                    )
+                    if max_attempts is not None and attempt_count >= max_attempts:
+                        break
+                    time.sleep(0.25)
+                    continue
+
+                logger.info(
+                    f"[CMD] 已点击人机验证目标: kind={probe.get('kind')}, "
+                    f"x={click_x}, y={click_y}"
+                )
+                return {
+                    "ok": True,
+                    "kind": probe.get("kind"),
+                    "x": click_x,
+                    "y": click_y,
+                    "hint": probe.get("hint", ""),
+                }
+
+            if max_attempts is not None and attempt_count >= max_attempts:
+                break
+            time.sleep(0.25)
+
+        logger.warning(f"[CMD] 未找到可点击的人机验证目标: last={str(last_probe)[:160]}")
+        return {
+            "ok": False,
+            "error": last_error or "captcha_target_not_found",
+            "last_probe": last_probe,
+        }
+
+    def _execute_action(self, action: Dict, session: 'TabSession') -> Any:
+        action_type = action.get("type", "")
+        tab = session.tab
+
+        if action_type == "clear_cookies":
+            try:
+                current_url = str(getattr(tab, "url", "") or "").strip()
+                split = urlsplit(current_url) if current_url else None
+                origin = ""
+                hostname = ""
+                if split and split.scheme in {"http", "https"} and split.netloc:
+                    origin = f"{split.scheme}://{split.netloc}"
+                    hostname = split.hostname or ""
+
+                deleted_cookies = 0
+                origin_cleared = False
+
+                if origin:
+                    try:
+                        tab.run_cdp("Storage.clearDataForOrigin", origin=origin, storageTypes="all")
+                        origin_cleared = True
+                    except Exception as e:
+                        logger.debug(f"[CMD] 按源清空存储失败（忽略）: {e}")
+
+                cookie_items = []
+                for kwargs in (
+                    {"urls": [current_url]} if current_url else None,
+                    {},
+                ):
+                    if kwargs is None:
+                        continue
+                    try:
+                        result = tab.run_cdp("Network.getCookies", **kwargs) or {}
+                        cookies = result.get("cookies") or []
+                        if cookies:
+                            cookie_items = cookies
+                            break
+                    except Exception as e:
+                        logger.debug(f"[CMD] 获取 Cookie 失败（忽略）: {e}")
+
+                seen_keys = set()
+                for cookie in cookie_items:
+                    name = str(cookie.get("name", "") or "").strip()
+                    domain = str(cookie.get("domain", "") or "").strip()
+                    path = str(cookie.get("path", "/") or "/").strip() or "/"
+                    if not name:
+                        continue
+                    if hostname:
+                        normalized_domain = domain.lstrip(".").lower()
+                        if normalized_domain and normalized_domain != hostname.lower() and not hostname.lower().endswith(f".{normalized_domain}"):
+                            continue
+                    dedupe_key = (name, domain, path)
+                    if dedupe_key in seen_keys:
+                        continue
+                    seen_keys.add(dedupe_key)
+                    delete_kwargs = {"name": name, "path": path}
+                    if domain:
+                        delete_kwargs["domain"] = domain
+                    elif current_url:
+                        delete_kwargs["url"] = current_url
+                    try:
+                        tab.run_cdp("Network.deleteCookies", **delete_kwargs)
+                        deleted_cookies += 1
+                    except Exception as e:
+                        logger.debug(f"[CMD] 删除 Cookie 失败（忽略）: {e}")
+
+                try:
+                    tab.run_js(
+                        "try { localStorage.clear(); } catch (e) {}"
+                        "try { sessionStorage.clear(); } catch (e) {}"
+                        "try { document.cookie.split(';').forEach(function(c) {"
+                        "  var name = c.trim().split('=')[0];"
+                        "  if (!name) return;"
+                        "  document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/;';"
+                        "}); } catch (e) {}"
+                    )
+                except Exception as e:
+                    logger.debug(f"[CMD] 清空页面存储失败（忽略）: {e}")
+
+                logger.debug(
+                    f"[CMD] Cookie/存储已清除: 地址={current_url or '-'}, "
+                    f"按源清空={origin_cleared}, 已删除 Cookie 数={deleted_cookies}"
+                )
+                return "cookies_cleared"
+            except Exception as e:
+                logger.warning(f"[CMD] 清除 Cookie 失败: {e}")
+                return f"cookies_clear_failed: {e}"
+
+        elif action_type == "refresh_page":
+            try:
+                tab.refresh()
+                try:
+                    self.notify_tab_navigated(session, reason="action_refresh_page")
+                except Exception:
+                    pass
+                time.sleep(2)
+                logger.debug("[CMD] 页面已刷新")
+                return "page_refreshed"
+            except Exception as e:
+                logger.warning(f"[CMD] 刷新页面失败: {e}")
+                return f"refresh_failed: {e}"
+
+        elif action_type == "new_chat":
+            try:
+                engine = self._get_config_engine()
+                domain = self._get_session_domain(session)
+                site_data = engine._get_site_data(domain, session.preset_name)
+                if site_data:
+                    selector = site_data.get("selectors", {}).get("new_chat_btn", "")
+                    if selector:
+                        ele = tab.ele(selector, timeout=3)
+                        if ele:
+                            ele.click()
+                            time.sleep(1)
+                            logger.debug("[CMD] 新建对话完成")
+                            return "new_chat_clicked"
+                        else:
+                            logger.warning("[CMD] 新建对话按钮未找到")
+                            return "new_chat_button_not_found"
+                    else:
+                        logger.warning("[CMD] 未配置新建对话按钮选择器（new_chat_btn）")
+                        return "new_chat_selector_missing"
+            except Exception as e:
+                logger.warning(f"[CMD] 新建对话失败: {e}")
+                return f"new_chat_failed: {e}"
+
+        elif action_type == "run_js":
+            code = action.get("code", "")
+            if code:
+                try:
+                    result = self._run_command_js(tab, code)
+                    retry_on_results = action.get("retry_on_results", [])
+                    if isinstance(retry_on_results, str):
+                        retry_on_results = [
+                            item.strip() for item in retry_on_results.split(",") if item.strip()
+                        ]
+                    elif not isinstance(retry_on_results, list):
+                        retry_on_results = []
+
+                    try:
+                        retry_attempts = max(0, int(action.get("retry_attempts", 0)))
+                    except Exception:
+                        retry_attempts = 0
+
+                    retry_after_refresh = bool(action.get("retry_after_refresh", False))
+                    try:
+                        retry_wait_seconds = max(0.0, float(action.get("retry_wait_seconds", 0)))
+                    except Exception:
+                        retry_wait_seconds = 0.0
+
+                    attempt = 0
+                    while attempt < retry_attempts and str(result) in retry_on_results:
+                        attempt += 1
+                        logger.info(
+                            f"[CMD] JS 命中重试条件: 返回值={result}, "
+                            f"第 {attempt}/{retry_attempts} 次, 刷新后重试={retry_after_refresh}"
+                        )
+                        if retry_after_refresh:
+                            try:
+                                tab.refresh()
+                                try:
+                                    self.notify_tab_navigated(session, reason="action_run_js_retry_refresh")
+                                except Exception:
+                                    pass
+                                time.sleep(2)
+                            except Exception as refresh_error:
+                                logger.warning(f"[CMD] JS 重试前刷新失败: {refresh_error}")
+                                break
+                        if retry_wait_seconds > 0:
+                            time.sleep(retry_wait_seconds)
+                        result = self._run_command_js(tab, code)
+                    logger.debug(f"[CMD] JS 执行完成: {str(result)[:100]}")
+
+                    # 当 JS 返回假值（None/""/False/0）时，视为执行未成功，
+                    # 返回 {ok: False} 以便 page_check 触发器重置 latch 并重试。
+                    # 默认开启；如 JS 本身就应返回假值，用户可在动作中设置 fail_on_falsy: false
+                    fail_on_falsy = action.get("fail_on_falsy", True)
+                    if fail_on_falsy and not result:
+                        logger.info(f"[CMD] JS 返回假值，按 fail_on_falsy 记为失败: {result!r}")
+                        return {"ok": False, "js_result": result, "reason": "falsy_result"}
+
+                    return result
+                except Exception as e:
+                    logger.warning(f"[CMD] JS 执行失败: {e}")
+                    return f"js_failed: {e}"
+            return ""
+
+        elif action_type == "run_js_file":
+            file_path = action.get("file_path", "")
+            encoding = str(action.get("encoding", "utf-8-sig") or "utf-8-sig").strip() or "utf-8-sig"
+            try:
+                resolved_path, code = self._load_action_text_file(file_path, encoding=encoding)
+            except Exception as e:
+                logger.warning(f"[CMD] JS 文件读取失败: path={file_path!r}, error={e}")
+                return f"js_file_read_failed: {e}"
+
+            if not code.strip():
+                logger.warning(f"[CMD] JS 文件为空: {resolved_path}")
+                return "js_file_empty"
+
+            inject_on_new_document = self._coerce_action_bool(
+                action.get("inject_on_new_document", True),
+                True,
+            )
+            apply_now = self._coerce_action_bool(action.get("apply_now", True), True)
+            registry = self._ensure_command_init_script_registry(session)
+            registry_key = resolved_path.lower()
+            registry_entry = registry.get(registry_key) if isinstance(registry.get(registry_key), dict) else None
+            script_identifier = ""
+
+            if inject_on_new_document:
+                try:
+                    previous_identifier = str((registry_entry or {}).get("identifier", "") or "").strip()
+                    previous_source = str((registry_entry or {}).get("source", "") or "")
+                    if previous_identifier and previous_source and previous_source != code:
+                        try:
+                            tab.run_cdp(
+                                "Page.removeScriptToEvaluateOnNewDocument",
+                                identifier=previous_identifier,
+                                _timeout=BACKGROUND_WAKE_CDP_TIMEOUT,
+                            )
+                        except Exception as remove_error:
+                            logger.debug(f"[CMD] 旧 JS 预注入脚本移除失败（忽略）: {remove_error}")
+                        previous_identifier = ""
+
+                    if not previous_identifier or previous_source != code:
+                        result = tab.run_cdp(
+                            "Page.addScriptToEvaluateOnNewDocument",
+                            source=code,
+                            _timeout=BACKGROUND_WAKE_CDP_TIMEOUT,
+                        )
+                        if isinstance(result, dict):
+                            script_identifier = str(
+                                result.get("identifier")
+                                or result.get("scriptId")
+                                or result.get("id")
+                                or ""
+                            ).strip()
+                        elif result not in (None, ""):
+                            script_identifier = str(result).strip()
+                        registry[registry_key] = {
+                            "identifier": script_identifier,
+                            "source": code,
+                            "path": resolved_path,
+                        }
+                    else:
+                        script_identifier = previous_identifier
+                except Exception as e:
+                    logger.warning(f"[CMD] JS 文件预注入失败: path={resolved_path}, error={e}")
+                    return f"js_file_preinject_failed: {e}"
+
+            run_result = None
+            if apply_now:
+                try:
+                    run_result = self._run_command_js(tab, code)
+                except Exception as e:
+                    logger.warning(f"[CMD] JS 文件执行失败: path={resolved_path}, error={e}")
+                    return f"js_file_run_failed: {e}"
+
+            fail_on_falsy = action.get("fail_on_falsy", False)
+            if apply_now and fail_on_falsy and not run_result:
+                logger.info(f"[CMD] JS 文件返回假值，按 fail_on_falsy 记为失败: {run_result!r}")
+                return {"ok": False, "js_result": run_result, "reason": "falsy_result"}
+
+            result_payload = {
+                "ok": True,
+                "path": resolved_path,
+                "applied_now": apply_now,
+                "inject_on_new_document": inject_on_new_document,
+                "script_id": script_identifier,
+                "result": run_result,
+            }
+            logger.debug(
+                f"[CMD] JS 文件已处理: path={resolved_path}, apply_now={apply_now}, "
+                f"inject_on_new_document={inject_on_new_document}, script_id={script_identifier or '-'}"
+            )
+            return result_payload
+
+        elif action_type == "wait":
+            seconds = float(action.get("seconds", 1))
+            time.sleep(seconds)
+            logger.debug(f"[CMD] 等待 {seconds}秒")
+            return f"waited:{seconds}"
+
+        elif action_type in {"execute_preset", "switch_preset"}:
+            return self._execute_preset_action(action, session)
+
+        elif action_type == "write_element":
+            return self._execute_write_element_action(action, session)
+
+        elif action_type == "read_element":
+            return self._execute_read_element_action(action, session)
+
+        elif action_type == "click_element":
+            selector = action.get("selector", "")
+            if selector:
+                try:
+                    ele = tab.ele(selector, timeout=3)
+                    if ele:
+                        # 获取当前站点的 stealth 配置
+                        config_engine = self._get_config_engine()
+                        site_cfg = config_engine._get_site_data(
+                            self._get_session_domain(session),
+                            session.preset_name
+                        )
+                        is_stealth = site_cfg.get("stealth", False) if site_cfg else False
+                        
+                        if is_stealth:
+                            logger.debug(f"[CMD] 准备低熵模式点击元素: {selector}")
+                            # 尝试通过 JS 获取元素中心坐标
+                            rect = ele.run_js(
+                                "const r = this.getBoundingClientRect();"
+                                "return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)}"
+                            )
+                            click_x_raw = rect.get('x') if isinstance(rect, dict) else None
+                            click_y_raw = rect.get('y') if isinstance(rect, dict) else None
+                            if click_x_raw is not None and click_y_raw is not None:
+                                click_x = int(click_x_raw) + __import__('random').randint(-4, 4)
+                                click_y = int(click_y_raw) + __import__('random').randint(-4, 4)
+                                from app.utils.human_mouse import cdp_precise_click, smooth_move_mouse
+                                # 平滑移动到坐标再进行精确按压
+                                smooth_move_mouse(tab, (click_x - 50, click_y - 50), (click_x, click_y))
+                                time.sleep(__import__('random').uniform(0.05, 0.15))
+                                success = cdp_precise_click(tab, click_x, click_y)
+                                if success:
+                                    logger.debug(f"[CMD] 元素已低熵点击: {selector} at ({click_x}, {click_y})")
+                                    return f"element_stealth_clicked:{selector}"
+                                else:
+                                    logger.warning(f"[CMD] 元素低熵点击事件派发失败: {selector}")
+                                    return f"element_stealth_click_failed:{selector}"
+                            else:
+                                logger.warning(f"[CMD] 低熵点击无法获取目标坐标，取消普通点击降级: {selector}")
+                                return f"element_stealth_click_unavailable:{selector}"
+                        else:
+                            ele.click()
+                            time.sleep(1)
+                            logger.debug(f"[CMD] 元素已点击: {selector}")
+                            return f"element_clicked:{selector}"
+                    else:
+                        logger.warning(f"[CMD] 待点击的元素未找到: {selector}")
+                        return f"element_not_found:{selector}"
+                except Exception as e:
+                    logger.warning(f"[CMD] 点击元素失败: {e}")
+                    return f"click_element_failed:{e}"
+            return "click_element_skipped_no_selector"
+
+        elif action_type == "click_captcha_challenge":
+            return self._execute_captcha_challenge_click_action(action, session)
+
+        elif action_type == "click_coordinates":
+            try:
+                x = int(action.get("x", 0))
+                y = int(action.get("y", 0))
+                from app.utils.human_mouse import cdp_precise_click
+                # cdp_precise_click handles its own debug logging and execution securely via CDP
+                success = cdp_precise_click(tab, x, y)
+                if success:
+                    time.sleep(0.5)
+                    logger.debug(f"[CMD] 坐标已点击: ({x}, {y})")
+                    return f"coordinates_clicked:({x},{y})"
+                else:
+                    logger.warning(f"[CMD] 坐标点击失败: ({x}, {y})")
+                    return f"coordinates_click_failed:({x},{y})"
+            except Exception as e:
+                logger.warning(f"[CMD] 坐标点击失败，参数异常: {e}")
+                return f"click_coordinates_failed:{e}"
+
+        elif action_type == "execute_workflow":
+            return self._execute_workflow_action(action, session)
+
+        elif action_type == "navigate":
+            url = self._render_template(action.get("url", ""), self._build_template_context(session)).strip()
+            if url:
+                try:
+                    tab.get(url)
+                    try:
+                        self.notify_tab_navigated(session, reason="action_navigate")
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                    logger.debug(f"[CMD] 已导航到: {url}")
+                    return f"navigated:{url}"
+                except Exception as e:
+                    logger.warning(f"[CMD] 导航失败: {e}")
+                    return f"navigate_failed:{e}"
+            return "navigate_skipped"
+
+        elif action_type == "http_request":
+            return self._execute_http_request_action(action, session)
+
+        elif action_type == "append_file":
+            return self._execute_append_file_action(action, session)
+
+        elif action_type == "switch_proxy":
+            return self._execute_switch_proxy(action, session)
+
+        elif action_type == "send_webhook":
+            return self._execute_webhook_action(action, session)
+
+        elif action_type == "send_napcat":
+            return self._execute_napcat_action(action, session)
+
+        elif action_type == "execute_command_group":
+            return self._execute_command_group_action(action, session)
+
+        elif action_type == "abort_task":
+            result = self._execute_abort_task(action, session)
+            if bool(action.get("stop_actions", True)):
+                raise CommandFlowAbort("abort_task_triggered")
+            return result
+
+        elif action_type == "release_tab_lock":
+            result = self._execute_release_tab_lock(action, session)
+            if bool(action.get("stop_actions", True)):
+                raise CommandFlowAbort("release_tab_lock_triggered")
+            return result
+
+        else:
+            logger.warning(f"[CMD] 未知动作类型: {action_type}")
+            return {"ok": False, "error": f"unknown_action_type:{action_type or '(empty)'}"}
+
+    def _execute_preset_action(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        """执行预设动作，兼容旧版 switch_preset。"""
+        raw_preset_name = action.get("preset_name", "")
+        if self._should_follow_default_preset(raw_preset_name):
+            try:
+                browser = self._get_browser()
+                success = browser.tab_pool.set_tab_preset(session.persistent_index, None)
+                if not success:
+                    return {"ok": False, "error": "set_default_preset_failed"}
+                domain = self._get_session_domain(session)
+                effective_preset = self._get_config_engine().get_default_preset(domain) or "主预设"
+                logger.debug(f"[CMD] 预设已切换为跟随站点默认: {effective_preset}")
+                return {"ok": True, "preset": effective_preset, "follow_default": True}
+            except Exception as e:
+                logger.warning(f"[CMD] 切换为默认预设失败: {e}")
+                return {"ok": False, "error": str(e)}
+
+        preset_name = self._resolve_preset_name(action.get("preset_name", ""), session)
+        if not preset_name:
+            logger.warning("[CMD] 预设名称为空，跳过执行")
+            return {"ok": False, "error": "empty_preset"}
+
+        try:
+            browser = self._get_browser()
+            success = browser.tab_pool.set_tab_preset(
+                session.persistent_index, preset_name
+            )
+            if not success:
+                return {"ok": False, "error": "set_preset_failed"}
+            logger.debug(f"[CMD] 预设已切换: {preset_name}")
+            return {"ok": True, "preset": preset_name}
+        except Exception as e:
+            logger.warning(f"[CMD] 切换预设失败: {e}")
+            return {"ok": False, "error": str(e)}
+
+    def _execute_workflow_action(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        """在当前标签页上立即执行目标预设的工作流。"""
+        sse_buffer = ""
+
+        def _iter_workflow_chunk_payloads(chunk: Any) -> List[Dict[str, Any]]:
+            nonlocal sse_buffer
+            if isinstance(chunk, bytes):
+                chunk_text = chunk.decode("utf-8", errors="ignore")
+            elif isinstance(chunk, str):
+                chunk_text = chunk
+            else:
+                chunk_text = ""
+
+            if chunk_text:
+                normalized = chunk_text.replace("\r\n", "\n").replace("\r", "\n")
+                normalized_start = normalized.lstrip()
+                looks_like_sse = (
+                    bool(sse_buffer)
+                    or normalized_start.startswith(("data:", "event:", ":"))
+                    or "\ndata:" in normalized
+                )
+                if looks_like_sse:
+                    combined = f"{sse_buffer}{normalized}"
+                    if "\n\n" not in combined:
+                        sse_buffer = combined[-MAX_COMMAND_WORKFLOW_SSE_BUFFER_CHARS:]
+                        return []
+
+                    frames = combined.split("\n\n")
+                    sse_buffer = (
+                        frames[-1][-MAX_COMMAND_WORKFLOW_SSE_BUFFER_CHARS:]
+                        if frames[-1]
+                        else ""
+                    )
+                    complete = "\n\n".join(frames[:-1])
+                    payloads = iter_sse_payloads(f"{complete}\n\n") if complete else []
+                    if payloads:
+                        return payloads
+                    return []
+
+            payloads = iter_sse_payloads(chunk)
+            if payloads:
+                return payloads
+
+            payload = chunk[6:].strip() if isinstance(chunk, str) and chunk.startswith("data: ") else chunk
+            if not payload:
+                return []
+            try:
+                data = json.loads(payload)
+            except Exception:
+                return []
+            return [data] if isinstance(data, dict) else []
+
+        def _workflow_error_from_chunk(chunk: Any) -> Any:
+            for data in _iter_workflow_chunk_payloads(chunk):
+                error = data.get("error")
+                if error:
+                    return error
+            return None
+
+        def _workflow_error_from_pending_buffer() -> Any:
+            nonlocal sse_buffer
+            if not sse_buffer:
+                return None
+            tail = sse_buffer
+            sse_buffer = ""
+            for data in iter_sse_payloads(f"{tail}\n\n"):
+                error = data.get("error")
+                if error:
+                    return error
+            return None
+
+        try:
+            browser = self._get_browser()
+            raw_preset_name = action.get("preset_name", "")
+            preset_name = self._resolve_preset_name(raw_preset_name, session)
+            if self._should_follow_default_preset(raw_preset_name):
+                domain = self._get_session_domain(session)
+                preset_name = self._get_config_engine().get_default_preset(domain) or ""
+            prompt = self._render_template(action.get("prompt", ""), self._build_template_context(session))
+            inherited_workflow_priority = self._normalize_priority(
+                action.get("workflow_priority", getattr(session, "_current_command_priority", None)),
+                self._get_request_priority_baseline(),
+            )
+            timeout_default_raw = os.getenv("CMD_EXECUTE_WORKFLOW_TIMEOUT_SEC", "45")
+            timeout_sec = max(
+                1.0,
+                self._coerce_float(action.get("timeout_sec", timeout_default_raw), 45.0)
+            )
+            started_at = time.time()
+            deadline = started_at + timeout_sec
+            timed_out = False
+            previous_stop_reason = str(getattr(session, "_workflow_stop_reason", "") or "").strip()
+            # High-priority commands may launch a nested workflow while the parent workflow
+            # has already marked the session as interrupted. Clear that inherited stop flag
+            # before starting the nested workflow, otherwise the new workflow self-cancels
+            # immediately. Only restore it afterwards when there is still an active parent
+            # workflow that needs to observe the original interrupt.
+            preserved_interrupt = (
+                previous_stop_reason in {"command_interrupt", "command_interrupt_abort"}
+                and self._has_active_workflow(session)
+            )
+            setattr(session, "_workflow_stop_reason", None)
+
+            def _action_stop_checker() -> bool:
+                nonlocal timed_out
+                current_reason = str(getattr(session, "_workflow_stop_reason", "") or "").strip()
+                if current_reason in {"command_interrupt", "command_interrupt_abort"}:
+                    return True
+                if time.time() >= deadline:
+                    timed_out = True
+                    setattr(session, "_workflow_stop_reason", "timeout")
+                    return True
+                return False
+            try:
+                if preset_name:
+                    effective_preset = preset_name
+                    logger.debug(
+                        f"[CMD] 开始执行工作流: 标签页=#{session.persistent_index}, "
+                        f"预设={effective_preset}, 超时={timeout_sec}秒"
+                    )
+
+                    messages = [{"role": "user", "content": prompt}]
+                    for chunk in browser._execute_workflow_non_stream(
+                        session,
+                        messages,
+                        preset_name=preset_name,
+                        stop_checker=_action_stop_checker,
+                        workflow_priority=inherited_workflow_priority,
+                    ):
+                        workflow_error = _workflow_error_from_chunk(chunk)
+                        if workflow_error:
+                            logger.warning(f"[CMD] 工作流返回错误: {workflow_error}")
+                            return {"ok": False, "error": workflow_error}
+                    workflow_error = _workflow_error_from_pending_buffer()
+                    if workflow_error:
+                        logger.warning(f"[CMD] 工作流返回错误: {workflow_error}")
+                        return {"ok": False, "error": workflow_error}
+                    if timed_out:
+                        logger.warning(
+                            f"[CMD] 工作流执行超时: 标签页=#{session.persistent_index}, "
+                            f"预设={effective_preset}, 超时={timeout_sec}秒"
+                        )
+                        return {
+                            "ok": False,
+                            "error": f"workflow_timeout:{timeout_sec}s",
+                            "timeout": timeout_sec,
+                            "preset": effective_preset,
+                        }
+
+                    logger.debug(
+                        f"[CMD] 工作流执行完成: 标签页=#{session.persistent_index}, 预设={effective_preset}"
+                    )
+                    return {"ok": True, "preset": effective_preset}
+
+                effective_preset = session.preset_name or "主预设"
+                logger.debug(
+                    f"[CMD] 开始执行工作流: 标签页=#{session.persistent_index}, "
+                    f"预设={effective_preset}, 超时={timeout_sec}秒"
+                )
+
+                messages = [{"role": "user", "content": prompt}]
+                for chunk in browser._execute_workflow_non_stream(
+                    session,
+                    messages,
+                    stop_checker=_action_stop_checker,
+                    workflow_priority=inherited_workflow_priority,
+                ):
+                    workflow_error = _workflow_error_from_chunk(chunk)
+                    if workflow_error:
+                        logger.warning(f"[CMD] 工作流返回错误: {workflow_error}")
+                        return {"ok": False, "error": workflow_error}
+                workflow_error = _workflow_error_from_pending_buffer()
+                if workflow_error:
+                    logger.warning(f"[CMD] 工作流返回错误: {workflow_error}")
+                    return {"ok": False, "error": workflow_error}
+                if timed_out:
+                    logger.warning(
+                        f"[CMD] 工作流执行超时: 标签页=#{session.persistent_index}, "
+                        f"预设={effective_preset}, 超时={timeout_sec}秒"
+                    )
+                    return {
+                        "ok": False,
+                        "error": f"workflow_timeout:{timeout_sec}s",
+                        "timeout": timeout_sec,
+                        "preset": effective_preset,
+                    }
+
+                logger.debug(
+                    f"[CMD] 工作流执行完成: 标签页=#{session.persistent_index}, 预设={effective_preset}"
+                )
+                return {"ok": True, "preset": effective_preset}
+            finally:
+                current_reason = str(getattr(session, "_workflow_stop_reason", "") or "").strip()
+                if preserved_interrupt:
+                    setattr(session, "_workflow_stop_reason", previous_stop_reason)
+                elif current_reason == "timeout" and not timed_out:
+                    setattr(session, "_workflow_stop_reason", "")
+        except Exception as e:
+            logger.warning(f"[CMD] 执行工作流失败: {e}")
+            return {"ok": False, "error": str(e)}
+
+    @staticmethod
+    def _sanitize_command_var_name(name: Any) -> str:
+        raw = str(name or "").strip()
+        if not raw:
+            return ""
+        return re.sub(r"[^a-zA-Z0-9_]+", "_", raw).strip("_")[:64]
+
+    def _get_command_vars(self, session: 'TabSession') -> Dict[str, str]:
+        store = getattr(session, "_command_vars", None)
+        if isinstance(store, dict):
+            return store
+        store = {}
+        setattr(session, "_command_vars", store)
+        return store
+
+    def _set_command_var(self, session: 'TabSession', name: Any, value: Any) -> str:
+        key = self._sanitize_command_var_name(name)
+        if not key:
+            return ""
+        self._get_command_vars(session)[key] = str(value or "")
+        return key
+
+    def _save_generated_value(
+        self,
+        session: 'TabSession',
+        save_as: Any,
+        value: Any,
+        extras: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        key = self._set_command_var(session, save_as, value)
+        if key and isinstance(extras, dict):
+            for extra_key, extra_value in extras.items():
+                if extra_value is None:
+                    continue
+                self._set_command_var(session, f"{key}_{extra_key}", extra_value)
+        return key
+
+    @staticmethod
+    def _preview_text(value: Any, limit: int = 120) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
+    @staticmethod
+    def _pick_random_chars(kind: str, length: int) -> str:
+        charsets = {
+            "digits": string.digits,
+            "letters": string.ascii_letters,
+            "alnum": string.ascii_letters + string.digits,
+            "hex": string.hexdigits.lower()[:16],
+        }
+        pool = charsets.get(str(kind or "").strip().lower(), charsets["alnum"])
+        return "".join(random.choice(pool) for _ in range(max(0, length)))
+
+    @staticmethod
+    def _format_birthdate(picked: date, date_format: str) -> str:
+        fmt = str(date_format or "YYYY-MM-DD").strip() or "YYYY-MM-DD"
+        replacements = [
+            ("YYYY", f"{picked.year:04d}"),
+            ("YY", f"{picked.year % 100:02d}"),
+            ("MM", f"{picked.month:02d}"),
+            ("DD", f"{picked.day:02d}"),
+            ("M", str(picked.month)),
+            ("D", str(picked.day)),
+        ]
+        rendered = fmt
+        for token, value in replacements:
+            rendered = rendered.replace(token, value)
+        return rendered
+
+    def _generate_birthdate_value(self, action: Dict) -> Dict[str, Any]:
+        preset_name = str(action.get("preset_name", "") or "").strip().lower()
+        min_age = max(0, self._coerce_int(action.get("min_age", 18), 18))
+        max_age = max(min_age, self._coerce_int(action.get("max_age", 35), 35))
+        latest = date.today() - timedelta(days=max(0, min_age) * 365)
+        earliest = date.today() - timedelta(days=max(0, max_age) * 365 + max_age // 4 + 2)
+        span_days = max(0, (latest - earliest).days)
+        picked = earliest + timedelta(days=random.randint(0, span_days if span_days > 0 else 0))
+        parts = {
+            "year": f"{picked.year:04d}",
+            "month": f"{picked.month:02d}",
+            "day": f"{picked.day:02d}",
+            "month_num": str(picked.month),
+            "day_num": str(picked.day),
+            "iso": picked.isoformat(),
+        }
+        value = self._format_birthdate(
+            picked,
+            str(action.get("date_format", "YYYY-MM-DD") or "YYYY-MM-DD"),
+        )
+        if preset_name == "birth_year":
+            value = parts["year"]
+        elif preset_name == "birth_month":
+            value = parts["month"]
+        elif preset_name == "birth_day":
+            value = parts["day"]
+        return {"value": value, "extras": parts}
+
+    @staticmethod
+    def _generate_chinese_name_value(action: Dict) -> Dict[str, Any]:
+        surnames = list("赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝安常乐于时傅皮卞齐康伍余元顾孟平黄和穆萧尹")
+        given_chars = list("子文宇晨若思雨欣安泽俊浩嘉依清语然一可宁涵诗雅博昊轩瑶琪妍婷悦萌锦瑞宸铭霖舒彤佳林远晴川宁知南星岚婧凡熙程涵洛言楚歆沐芷")
+        surname = random.choice(surnames)
+        given_len = 1 if random.random() < 0.32 else 2
+        given = "".join(random.choice(given_chars) for _ in range(given_len))
+        preset_name = str(action.get("preset_name", "") or "").strip().lower()
+        if preset_name == "surname_cn":
+            value = surname
+        elif preset_name == "given_name_cn":
+            value = given
+        else:
+            value = surname + given
+        return {
+            "value": value,
+            "extras": {
+                "surname": surname,
+                "given": given,
+                "full": surname + given,
+            },
+        }
+
+    def _resolve_automation_value(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        source = str(action.get("value_source", "literal") or "literal").strip().lower()
+        context = self._build_template_context(session)
+        extras: Dict[str, Any] = {}
+
+        if source == "template":
+            value = self._render_template(action.get("template", ""), context)
+        elif source == "variable":
+            key = self._sanitize_command_var_name(action.get("variable_name"))
+            value = self._get_command_vars(session).get(key, "")
+        elif source in {"random", "prefix_random"}:
+            length = max(1, self._coerce_int(action.get("random_length", 8), 8))
+            random_part = self._pick_random_chars(action.get("random_kind", "alnum"), length)
+            prefix = self._render_template(action.get("prefix", ""), context) if source == "prefix_random" else ""
+            suffix = self._render_template(action.get("suffix", ""), context) if source == "prefix_random" else ""
+            value = f"{prefix}{random_part}{suffix}"
+            extras["random"] = random_part
+        elif source == "preset":
+            preset_name = str(action.get("preset_name", "") or "").strip().lower()
+            if preset_name in {"name_cn", "surname_cn", "given_name_cn"}:
+                generated = self._generate_chinese_name_value(action)
+            elif preset_name in {"birth_date", "birth_year", "birth_month", "birth_day"}:
+                generated = self._generate_birthdate_value(action)
+            else:
+                generated = {"value": "", "extras": {}}
+            value = str(generated.get("value", "") or "")
+            extras.update(generated.get("extras") or {})
+        else:
+            value = str(action.get("text", "") or "")
+
+        return {
+            "value": str(value or ""),
+            "extras": extras,
+        }
+
+    @staticmethod
+    def _read_element_value(ele: Any, read_mode: str, attr_name: str = "") -> str:
+        js = (
+            "return (function() {\n"
+            "  try {\n"
+            "    const el = this;\n"
+            "    const tag = String(el?.tagName || '').toLowerCase();\n"
+            "    const isInput = tag === 'textarea' || tag === 'input' || tag === 'select';\n"
+            "    const isCE = !!(el?.isContentEditable || el?.getAttribute?.('contenteditable') === 'true');\n"
+            f"    const normalizedMode = {json.dumps(str(read_mode or 'auto').strip().lower())};\n"
+            f"    const attrName = {json.dumps(str(attr_name or '').strip())};\n"
+            "    if (normalizedMode === 'value') return String(el?.value ?? '');\n"
+            "    if (normalizedMode === 'html') return String(el?.innerHTML ?? '');\n"
+            "    if (normalizedMode === 'attr') return String(el?.getAttribute?.(attrName || '') ?? '');\n"
+            "    if (normalizedMode === 'text') {\n"
+            "      if (isInput) return String(el?.value ?? '');\n"
+            "      if (isCE) return String(el?.innerText ?? '');\n"
+            "      return String(el?.innerText ?? el?.textContent ?? '');\n"
+            "    }\n"
+            "    if (isInput) return String(el?.value ?? '');\n"
+            "    if (isCE) return String(el?.innerText ?? '');\n"
+            "    return String(el?.innerText ?? el?.textContent ?? '');\n"
+            "  } catch (error) {\n"
+            "    return '';\n"
+            "  }\n"
+            "}).call(this);"
+        )
+        value = ele.run_js(js)
+        return str(value or "")
+
+    def _execute_read_element_action(self, action: Dict, session: 'TabSession') -> Any:
+        selector = str(action.get("selector", "") or "").strip()
+        if not selector:
+            return {"ok": False, "error": "empty_selector"}
+
+        timeout_sec = max(0.5, self._coerce_float(action.get("timeout_sec", 6), 6.0))
+        read_mode = str(action.get("read_mode", "auto") or "auto").strip().lower()
+        attr_name = str(action.get("attr_name", "") or "").strip()
+        trim_enabled = bool(action.get("trim", True))
+
+        try:
+            ele = session.tab.ele(selector, timeout=timeout_sec)
+            if not ele:
+                return {"ok": False, "error": f"element_not_found:{selector}"}
+            value = self._read_element_value(ele, read_mode, attr_name)
+            if trim_enabled:
+                value = value.strip()
+            saved_as = self._save_generated_value(session, action.get("save_as"), value)
+            logger.info(
+                f"[CMD] 已读取元素: selector={selector}, mode={read_mode}, "
+                f"保存变量={saved_as or '-'}, 预览={self._preview_text(value)!r}"
+            )
+            return value
+        except Exception as e:
+            logger.warning(f"[CMD] 读取元素失败: {e}")
+            return {"ok": False, "error": str(e)}
+
+    def _execute_write_element_action(self, action: Dict, session: 'TabSession') -> Any:
+        selector = str(action.get("selector", "") or "").strip()
+        if not selector:
+            return {"ok": False, "error": "empty_selector"}
+
+        timeout_sec = max(0.5, self._coerce_float(action.get("timeout_sec", 6), 6.0))
+        write_mode = str(action.get("write_mode", "replace") or "replace").strip().lower()
+        clear_first = bool(action.get("clear_first", write_mode == "replace"))
+        resolved = self._resolve_automation_value(action, session)
+        value = str(resolved.get("value", "") or "")
+        extras = resolved.get("extras") or {}
+
+        try:
+            ele = session.tab.ele(selector, timeout=timeout_sec)
+            if not ele:
+                return {"ok": False, "error": f"element_not_found:{selector}"}
+
+            from app.core.workflow.text_input import TextInputHandler
+
+            handler = TextInputHandler(
+                session.tab,
+                stealth_mode=False,
+                smart_delay_fn=lambda minimum=0.05, maximum=0.12: time.sleep(random.uniform(minimum, maximum)),
+                check_cancelled_fn=lambda: False,
+            )
+            if clear_first and write_mode == "replace":
+                handler.clear_input_safely(ele)
+                time.sleep(0.08)
+            success = handler.set_input_atomic(ele, value, mode="append" if write_mode == "append" else "replace")
+            if not success:
+                return {"ok": False, "error": "write_failed"}
+
+            actual_value = handler.read_input_full_text(ele)
+            actual_normalized = handler.normalize_for_compare(actual_value)
+            expected_normalized = handler.normalize_for_compare(value)
+            if write_mode == "append":
+                verified = expected_normalized in actual_normalized
+            else:
+                expected_core = re.sub(r"\s+", "", value)
+                actual_core = re.sub(r"\s+", "", actual_value)
+                verified = actual_normalized == expected_normalized or (expected_core and expected_core == actual_core)
+            if not verified:
+                return {
+                    "ok": False,
+                    "error": "write_verify_failed",
+                    "expected": self._preview_text(value),
+                    "actual": self._preview_text(actual_value),
+                }
+
+            saved_as = self._save_generated_value(session, action.get("save_as"), value, extras)
+            logger.info(
+                f"[CMD] 已写入元素: selector={selector}, mode={write_mode}, "
+                f"保存变量={saved_as or '-'}, 预览={self._preview_text(value)!r}"
+            )
+            return value
+        except Exception as e:
+            logger.warning(f"[CMD] 写入元素失败: {e}")
+            return {"ok": False, "error": str(e)}
+
+    def _execute_http_request_action(self, action: Dict, session: 'TabSession') -> Any:
+        ctx = self._build_template_context(session)
+        request_profile = str(action.get("request_profile", "") or "").strip().lower()
+        if request_profile:
+            handler = get_transport_profile_handler(request_profile)
+            if handler is not None:
+                return handler(action, session, ctx, self)
+
+        method = str(action.get("method", "GET") or "GET").strip().upper()
+        url = self._render_template(action.get("url", ""), ctx).strip()
+        if not url:
+            return {"ok": False, "error": "empty_url"}
+
+        headers_raw = action.get("headers", "")
+        headers_value = self._render_template_data(headers_raw, ctx)
+        if isinstance(headers_value, dict):
+            headers = {str(key): str(value) for key, value in headers_value.items()}
+        else:
+            parsed_headers = self._parse_json_or_string(str(headers_value or ""))
+            headers = parsed_headers if isinstance(parsed_headers, dict) else {}
+
+        body = self._render_template(str(action.get("body", "") or ""), ctx)
+        body_mode = str(action.get("body_mode", "json") or "json").strip().lower()
+        response_mode = str(action.get("response_mode", "text") or "text").strip().lower()
+        credentials = str(action.get("credentials", "include") or "include").strip().lower() or "include"
+        timeout_ms = int(max(1000, self._coerce_float(action.get("timeout_sec", 15), 15.0) * 1000))
+        fail_on_http_error = bool(action.get("fail_on_http_error", True))
+
+        request_js = f"""
+        return (async () => {{
+            const method = {json.dumps(method)};
+            const url = {json.dumps(url)};
+            const headers = {json.dumps(headers, ensure_ascii=False)};
+            const bodyMode = {json.dumps(body_mode)};
+            const rawBody = {json.dumps(body, ensure_ascii=False)};
+            const responseMode = {json.dumps(response_mode)};
+            const credentialsMode = {json.dumps(credentials)};
+            const failOnHttpError = {str(bool(fail_on_http_error)).lower()};
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort('timeout'), {timeout_ms});
+            try {{
+                const init = {{
+                    method,
+                    headers: Object.assign({{}}, headers),
+                    credentials: credentialsMode,
+                    redirect: 'follow',
+                    signal: controller.signal,
+                }};
+                if (!['GET', 'HEAD'].includes(method)) {{
+                    if (bodyMode === 'form') {{
+                        let formBody = rawBody;
+                        try {{
+                            const parsed = rawBody ? JSON.parse(rawBody) : {{}};
+                            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {{
+                                const params = new URLSearchParams();
+                                Object.entries(parsed).forEach(([key, value]) => params.append(String(key), String(value ?? '')));
+                                formBody = params.toString();
+                            }}
+                        }} catch (error) {{}}
+                        init.body = formBody;
+                        if (!init.headers['Content-Type']) {{
+                            init.headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+                        }}
+                    }} else if (bodyMode === 'text') {{
+                        init.body = rawBody;
+                        if (!init.headers['Content-Type']) {{
+                            init.headers['Content-Type'] = 'text/plain;charset=UTF-8';
+                        }}
+                    }} else {{
+                        init.body = rawBody;
+                        if (!init.headers['Content-Type']) {{
+                            init.headers['Content-Type'] = 'application/json;charset=UTF-8';
+                        }}
+                    }}
+                }}
+                const response = await fetch(url, init);
+                const contentType = response.headers.get('content-type') || '';
+                let text = '';
+                try {{
+                    text = await response.text();
+                }} catch (error) {{
+                    text = '';
+                }}
+                let parsedJson = null;
+                if (text) {{
+                    try {{
+                        parsedJson = JSON.parse(text);
+                    }} catch (error) {{}}
+                }}
+                const payload = {{
+                    ok: response.ok,
+                    status: response.status,
+                    url: response.url || url,
+                    content_type: contentType,
+                    text,
+                    json: parsedJson,
+                }};
+                if (failOnHttpError && payload.status >= 400) {{
+                    return '__CMD_HTTP_STATUS__' + JSON.stringify({{
+                        ok: payload.ok,
+                        status: payload.status,
+                        url: payload.url,
+                        body: parsedJson !== null ? parsedJson : text
+                    }});
+                }}
+                if (responseMode === 'status') return JSON.stringify({{
+                    ok: payload.ok,
+                    status: payload.status,
+                    url: payload.url
+                }});
+                if (responseMode === 'json') return parsedJson !== null ? JSON.stringify(parsedJson) : text;
+                if (responseMode === 'response') return JSON.stringify({{
+                    ok: payload.ok,
+                    status: payload.status,
+                    url: payload.url,
+                    body: parsedJson !== null ? parsedJson : text
+                }});
+                return text;
+            }} catch (error) {{
+                return '__CMD_HTTP_ERROR__' + String(error && error.message ? error.message : error);
+            }} finally {{
+                clearTimeout(timer);
+            }}
+        }})()
+        """
+
+        try:
+            result = self._run_command_js(session.tab, request_js)
+            result_text = str(result or "")
+            if result_text.startswith("__CMD_HTTP_ERROR__"):
+                return {"ok": False, "error": result_text.replace("__CMD_HTTP_ERROR__", "", 1)}
+            if result_text.startswith("__CMD_HTTP_STATUS__"):
+                try:
+                    parsed = json.loads(result_text.replace("__CMD_HTTP_STATUS__", "", 1))
+                except Exception:
+                    parsed = {}
+                status_code = int(parsed.get("status", 0) or 0)
+                return {"ok": False, "error": f"http_status_{status_code}", "status": status_code, "response": parsed}
+
+            saved_as = self._save_generated_value(session, action.get("save_as"), result_text)
+            logger.info(
+                f"[CMD] 页面内请求完成: {method} {url} "
+                f"(mode={response_mode}, 保存变量={saved_as or '-'}, 预览={self._preview_text(result_text)!r})"
+            )
+            return result_text
+        except Exception as e:
+            logger.warning(f"[CMD] 页面内请求失败: {e}")
+            return {"ok": False, "error": str(e)}
+
+    def _execute_http_request_deepseek_completion(
+        self,
+        action: Dict,
+        session: 'TabSession',
+        ctx: Dict[str, Any],
+    ) -> Any:
+        handler = get_transport_profile_handler("deepseek_completion")
+        if handler is not None:
+            return handler(action, session, ctx, self)
+        return {"ok": False, "error": "deepseek_completion_handler_not_found"}
+
+    def _get_append_file_base_dir(self) -> str:
+        raw_base = str(os.getenv("CMD_APPEND_FILE_BASE_DIR", "") or "").strip()
+        if raw_base:
+            base_dir = raw_base
+        else:
+            try:
+                from app.core.config import PROJECT_ROOT
+                base_dir = os.path.join(str(PROJECT_ROOT), "data", "command_outputs")
+            except Exception:
+                base_dir = os.path.join(os.getcwd(), "data", "command_outputs")
+        return os.path.abspath(os.path.expanduser(base_dir))
+
+    @staticmethod
+    def _is_path_within_base(target_path: str, base_dir: str) -> bool:
+        try:
+            base_norm = os.path.normcase(os.path.normpath(os.path.realpath(base_dir)))
+            target_norm = os.path.normcase(os.path.normpath(os.path.realpath(target_path)))
+            return os.path.commonpath([base_norm, target_norm]) == base_norm
+        except Exception:
+            return False
+
+    def _resolve_append_file_path(self, file_path: str) -> Dict[str, str]:
+        raw_path = str(file_path or "").strip()
+        if not raw_path:
+            raise ValueError("empty_file_path")
+
+        base_dir = self._get_append_file_base_dir()
+        expanded_path = os.path.expanduser(raw_path)
+        if os.path.isabs(expanded_path):
+            target_path = os.path.abspath(expanded_path)
+        else:
+            target_path = os.path.abspath(os.path.join(base_dir, expanded_path))
+
+        if not self._is_path_within_base(target_path, base_dir):
+            raise PermissionError(
+                f"append_file path escapes safe base: path={target_path}, base={base_dir}"
+            )
+
+        return {"path": target_path, "base_dir": base_dir}
+
+    def _execute_append_file_action(self, action: Dict, session: 'TabSession') -> Any:
+        ctx = self._build_template_context(session)
+        file_path = self._render_template(action.get("file_path", ""), ctx).strip()
+        if not file_path:
+            return {"ok": False, "error": "empty_file_path"}
+
+        content = self._render_template(action.get("content", ""), ctx)
+        append_newline = bool(action.get("append_newline", True))
+        create_dirs = bool(action.get("create_dirs", True))
+        encoding = str(action.get("encoding", "utf-8") or "utf-8").strip() or "utf-8"
+
+        try:
+            resolved = self._resolve_append_file_path(file_path)
+            normalized_path = resolved["path"]
+            base_dir = resolved["base_dir"]
+            parent_dir = os.path.dirname(normalized_path)
+            if create_dirs and parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            if not self._is_path_within_base(normalized_path, base_dir):
+                raise PermissionError(
+                    f"append_file path escapes safe base after directory creation: "
+                    f"path={normalized_path}, base={base_dir}"
+                )
+
+            write_text = content + ("\n" if append_newline else "")
+            with open(normalized_path, "a", encoding=encoding, newline="") as f:
+                f.write(write_text)
+
+            logger.info(
+                f"[CMD] 已追加到文件: path={normalized_path}, "
+                f"chars={len(write_text)}, newline={append_newline}"
+            )
+            return {
+                "ok": True,
+                "path": normalized_path,
+                "base_dir": base_dir,
+                "chars": len(write_text),
+                "preview": self._preview_text(write_text),
+            }
+        except Exception as e:
+            logger.warning(f"[CMD] 追加文件失败: {e}")
+            return {"ok": False, "error": str(e), "path": file_path}
+
+    def _build_template_context(self, session: 'TabSession') -> Dict[str, Any]:
+        current_context = getattr(session, "_current_command_context", None) or {}
+        current_command = getattr(session, "_current_command", None) or {}
+        latest_event = copy.deepcopy(current_context.get("network_event") or {})
+        latest_result_event = copy.deepcopy(current_context.get("command_result_event") or {})
+        domain = self._get_session_domain(session)
+        effective_preset = session.preset_name or self._get_config_engine().get_default_preset(domain) or "主预设"
+        context = {
+            "tab_id": session.id,
+            "tab_index": session.persistent_index,
+            "domain": domain,
+            "preset": effective_preset,
+            "request_count": session.request_count,
+            "error_count": session.error_count,
+            "task_id": session.current_task_id or "",
+            "timestamp": int(time.time()),
+            "iso_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "network_url": str(latest_event.get("url", "") or ""),
+            "network_status": str(latest_event.get("status", "") or ""),
+            "network_method": str(latest_event.get("method", "") or ""),
+            "source_command_id": str(latest_result_event.get("source_command_id", "") or ""),
+            "source_command_name": str(latest_result_event.get("source_command_name", "") or ""),
+            "source_group_name": str(latest_result_event.get("source_group_name", "") or ""),
+            "command_result": str(latest_result_event.get("result", "") or ""),
+            "command_result_summary": str(latest_result_event.get("summary", "") or ""),
+            "command_result_mode": str(latest_result_event.get("mode", "") or ""),
+            "command_result_informative": str(bool(latest_result_event.get("informative", False))).lower(),
+            "command_result_time": str(int(latest_result_event.get("timestamp", 0) or 0)),
+            "command_ui": copy.deepcopy(current_command.get("advanced_ui") or {}),
+        }
+        context.update({
+            str(key): str(value)
+            for key, value in self._get_command_vars(session).items()
+            if str(key).strip()
+        })
+        return context
+
+    def _render_template(self, template: Any, context: Dict[str, Any]) -> str:
+        raw = str(template or "")
+
+        def _replace(match: re.Match) -> str:
+            key = match.group(1).strip()
+            if key in context:
+                return str(context.get(key, ""))
+            return str(os.getenv(key, ""))
+
+        return re.sub(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", _replace, raw)
+
+    def _render_template_data(self, value: Any, context: Dict[str, Any]) -> Any:
+        if isinstance(value, dict):
+            return {str(key): self._render_template_data(item, context) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._render_template_data(item, context) for item in value]
+        if isinstance(value, tuple):
+            return [self._render_template_data(item, context) for item in value]
+        if isinstance(value, str):
+            return self._render_template(value, context)
+        return value
+
+    def _parse_json_or_string(self, raw: str) -> Any:
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return json.loads(text)
+            except Exception:
+                return text
+        return text
+
+    def _execute_webhook_action(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        if not HAS_REQUESTS:
+            logger.error("[CMD] send_webhook 需要 requests 库，请运行: pip install requests")
+            return {"ok": False, "error": "requests_not_installed"}
+
+        ctx = self._build_template_context(session)
+        method = str(action.get("method", "POST") or "POST").strip().upper()
+        timeout = float(action.get("timeout", 8))
+        url = self._render_template(action.get("url", ""), ctx).strip()
+        if not url:
+            logger.warning("[CMD] Webhook URL 为空，跳过执行")
+            return {"ok": False, "error": "empty_url"}
+
+        raw_payload = action.get("payload", "")
+        if isinstance(raw_payload, (dict, list, tuple)):
+            payload = self._render_template_data(raw_payload, ctx)
+        else:
+            payload_text = self._render_template(raw_payload, ctx)
+            payload = self._parse_json_or_string(payload_text)
+
+        raw_headers = action.get("headers")
+        headers: Dict[str, str] = {}
+        if isinstance(raw_headers, dict):
+            rendered_headers = self._render_template_data(raw_headers, ctx)
+            headers = {str(key): str(value) for key, value in rendered_headers.items()}
+        elif isinstance(raw_headers, str) and raw_headers.strip():
+            parsed = self._parse_json_or_string(self._render_template(raw_headers, ctx))
+            if isinstance(parsed, dict):
+                headers = {str(k): str(v) for k, v in parsed.items()}
+
+        request_kwargs: Dict[str, Any] = {
+            "method": method,
+            "url": url,
+            "timeout": timeout,
+            "headers": headers or None,
+        }
+
+        if method == "GET":
+            if isinstance(payload, dict):
+                request_kwargs["params"] = payload
+            elif payload:
+                request_kwargs["params"] = {"payload": payload}
+        else:
+            if isinstance(payload, (dict, list)):
+                request_kwargs["json"] = payload
+            elif payload:
+                request_kwargs["data"] = payload
+
+        try:
+            response = requests.request(**request_kwargs)
+            if bool(action.get("raise_for_status", False)):
+                response.raise_for_status()
+
+            logger.info(f"[CMD] Webhook 已发送: {method} {url} -> {response.status_code}")
+            return {
+                "ok": response.ok,
+                "status_code": response.status_code,
+                "url": url,
+                "body_preview": response.text[:200],
+            }
+        except Exception as e:
+            logger.warning(f"[CMD] Webhook 发送失败: {e}")
+            return {"ok": False, "error": str(e), "url": url}
+
+    def _execute_napcat_action(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        if not HAS_REQUESTS:
+            logger.error("[CMD] send_napcat 需要 requests 库，请运行: pip install requests")
+            return {"ok": False, "error": "requests_not_installed"}
+
+        ctx = self._build_template_context(session)
+        base_url = self._render_template(action.get("base_url", ""), ctx).strip().rstrip("/")
+        target_type = str(action.get("target_type", "private") or "private").strip().lower()
+        timeout = float(action.get("timeout", 8))
+        access_token = self._render_template(action.get("access_token", ""), ctx).strip()
+        message = self._render_template(
+            action.get("message", "{{command_result_summary}}"),
+            ctx,
+        ).strip()
+
+        if not base_url:
+            return {"ok": False, "error": "empty_base_url"}
+        if not message:
+            return {"ok": False, "error": "empty_message"}
+
+        if target_type == "group":
+            api_path = "/send_group_msg"
+            target_id = str(action.get("group_id", "") or "").strip()
+            payload = {"group_id": int(target_id), "message": message} if target_id.isdigit() else {"group_id": target_id, "message": message}
+        else:
+            api_path = "/send_private_msg"
+            target_id = str(action.get("user_id", "") or "").strip()
+            payload = {"user_id": int(target_id), "message": message} if target_id.isdigit() else {"user_id": target_id, "message": message}
+
+        if not target_id:
+            return {"ok": False, "error": f"empty_{target_type}_id"}
+
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if access_token:
+            headers["Authorization"] = access_token if " " in access_token else access_token
+
+        url = f"{base_url}{api_path}"
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            if bool(action.get("raise_for_status", True)):
+                response.raise_for_status()
+            logger.info(f"[CMD] NapCat 已发送: {target_type} {target_id} -> {response.status_code}")
+            return {
+                "ok": response.ok,
+                "status_code": response.status_code,
+                "url": url,
+                "target_type": target_type,
+                "target_id": target_id,
+                "body_preview": response.text[:200],
+            }
+        except Exception as e:
+            logger.warning(f"[CMD] NapCat 发送失败: {e}")
+            return {"ok": False, "error": str(e), "url": url, "target_type": target_type, "target_id": target_id}
+
+    def _execute_command_group_action(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        group_name = self._normalize_group_name(action.get("group_name"))
+        include_disabled = bool(action.get("include_disabled", False))
+        acquire_policy = action.get("acquire_policy", "inherit_session")
+        if not group_name:
+            logger.warning("[CMD] execute_command_group 缺少 group_name，跳过执行")
+            return {"ok": False, "error": "empty_group_name"}
+
+        logger.info(
+            f"[CMD] 执行命令组动作: {group_name} "
+            f"(include_disabled={include_disabled}, acquire_policy={acquire_policy})"
+        )
+        ancestry_chain = list(getattr(session, "_current_command_chain", None) or [])
+        return self.execute_command_group(
+            group_name=group_name,
+            session=session,
+            include_disabled=include_disabled,
+            source_command_id=str(getattr(session, "_current_command_id", "") or "").strip() or None,
+            ancestry_chain=ancestry_chain,
+            acquire_policy=acquire_policy,
+        )
+
+    def _execute_abort_task(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        reason = str(action.get("reason", "abort_task_action")).strip() or "abort_task_action"
+        cancelled = False
+        try:
+            from app.services.request_manager import request_manager
+            cancelled = request_manager.cancel_current(reason, tab_id=session.id)
+        except Exception as e:
+            logger.debug(f"[CMD] 取消请求失败（可忽略）: {e}")
+
+        try:
+            if hasattr(session.tab, "stop_loading"):
+                session.tab.stop_loading()
+            session.tab.run_js("if (window.stop) { window.stop(); }")
+        except Exception:
+            pass
+
+        logger.info(f"[CMD] 中断任务动作已执行 (已取消={cancelled}, 原因={reason})")
+        return {"ok": True, "cancelled": cancelled, "reason": reason}
+
+    def _execute_release_tab_lock(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        """
+        解除当前标签页占用：
+        - 尝试取消该标签页关联请求；
+        - 强制释放标签页 BUSY 状态；
+        - 可选重置到 about:blank。
+        """
+        reason = str(action.get("reason", "release_tab_lock_action")).strip() or "release_tab_lock_action"
+        clear_page = bool(action.get("clear_page", True))
+        try:
+            browser = self._get_browser()
+            pool = browser.tab_pool
+            result = pool.terminate_by_index(
+                session.persistent_index,
+                reason=reason,
+                clear_page=clear_page,
+            )
+            logger.info(
+                f"[CMD] 解除标签页占用完成: 标签页=#{session.persistent_index}, "
+                f"已取消={result.get('cancelled')}, 状态={result.get('status')}, 原因={reason}"
+            )
+            return result
+        except Exception as e:
+            logger.warning(f"[CMD] 解除标签页占用失败: {e}")
+            return {"ok": False, "error": str(e), "reason": reason}
+
+    # ================= 代理切换 =================
+
+    def _execute_switch_proxy(self, action: Dict, session: 'TabSession') -> Dict[str, Any]:
+        """
+        执行代理节点切换（通过 Clash API）
+        """
+        if not HAS_REQUESTS:
+            logger.error("[CMD] 切换代理需要 requests 库，请运行: pip install requests")
+            return {"ok": False, "error": "requests_not_installed"}
+
+        # 读取配置
+        clash_api = action.get("clash_api", "http://127.0.0.1:9090").rstrip("/")
+        clash_secret = action.get("clash_secret", "")
+        selector = action.get("selector", "Proxy")
+        mode = action.get("mode", "random")
+        node_name = action.get("node_name", "")
+        exclude_str = action.get("exclude_keywords", "DIRECT,REJECT,GLOBAL,自动选择,故障转移")
+        refresh_after = action.get("refresh_after", True)
+
+        exclude_keywords = [k.strip() for k in exclude_str.split(",") if k.strip()]
+
+        headers = {"Content-Type": "application/json"}
+        if clash_secret:
+            headers["Authorization"] = f"Bearer {clash_secret}"
+
+        try:
+            resp = requests.get(
+                f"{clash_api}/proxies/{selector}",
+                headers=headers,
+                timeout=5
+            )
+
+            if resp.status_code == 404:
+                logger.error(f"[CMD] 代理组 '{selector}' 不存在，请检查 Clash 配置")
+                return {"ok": False, "error": "proxy_group_not_found"}
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            current_node = data.get("now", "")
+            all_nodes = data.get("all", [])
+
+            available = []
+            for node in all_nodes:
+                should_exclude = False
+                for keyword in exclude_keywords:
+                    if keyword and keyword in node:
+                        should_exclude = True
+                        break
+                if not should_exclude:
+                    available.append(node)
+
+            if not available:
+                logger.warning("[CMD] 没有可用的代理节点")
+                return {"ok": False, "error": "no_available_nodes"}
+
+            new_node = None
+
+            if mode == "specific":
+                if node_name in available:
+                    new_node = node_name
+                else:
+                    logger.warning(f"[CMD] 指定节点 '{node_name}' 不可用，回退到随机模式")
+                    mode = "random"
+
+            if mode == "random":
+                candidates = [n for n in available if n != current_node]
+                if candidates:
+                    new_node = random.choice(candidates)
+                else:
+                    new_node = random.choice(available)
+
+            elif mode == "round_robin":
+                try:
+                    current_idx = available.index(current_node)
+                    next_idx = (current_idx + 1) % len(available)
+                    new_node = available[next_idx]
+                except ValueError:
+                    new_node = available[0]
+
+            if not new_node:
+                logger.warning("[CMD] 无法选择新节点")
+                return {"ok": False, "error": "cannot_pick_node"}
+
+            if new_node == current_node:
+                logger.info(f"[CMD] 当前已是节点: {current_node}，跳过切换")
+                return {"ok": True, "switched": False, "node": current_node}
+
+            switch_resp = requests.put(
+                f"{clash_api}/proxies/{selector}",
+                json={"name": new_node},
+                headers=headers,
+                timeout=5
+            )
+            switch_resp.raise_for_status()
+
+            logger.info(f"[CMD] ✅ 代理已切换: {current_node} → {new_node}")
+
+            if refresh_after:
+                time.sleep(1)
+                try:
+                    session.tab.refresh()
+                    try:
+                        self.notify_tab_navigated(session, reason="action_switch_proxy_refresh")
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                    logger.debug("[CMD] 页面已刷新")
+                except Exception as e:
+                    logger.warning(f"[CMD] 刷新页面失败: {e}")
+
+            return {
+                "ok": True,
+                "switched": True,
+                "from": current_node,
+                "to": new_node,
+            }
+
+        except requests.exceptions.ConnectionError:
+            logger.error(f"[CMD] ❌ 无法连接到 Clash API ({clash_api})，请检查 Clash 是否运行")
+            return {"ok": False, "error": "connection_error"}
+        except requests.exceptions.Timeout:
+            logger.error("[CMD] ❌ Clash API 请求超时")
+            return {"ok": False, "error": "timeout"}
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"[CMD] ❌ Clash API 错误: {e}")
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"[CMD] ❌ 切换代理失败: {e}")
+            return {"ok": False, "error": str(e)}
+
+    # ================= 高级模式 =================
+
+    @staticmethod
+    def _command_env_flag(name: str, default: bool = False) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _get_python_sandbox_allowed_imports(self) -> set:
+        allowed = set(getattr(self, "_BASE_PYTHON_SANDBOX_ALLOWED_IMPORTS", _BASE_PYTHON_SANDBOX_ALLOWED_IMPORTS))
+        allowed.update(_REGISTERED_SANDBOX_ALLOWED_IMPORTS)
+        if hasattr(self, "_PYTHON_SANDBOX_ALLOWED_IMPORTS"):
+            allowed.update(self._PYTHON_SANDBOX_ALLOWED_IMPORTS)
+        extra = str(os.getenv("CMD_PYTHON_SANDBOX_ALLOWED_IMPORTS", "") or "").strip()
+        if extra:
+            for name in extra.split(","):
+                normalized = str(name or "").strip()
+                if normalized:
+                    allowed.add(normalized)
+        if HAS_REQUESTS and self._command_env_flag("CMD_PYTHON_SANDBOX_ALLOW_REQUESTS", True):
+            allowed.add("requests")
+            allowed.add("urllib.parse")
+        return allowed
+
+    @staticmethod
+    def _is_python_import_allowed(module_name: str, allowed_imports: set) -> bool:
+        normalized = str(module_name or "").strip()
+        if not normalized:
+            return False
+        return any(
+            normalized == allowed or normalized.startswith(f"{allowed}.")
+            for allowed in allowed_imports
+        )
+
+    def _guarded_python_import(self, allowed_imports: set):
+        real_import = __import__
+
+        def _import(name, globals=None, locals=None, fromlist=(), level=0):
+            if level != 0:
+                raise ImportError("relative imports are disabled in command python sandbox")
+            module_name = str(name or "").strip()
+            if not self._is_python_import_allowed(module_name, allowed_imports):
+                raise ImportError(f"import disabled in command python sandbox: {module_name}")
+            return real_import(name, globals, locals, fromlist, level)
+
+        return _import
+
+    def _validate_python_script_safety(self, script: str, allowed_imports: set) -> None:
+        tree = ast.parse(script)
+        blocked_attrs = {
+            "__builtins__",
+            "__class__",
+            "__dict__",
+            "__globals__",
+            "__mro__",
+            "__subclasses__",
+            "builtins",
+            "ctypes",
+            "importlib",
+            "os",
+            "pathlib",
+            "shutil",
+            "socket",
+            "subprocess",
+            "sys",
+        }
+        blocked_attr_calls = {
+            "chmod",
+            "chown",
+            "execl",
+            "execle",
+            "execlp",
+            "execlpe",
+            "execv",
+            "execve",
+            "execvp",
+            "execvpe",
+            "kill",
+            "mkdir",
+            "open",
+            "popen",
+            "remove",
+            "rename",
+            "replace",
+            "rmdir",
+            "spawnl",
+            "spawnle",
+            "spawnlp",
+            "spawnlpe",
+            "spawnv",
+            "spawnve",
+            "spawnvp",
+            "spawnvpe",
+            "system",
+            "unlink",
+        }
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if not self._is_python_import_allowed(alias.name, allowed_imports):
+                        raise PermissionError(f"import disabled: {alias.name}")
+            elif isinstance(node, ast.ImportFrom):
+                module_name = str(node.module or "").strip()
+                if not module_name or not self._is_python_import_allowed(module_name, allowed_imports):
+                    raise PermissionError(f"import disabled: {module_name or '<relative>'}")
+            elif isinstance(node, ast.Name):
+                if node.id in self._PYTHON_SANDBOX_BLOCKED_CALLS:
+                    raise PermissionError(f"name disabled: {node.id}")
+                if node.id.startswith("__") and node.id.endswith("__"):
+                    raise PermissionError(f"dunder name disabled: {node.id}")
+            elif isinstance(node, ast.Attribute):
+                attr = str(node.attr or "")
+                if attr in blocked_attrs or (attr.startswith("__") and attr.endswith("__")):
+                    raise PermissionError(f"attribute disabled: {attr}")
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id in self._PYTHON_SANDBOX_BLOCKED_CALLS:
+                    raise PermissionError(f"call disabled: {func.id}")
+                if isinstance(func, ast.Attribute):
+                    attr = str(func.attr or "")
+                    if attr in blocked_attr_calls or attr in blocked_attrs:
+                        raise PermissionError(f"call disabled: {attr}")
+
+    def _build_python_safe_builtins(self, allowed_imports: set) -> Dict[str, Any]:
+        safe_builtins = {
+            "ArithmeticError": ArithmeticError,
+            "AssertionError": AssertionError,
+            "AttributeError": AttributeError,
+            "BaseException": BaseException,
+            "ConnectionError": ConnectionError,
+            "Exception": Exception,
+            "ImportError": ImportError,
+            "IndexError": IndexError,
+            "KeyError": KeyError,
+            "LookupError": LookupError,
+            "NameError": NameError,
+            "PermissionError": PermissionError,
+            "RuntimeError": RuntimeError,
+            "StopIteration": StopIteration,
+            "TimeoutError": TimeoutError,
+            "TypeError": TypeError,
+            "ValueError": ValueError,
+            "ZeroDivisionError": ZeroDivisionError,
+            "__import__": self._guarded_python_import(allowed_imports),
+            "abs": abs,
+            "all": all,
+            "any": any,
+            "bool": bool,
+            "dict": dict,
+            "enumerate": enumerate,
+            "filter": filter,
+            "float": float,
+            "format": format,
+            "hasattr": hasattr,
+            "int": int,
+            "isinstance": isinstance,
+            "issubclass": issubclass,
+            "len": len,
+            "list": list,
+            "map": map,
+            "max": max,
+            "min": min,
+            "next": next,
+            "range": range,
+            "repr": repr,
+            "reversed": reversed,
+            "round": round,
+            "set": set,
+            "slice": slice,
+            "sorted": sorted,
+            "str": str,
+            "sum": sum,
+            "tuple": tuple,
+            "zip": zip,
+        }
+        return safe_builtins
+
+    def _execute_advanced(self, command: Dict, session: 'TabSession') -> Dict[str, Any]:
+        script = command.get("script", "")
+        lang = command.get("script_lang", "javascript")
+
+        if not script.strip():
+            logger.warning("[CMD] 高级模式脚本为空")
+            return {"mode": "advanced", "result": "", "steps": []}
+
+        if lang == "javascript":
+            try:
+                ui_payload = copy.deepcopy(command.get("advanced_ui") or {})
+                import re
+                if re.search(r'\breturn\b', script):
+                    wrapped_script = (
+                        "return (function(command_ui) {\n"
+                        "const ui = command_ui || {};\n"
+                        + script +
+                        "\n}).call(this, arguments[0] || {});"
+                    )
+                else:
+                    wrapped_script = (
+                        "const command_ui = arguments[0] || {};\n"
+                        "const ui = command_ui.values || command_ui;\n"
+                        + script
+                    )
+                result = session.tab.run_js(wrapped_script, ui_payload)
+                logger.info(f"[CMD] JS 脚本执行完成: {str(result)[:200]}")
+                return {"mode": "advanced", "result": result, "steps": []}
+            except Exception as e:
+                logger.error(f"[CMD] JS 脚本执行失败: {e}")
+                return {"mode": "advanced", "result": f"js_failed: {e}", "steps": []}
+
+        if lang == "python":
+            import json as json_module
+            from app.services.request_manager import request_manager
+
+            initial_request_ids = []
+            initial_task_id = str(getattr(session, "current_task_id", "") or "").strip()
+            initial_task_status = str(getattr(getattr(session, "status", None), "value", "") or "").strip().lower()
+            try:
+                for attr_name in ("_command_request_id", "_bound_request_id", "_command_loop_request_id"):
+                    request_id = str(getattr(session, attr_name, "") or "").strip()
+                    if request_id and request_id not in initial_request_ids:
+                        initial_request_ids.append(request_id)
+                task_id = str(getattr(session, "current_task_id", "") or "").strip()
+                if task_id.startswith("req-") and task_id not in initial_request_ids:
+                    initial_request_ids.append(task_id)
+            except Exception:
+                pass
+
+            _last_reset_time = 0.0
+            _loop_request_ctx = None
+
+            def _remember_command_loop_prompt_request(prompt: str, request_id: str) -> None:
+                prompt_text = str(prompt or "")
+                request_key = str(request_id or "").strip()
+                if not prompt_text or not request_key:
+                    return
+                try:
+                    digest = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+                    now_ts = time.time()
+                    mapping = getattr(session, "_command_loop_prompt_request_ids", None)
+                    if not isinstance(mapping, dict):
+                        mapping = {}
+                    else:
+                        mapping = {
+                            key: value
+                            for key, value in mapping.items()
+                            if isinstance(value, dict)
+                            and float(value.get("expires_at", 0.0) or 0.0) > now_ts
+                        }
+                    mapping[digest] = {
+                        "request_id": request_key,
+                        "expires_at": now_ts + 900.0,
+                    }
+                    setattr(session, "_command_loop_prompt_request_ids", mapping)
+                except Exception:
+                    pass
+
+            def _remember_command_loop_request_window(
+                request_id: str,
+                *,
+                prompt: str = "",
+                ended: bool = False,
+            ) -> None:
+                request_key = str(request_id or "").strip()
+                if not request_key:
+                    return
+                try:
+                    now_ts = time.time()
+                    history = getattr(session, "_command_loop_request_history", None)
+                    if not isinstance(history, list):
+                        history = []
+                    kept = []
+                    found = False
+                    for item in history:
+                        if not isinstance(item, dict):
+                            continue
+                        if float(item.get("expires_at", 0.0) or 0.0) <= now_ts:
+                            continue
+                        if str(item.get("request_id") or "") == request_key:
+                            found = True
+                            if prompt:
+                                item["prompt"] = str(prompt or "")
+                            if ended:
+                                item["ended_at"] = now_ts
+                            item["expires_at"] = now_ts + 900.0
+                        kept.append(item)
+                    if not found:
+                        kept.append({
+                            "request_id": request_key,
+                            "prompt": str(prompt or ""),
+                            "started_at": now_ts,
+                            "ended_at": now_ts if ended else 0.0,
+                            "expires_at": now_ts + 900.0,
+                        })
+                    setattr(session, "_command_loop_request_history", kept[-50:])
+                except Exception:
+                    pass
+
+            def _session_domain() -> str:
+                try:
+                    return str(getattr(session, "current_domain", "") or "").strip()
+                except Exception:
+                    return ""
+
+            def _collect_request_ids() -> List[str]:
+                request_ids = list(initial_request_ids)
+                try:
+                    for attr_name in ("_command_request_id", "_bound_request_id", "_command_loop_request_id"):
+                        request_id = str(getattr(session, attr_name, "") or "").strip()
+                        if request_id and request_id not in request_ids:
+                            request_ids.append(request_id)
+                except Exception:
+                    pass
+                try:
+                    task_id = str(getattr(session, "current_task_id", "") or "").strip()
+                    if task_id.startswith("req-") and task_id not in request_ids:
+                        request_ids.append(task_id)
+                except Exception:
+                    pass
+                return request_ids
+
+            def _command_loop_is_active() -> bool:
+                try:
+                    if hasattr(session, "get_command_loop_info"):
+                        return bool((session.get_command_loop_info() or {}).get("active"))
+                except Exception:
+                    pass
+                return False
+
+            def _touch_session_activity() -> None:
+                try:
+                    if hasattr(session, "touch_activity"):
+                        session.touch_activity()
+                    else:
+                        session.last_used_at = time.time()
+                except Exception:
+                    pass
+
+            def _reset_timeout(force: bool = False) -> None:
+                nonlocal _last_reset_time
+                now = time.monotonic()
+                if not force and now - _last_reset_time < 0.5:
+                    return
+                _last_reset_time = now
+
+                _touch_session_activity()
+                if not force and _command_loop_is_active():
+                    return
+                request_ids = _collect_request_ids()
+                for req_id in request_ids:
+                    ctx = request_manager.get_request(req_id)
+                    if ctx is not None and hasattr(ctx, "reset_timeout"):
+                        ctx.reset_timeout()
+
+            def _check_cancelled() -> bool:
+                _reset_timeout()
+                request_ids = _collect_request_ids()
+                try:
+                    for request_id in request_ids:
+                        ctx = request_manager.get_request(request_id)
+                        if ctx is not None and ctx.should_stop():
+                            return True
+                except Exception:
+                    pass
+                try:
+                    current_task_id = str(getattr(session, "current_task_id", "") or "").strip()
+                    current_task_status = str(getattr(getattr(session, "status", None), "value", "") or "").strip().lower()
+                    if initial_task_id and current_task_id != initial_task_id:
+                        return True
+                    if initial_task_id and current_task_status != initial_task_status and current_task_status in {"idle", "error", "closed"}:
+                        return True
+                except Exception:
+                    pass
+                try:
+                    stop_reason = str(getattr(session, "_workflow_stop_reason", "") or "").strip().lower()
+                    if stop_reason in {"command_interrupt_abort", "timeout"}:
+                        return True
+                except Exception:
+                    pass
+                return False
+
+            def _raise_if_cancelled() -> None:
+                if _check_cancelled():
+                    raise RuntimeError("python_script_cancelled")
+
+            def _begin_command_loop(iteration=None, total=None, label: str = "") -> Dict[str, Any]:
+                nonlocal _loop_request_ctx
+                _finish_command_loop_request("replaced")
+                info: Dict[str, Any] = {}
+                try:
+                    if hasattr(session, "begin_command_loop"):
+                        info = session.begin_command_loop(
+                            iteration=iteration,
+                            total=total,
+                            label=label,
+                        )
+                except Exception as e:
+                    logger.debug(f"[CMD] 记录命令循环状态失败（忽略）: {e}")
+                    info = {}
+                _reset_timeout(force=True)
+                _loop_request_ctx = _create_command_loop_request(
+                    iteration=iteration,
+                    total=total,
+                    label=label,
+                    prompt="",
+                )
+                return info
+
+            def _end_command_loop(status: str = "completed") -> Dict[str, Any]:
+                _finish_command_loop_request(status)
+                try:
+                    if hasattr(session, "end_command_loop"):
+                        return session.end_command_loop(status=status)
+                except Exception as e:
+                    logger.debug(f"[CMD] 清理命令循环状态失败（忽略）: {e}")
+                return {}
+
+            def _create_command_loop_request(iteration=None, total=None, label: str = "", prompt: str = ""):
+                loop_ctx = None
+                try:
+                    loop_ctx = request_manager.create_request()
+                    setattr(session, "_command_loop_request_id", loop_ctx.request_id)
+                    payload = {
+                        "model": str(command.get("name") or "command-python-loop"),
+                        "stream": False,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": str(prompt or ""),
+                            }
+                        ],
+                    }
+                    request_manager.record_request_input(
+                        loop_ctx,
+                        payload,
+                        endpoint="command/python-loop",
+                        route_domain=_session_domain(),
+                        tab_index=getattr(session, "persistent_index", None),
+                        preset_name=str(command.get("name") or "命令脚本"),
+                    )
+                    request_manager.update_request_metadata(
+                        loop_ctx.request_id,
+                        request_type="脚本循环",
+                        target_domain=_session_domain(),
+                        tab_id=getattr(session, "id", ""),
+                        command_id=str(command.get("id") or ""),
+                        command_name=str(command.get("name") or ""),
+                        command_loop={
+                            "iteration": iteration,
+                            "total": total,
+                            "label": str(label or ""),
+                        },
+                    )
+                    request_manager.start_request(loop_ctx, tab_id=session.id)
+                    _remember_command_loop_request_window(loop_ctx.request_id, prompt=prompt)
+                    return loop_ctx
+                except Exception as e:
+                    logger.debug(f"[CMD] 创建命令循环请求日志失败（忽略）: {e}")
+                    try:
+                        if loop_ctx is not None and not loop_ctx.is_terminal():
+                            loop_ctx.mark_failed(str(e))
+                            request_manager.finish_request(loop_ctx, success=False)
+                    except Exception:
+                        pass
+                return None
+
+            def _record_command_loop_request(
+                prompt: str = "",
+                payload: Any = None,
+                endpoint: str = "command/python-loop",
+                request_type: str = "脚本循环",
+                response_text: str = "",
+            ) -> Dict[str, Any]:
+                nonlocal _loop_request_ctx
+                try:
+                    if _loop_request_ctx is None or _loop_request_ctx.is_terminal():
+                        _loop_request_ctx = _create_command_loop_request(prompt=prompt)
+                    if _loop_request_ctx is None:
+                        return {"ok": False, "error": "create_failed"}
+
+                    if payload is None:
+                        payload = {
+                            "model": str(command.get("name") or "command-python-loop"),
+                            "stream": False,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": str(prompt or ""),
+                                }
+                            ],
+                        }
+                    request_manager.record_request_input(
+                        _loop_request_ctx,
+                        payload,
+                        endpoint=str(endpoint or "command/python-loop"),
+                        route_domain=_session_domain(),
+                        tab_index=getattr(session, "persistent_index", None),
+                        preset_name=str(command.get("name") or "命令脚本"),
+                    )
+                    metadata = {
+                        "request_type": str(request_type or "脚本循环"),
+                        "target_domain": _session_domain(),
+                        "tab_id": getattr(session, "id", ""),
+                        "command_id": str(command.get("id") or ""),
+                        "command_name": str(command.get("name") or ""),
+                    }
+                    if response_text:
+                        metadata["response_text"] = str(response_text)
+                        metadata["has_response_text"] = True
+                    request_manager.update_request_metadata(_loop_request_ctx.request_id, **metadata)
+                    _remember_command_loop_request_window(_loop_request_ctx.request_id, prompt=prompt)
+                    _remember_command_loop_prompt_request(prompt, _loop_request_ctx.request_id)
+                    _touch_session_activity()
+                    return {"ok": True, "request_id": _loop_request_ctx.request_id}
+                except Exception as e:
+                    logger.debug(f"[CMD] 记录命令循环请求日志失败（忽略）: {e}")
+                    return {"ok": False, "error": str(e)}
+
+            def _finish_command_loop_request(status: str = "completed") -> None:
+                nonlocal _loop_request_ctx
+                loop_ctx = _loop_request_ctx
+                _loop_request_ctx = None
+                try:
+                    if loop_ctx is not None:
+                        _remember_command_loop_request_window(loop_ctx.request_id, ended=True)
+                        setattr(session, "_last_command_loop_request_id", loop_ctx.request_id)
+                        setattr(session, "_last_command_loop_request_until", time.time() + 300.0)
+                    setattr(session, "_command_loop_request_id", None)
+                except Exception:
+                    pass
+                if loop_ctx is None:
+                    return
+                try:
+                    if loop_ctx.is_terminal():
+                        return
+                    normalized = str(status or "completed").strip().lower()
+                    if normalized in {"cancelled", "canceled"}:
+                        loop_ctx.request_cancel("command_loop_cancelled")
+                        request_manager.finish_request(loop_ctx, success=False)
+                    elif normalized in {"failed", "error", "stopped", "replaced"}:
+                        if normalized == "replaced":
+                            loop_ctx.request_cancel("command_loop_replaced")
+                            request_manager.finish_request(loop_ctx, success=False)
+                        else:
+                            request_manager.capture_error(loop_ctx, normalized, code=f"command_loop_{normalized}")
+                            loop_ctx.mark_failed(f"command_loop_{normalized}")
+                            request_manager.finish_request(loop_ctx, success=False)
+                    else:
+                        has_existing_response = False
+                        try:
+                            with loop_ctx._lock:
+                                existing_response = str(loop_ctx.monitor.get("response_text") or "").strip()
+                                existing_parts = loop_ctx.monitor.get("response_parts")
+                                has_existing_response = bool(existing_response) or (
+                                    isinstance(existing_parts, list)
+                                    and any(str(item).strip() for item in existing_parts)
+                                )
+                        except Exception:
+                            has_existing_response = False
+                        if has_existing_response:
+                            request_manager.update_request_metadata(
+                                loop_ctx.request_id,
+                                has_response_text=True,
+                            )
+                        else:
+                            request_manager.update_request_metadata(
+                                loop_ctx.request_id,
+                                response_text="命令脚本循环已完成。",
+                                has_response_text=True,
+                            )
+                        request_manager.finish_request(loop_ctx, success=True)
+                except Exception as e:
+                    logger.debug(f"[CMD] 完成命令循环请求日志失败（忽略）: {e}")
+
+            def _check_command_loop_cancelled() -> bool:
+                try:
+                    if hasattr(session, "is_command_loop_cancelled"):
+                        return bool(session.is_command_loop_cancelled())
+                except Exception:
+                    return False
+                return False
+
+            def _raise_if_command_loop_cancelled() -> None:
+                if _check_command_loop_cancelled():
+                    raise RuntimeError("python_script_loop_cancelled")
+
+            context = {
+                "__cleanups__": [],
+                "tab": session.tab,
+                "session": session,
+                "browser": self._get_browser(),
+                "config_engine": self._get_config_engine(),
+                "logger": logger,
+                "time": time,
+                "json": json_module,
+                "command_ui": copy.deepcopy(command.get("advanced_ui") or {}),
+                "check_cancelled": _check_cancelled,
+                "raise_if_cancelled": _raise_if_cancelled,
+                "reset_timeout": _reset_timeout,
+                "begin_command_loop": _begin_command_loop,
+                "end_command_loop": _end_command_loop,
+                "record_command_loop_request": _record_command_loop_request,
+                "check_command_loop_cancelled": _check_command_loop_cancelled,
+                "raise_if_command_loop_cancelled": _raise_if_command_loop_cancelled,
+                "result": "",
+            }
+            collector_state = {"matched": 0, "records": []}
+
+            def _record_arena_candidates(info=None, prompt: str = "", source: str = "") -> Dict[str, Any]:
+                values = (command.get("advanced_ui") or {}).get("values") or {}
+                outcome = record_arena_rule_candidates(
+                    command_id=str(command.get("id") or ""),
+                    values=values if isinstance(values, dict) else {},
+                    info=info if isinstance(info, dict) else {},
+                    prompt=prompt,
+                    source=source,
+                    profile_resolver=lambda: resolve_tab_browser_profile(session.tab),
+                )
+                if outcome.get("identity_unresolved"):
+                    logger.warning("[CMD] Arena 命中结果未保存：无法读取命中标签页的浏览器个人资料名")
+                collector_state["matched"] += int(outcome.get("matched") or 0)
+                collector_state["records"].extend(outcome.get("recorded") or [])
+                return outcome
+
+            context["record_arena_rule_candidates"] = _record_arena_candidates
+            globals_dict: Dict[str, Any] = {}
+            script_succeeded = False
+            try:
+                if self._command_env_flag("CMD_ALLOW_UNSAFE_PYTHON_COMMANDS", False):
+                    logger.warning("[CMD] Python 脚本正在以非沙箱模式执行，请仅用于完全可信配置")
+                    globals_dict = {"__builtins__": __builtins__}
+                else:
+                    allowed_imports = self._get_python_sandbox_allowed_imports()
+                    self._validate_python_script_safety(script, allowed_imports)
+                    globals_dict = {"__builtins__": self._build_python_safe_builtins(allowed_imports)}
+
+                globals_dict.update(context)
+                exec(script, globals_dict)
+                context.update(globals_dict)
+                if collector_state["records"]:
+                    grouped: Dict[str, int] = {}
+                    for item in collector_state["records"]:
+                        name = str(item.get("rule_name") or item.get("model_name") or "rule")
+                        grouped[name] = grouped.get(name, 0) + 1
+                    context["result"] = "多规则筛选新增结果：" + "，".join(
+                        f"{name} {count} 条" for name, count in grouped.items()
+                    )
+                logger.info("[CMD] Python 脚本执行完成")
+                script_succeeded = True
+                return {"mode": "advanced", "result": context.get("result", ""), "steps": []}
+            except Exception as e:
+                logger.error(f"[CMD] Python 脚本执行失败: {e}")
+                return {"mode": "advanced", "result": f"python_failed: {e}", "steps": []}
+            finally:
+                cleanups = context.get("__cleanups__")
+                if isinstance(cleanups, list):
+                    for cleanup_cb in cleanups:
+                        try:
+                            if callable(cleanup_cb):
+                                cleanup_cb()
+                        except Exception as cleanup_err:
+                            logger.debug(f"[CMD] 脚本清理回调执行异常（忽略）: {cleanup_err}")
+                try:
+                    stop_network_watch = globals_dict.get("_stop_claude_network_watch")
+                    if callable(stop_network_watch) and stop_network_watch not in (cleanups if isinstance(cleanups, list) else []):
+                        stop_network_watch()
+                except Exception as e:
+                    logger.debug(f"[CMD] 清理脚本网络监听失败（忽略）: {e}")
+                _end_command_loop("completed" if script_succeeded else "stopped")
+
+        logger.warning(f"[CMD] 不支持的脚本语言: {lang}")
+        return {"mode": "advanced", "result": f"unsupported_lang:{lang}", "steps": []}
+
+    # ================= 统计 =================
+
+    def _update_trigger_stats(self, command_id: str):
+        with self._lock:
+            state = self._command_runtime_stats.setdefault(command_id, {})
+            state["last_triggered"] = time.time()
+            state["trigger_count"] = int(state.get("trigger_count", 0) or 0) + 1
+
+    # ================= 元信息 =================
+
+    def get_trigger_types(self) -> Dict[str, str]:
+        return copy.deepcopy(TRIGGER_TYPES)
+
+    def get_action_types(self) -> Dict[str, str]:
+        return copy.deepcopy(ACTION_TYPES)
+
+    def get_trigger_states(self) -> Dict[str, Any]:
+        with self._lock:
+            result = {}
+            for (cmd_id, tab_id), state in self._trigger_states.items():
+                copied = copy.deepcopy(state)
+                if "triggered_requests" in copied and isinstance(copied["triggered_requests"], set):
+                    copied["triggered_requests"] = list(copied["triggered_requests"])
+                result[f"{cmd_id}:{tab_id}"] = copied
+            return result

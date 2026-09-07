@@ -1,0 +1,18 @@
+{
+  "Config not loaded": "配置未加载",
+  "Disable Next Edit": "关闭 Next Edit",
+  "Documentation": "查看文档",
+  "Enterprise license key successfully validated and saved. Reloading window.": "企业许可证密钥校验并保存成功，正在重载窗口。",
+  "Error activating the incontrol extension.": "incontrol 扩展激活失败。",
+  "Invalid license key. Please check your license key and try again.": "许可证密钥无效，请检查后重试。",
+  "No active debug session found, therefore no debug context will be provided for the llm.": "未找到活动的调试会话，因此不会向模型提供调试上下文。",
+  "No active editor to apply edits to": "没有可应用编辑的活动编辑器",
+  "No model with roles \"apply\" or \"chat\" found in config.": "配置中未找到角色为 \"apply\" 或 \"chat\" 的模型。",
+  "No session ID found. Please start a new session first.": "未找到会话 ID，请先新建一个会话。",
+  "Please enable tab autocomplete first to use Next Edit": "请先启用 Tab 自动补全，才能使用 Next Edit",
+  "Read the docs": "阅读文档",
+  "Retry": "重试",
+  "Select different model": "选择其他模型",
+  "View Logs": "查看日志",
+  "Your config.json has been converted to the new config.yaml format. If you need to switch back to config.json, you can delete or rename config.yaml.": "你的 config.json 已转换为新的 config.yaml 格式。如需换回 config.json，删除或重命名 config.yaml 即可。"
+}

@@ -1,0 +1,1063 @@
+"""
+Validation and retry helpers for tool-calling.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+import os
+import re
+from collections.abc import Sequence
+from typing import Any, Dict, List, Optional
+
+from jsonschema.validators import validator_for
+
+from app.services.tool_calling_common import (
+    _PREFERRED_XML_ARG_TAG,
+    _PREFERRED_XML_CALL_TAG,
+    _PREFERRED_XML_WRAPPER_TAG,
+    _describe_tool_choice,
+    _format_tool_result_message,
+    _get_max_tool_argument_chars,
+    _get_max_tool_argument_depth,
+    _get_max_tool_argument_nodes,
+    _contains_unicode_surrogate,
+    _json_dumps_safe,
+    _serialize_content,
+    logger,
+)
+from app.services.tool_calling_parse import (
+    _coerce_arguments_object,
+    _decode_tool_arguments,
+)
+from app.services.tool_calling_prompts import _generate_tool_few_shot_examples
+
+def _get_tool_validation_retry_limit() -> int:
+    raw_value = str(os.getenv("TOOL_CALLING_INTERNAL_RETRY_MAX", "2") or "2").strip()
+    try:
+        value = int(raw_value)
+    except Exception:
+        value = 2
+    return max(0, min(5, value))
+
+
+def _get_tool_retry_strategy() -> str:
+    raw_value = str(os.getenv("TOOL_CALLING_RETRY_STRATEGY", "focused_repair") or "focused_repair").strip().lower()
+    aliases = {
+        "focused": "focused_repair",
+        "repair": "focused_repair",
+        "minimal": "focused_repair",
+        "compact": "focused_repair",
+        "focused_repair": "focused_repair",
+        "聚焦修复": "focused_repair",
+        "full": "full_context",
+        "legacy": "full_context",
+        "context": "full_context",
+        "full_context": "full_context",
+        "完整上下文": "full_context",
+    }
+    return aliases.get(raw_value, "focused_repair")
+
+
+def _describe_tool_retry_strategy(strategy: str) -> str:
+    if strategy == "full_context":
+        return "完整上下文"
+    return "聚焦修复"
+
+
+def _get_partial_tool_success_enabled() -> bool:
+    raw_value = str(os.getenv("TOOL_CALLING_ALLOW_PARTIAL_SUCCESS", "1") or "1").strip().lower()
+    return raw_value not in {"0", "false", "no", "off"}
+
+
+def _get_tool_failure_degrade_enabled() -> bool:
+    raw_value = str(os.getenv("TOOL_CALLING_DEGRADE_ON_FAILURE", "0") or "0").strip().lower()
+    return raw_value not in {"0", "false", "no", "off"}
+
+
+def _inspect_tool_response(
+    raw_text: str,
+    parsed: Dict[str, Any],
+    tools: List[Dict[str, Any]],
+    tool_choice: Any,
+    parallel_tool_calls: Optional[bool],
+) -> Dict[str, Any]:
+    errors: List[Dict[str, Any]] = []
+    accepted_tool_calls: List[Dict[str, Any]] = []
+    rejected_tool_calls: List[Dict[str, Any]] = []
+    seen_tool_call_ids = set()
+    allowed_tools = {
+        str(item.get("function", {}).get("name", "") or "").strip(): item
+        for item in tools or []
+        if isinstance(item, dict)
+    }
+    allowed_tool_names = {
+        name.strip().lower()
+        for name in allowed_tools.keys()
+        if str(name or "").strip()
+    }
+    tool_calls = parsed.get("tool_calls") or []
+    required_tool_name = _get_required_tool_name(tool_choice)
+    parse_error = str(parsed.get("parse_error") or "").strip()
+    if parse_error:
+        errors.append(
+            {
+                "code": parse_error,
+                "message": "The reply echoed internal tool-call history instead of returning a new response.",
+            }
+        )
+        return {
+            "errors": errors,
+            "accepted_tool_calls": accepted_tool_calls,
+            "rejected_tool_calls": rejected_tool_calls,
+        }
+
+    if tool_choice == "none" and tool_calls:
+        errors.append(
+            {
+                "code": "tool_choice_none",
+                "message": "tool_choice is 'none', but the assistant still returned tool_calls.",
+            }
+        )
+
+    if parallel_tool_calls is False and len(tool_calls) > 1:
+        errors.append(
+            {
+                "code": "parallel_tool_calls_disabled",
+                "message": "Only one tool call is allowed in this response, but multiple tool_calls were returned.",
+            }
+        )
+
+    if required_tool_name:
+        if not tool_calls:
+            errors.append(
+                {
+                    "code": "required_tool_missing",
+                    "message": f'The tool "{required_tool_name}" was required but the assistant did not call it.',
+                }
+            )
+        else:
+            wrong_names = sorted(
+                {
+                    str(item.get("function", {}).get("name", "") or "").strip()
+                    for item in tool_calls
+                    if str(item.get("function", {}).get("name", "") or "").strip() != required_tool_name
+                }
+            )
+            if wrong_names:
+                errors.append(
+                    {
+                        "code": "wrong_required_tool",
+                        "message": (
+                            f'The tool "{required_tool_name}" was required, but the assistant returned '
+                            f"{', '.join(wrong_names)}."
+                        ),
+                    }
+                )
+
+    if not tool_calls:
+        if tool_choice == "required":
+            errors.append(
+                {
+                    "code": "tool_required_but_missing",
+                    "message": "At least one tool call was required, but the assistant answered without any tool_calls.",
+                }
+            )
+        parsed_mode = str(parsed.get("mode", "") or "").strip().lower()
+        parsed_content = "" if parsed.get("content") is None else str(parsed.get("content"))
+        raw_stripped = str(raw_text or "").strip()
+        is_structured_final_payload = (
+            parsed_mode == "final" and parsed_content != raw_stripped
+        )
+        if not is_structured_final_payload:
+            malformed_reason = _detect_malformed_tool_payload(
+                raw_text,
+                allowed_tool_names=allowed_tool_names,
+            )
+            if malformed_reason:
+                errors.append(
+                    {
+                        "code": "malformed_tool_payload",
+                        "message": malformed_reason,
+                    }
+                )
+        return {
+            "errors": errors,
+            "accepted_tool_calls": accepted_tool_calls,
+            "rejected_tool_calls": rejected_tool_calls,
+        }
+
+    for index, tool_call in enumerate(tool_calls):
+        tool_call_errors: List[Dict[str, Any]] = []
+        function_data = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        tool_name = str(function_data.get("name", "") or "").strip()
+        tool_call_id = str(tool_call.get("id", "") or "").strip()
+        tool_def = allowed_tools.get(tool_name)
+        if not tool_def:
+            tool_call_errors.append(
+                {
+                    "code": "unknown_tool",
+                    "message": f'Tool "{tool_name or "(missing)"}" is not declared in AVAILABLE_TOOLS.',
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "tool_call_index": index,
+                }
+            )
+            errors.extend(tool_call_errors)
+            rejected_tool_calls.append(copy.deepcopy(tool_call))
+            continue
+
+        args = _decode_tool_arguments(tool_call)
+        if args is None:
+            tool_call_errors.append(
+                {
+                    "code": "invalid_arguments_json",
+                    "message": f'Tool "{tool_name}" returned arguments that are not a valid JSON object.',
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "tool_call_index": index,
+                }
+            )
+            errors.extend(tool_call_errors)
+            rejected_tool_calls.append(copy.deepcopy(tool_call))
+            continue
+
+        shape_errors = _validate_tool_argument_shape_limits(args)
+        for message in shape_errors:
+            tool_call_errors.append(
+                {
+                    "code": "argument_shape_limit_exceeded",
+                    "message": f'Tool "{tool_name}" {message}',
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "tool_call_index": index,
+                }
+            )
+
+        schema = tool_def.get("function", {}).get("parameters")
+        # 修复(2a)：schema 本身非法属于客户端请求参数问题（invalid_request），
+        # 模型怎么修都过不了，单独标记为不可重试错误码，调用方据此立即停止重试。
+        schema_invalid_reason = _check_tool_schema_invalid_reason(schema)
+        if schema_invalid_reason:
+            tool_call_errors.append(
+                {
+                    "code": "invalid_tool_schema",
+                    "message": (
+                        f'invalid_request: the client-declared parameters schema for tool "{tool_name}" '
+                        f"is not a valid JSON Schema (客户端 tools schema 非法): {schema_invalid_reason}"
+                    ),
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "tool_call_index": index,
+                }
+            )
+        else:
+            schema_errors = _validate_tool_arguments_against_schema(
+                args=args,
+                schema=schema,
+                path="arguments",
+            )
+            for message in schema_errors:
+                tool_call_errors.append(
+                    {
+                        "code": "schema_validation_failed",
+                        "message": f'Tool "{tool_name}" {message}',
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "tool_call_index": index,
+                    }
+                )
+
+        if tool_call_id:
+            if tool_call_id in seen_tool_call_ids:
+                tool_call_errors.append(
+                    {
+                        "code": "duplicate_tool_call_id",
+                        "message": f'Tool "{tool_name}" reuses the duplicate tool_call id "{tool_call_id}".',
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "tool_call_index": index,
+                    }
+                )
+            else:
+                seen_tool_call_ids.add(tool_call_id)
+
+        if tool_call_errors:
+            errors.extend(tool_call_errors)
+            rejected_tool_calls.append(copy.deepcopy(tool_call))
+            continue
+
+        function_data["arguments"] = json.dumps(args, ensure_ascii=False)
+        accepted_tool_calls.append(tool_call)
+
+    return {
+        "errors": errors,
+        "accepted_tool_calls": accepted_tool_calls,
+        "rejected_tool_calls": rejected_tool_calls,
+    }
+
+
+def _collect_tool_response_errors(
+    raw_text: str,
+    parsed: Dict[str, Any],
+    tools: List[Dict[str, Any]],
+    tool_choice: Any,
+    parallel_tool_calls: Optional[bool],
+) -> List[Dict[str, Any]]:
+    return _inspect_tool_response(
+        raw_text=raw_text,
+        parsed=parsed,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
+    ).get("errors", [])
+
+
+def _is_partial_tool_success_eligible(
+    inspection: Dict[str, Any],
+    parallel_tool_calls: Optional[bool],
+) -> bool:
+    if not _get_partial_tool_success_enabled():
+        return False
+    if parallel_tool_calls is False:
+        return False
+    accepted_tool_calls = inspection.get("accepted_tool_calls") or []
+    rejected_tool_calls = inspection.get("rejected_tool_calls") or []
+    if not accepted_tool_calls or not rejected_tool_calls:
+        return False
+
+    blocking_codes = {
+        "tool_choice_none",
+        "parallel_tool_calls_disabled",
+        "required_tool_missing",
+        "wrong_required_tool",
+        "tool_required_but_missing",
+        "malformed_tool_payload",
+    }
+    return not any(
+        str(item.get("code", "") or "").strip() in blocking_codes
+        for item in inspection.get("errors") or []
+        if isinstance(item, dict)
+    )
+
+
+def _build_partial_tool_success_response(
+    parsed: Dict[str, Any],
+    inspection: Dict[str, Any],
+) -> Dict[str, Any]:
+    accepted_tool_calls = inspection.get("accepted_tool_calls") or []
+    rejected_tool_calls = inspection.get("rejected_tool_calls") or []
+    logger.warning(
+        "[tool_calling] 并行工具调用部分成功，已放行通过校验的 tool_calls "
+        f"accepted={len(accepted_tool_calls)} rejected={len(rejected_tool_calls)}"
+    )
+    return {
+        "mode": "tool_calls",
+        "content": parsed.get("content"),
+        "tool_calls": copy.deepcopy(accepted_tool_calls),
+    }
+
+
+def _build_tool_calling_degraded_response(
+    parsed: Optional[Dict[str, Any]],
+    inspection: Optional[Dict[str, Any]] = None,
+    failure_summary: str = "",
+) -> Dict[str, Any]:
+    if isinstance(inspection, dict):
+        accepted_tool_calls = [
+            item for item in (inspection.get("accepted_tool_calls") or [])
+            if isinstance(item, dict)
+        ]
+        blocking_codes = {
+            "tool_choice_none",
+            "parallel_tool_calls_disabled",
+            "required_tool_missing",
+            "wrong_required_tool",
+            "tool_required_but_missing",
+            "malformed_tool_payload",
+        }
+        has_blocking_error = any(
+            str(item.get("code") or "") in blocking_codes
+            for item in (inspection.get("errors") or [])
+            if isinstance(item, dict)
+        )
+        if accepted_tool_calls and not has_blocking_error:
+            logger.warning(
+                "[tool_calling] 修复耗尽后仅保留通过校验的 tool_calls "
+                f"count={len(accepted_tool_calls)}"
+            )
+            return {
+                "mode": "tool_calls",
+                "content": parsed.get("content") if isinstance(parsed, dict) else None,
+                "tool_calls": copy.deepcopy(accepted_tool_calls),
+            }
+
+    summary = str(failure_summary or "tool_call_validation_failed").strip()
+    logger.warning(
+        "[tool_calling] 修复耗尽后没有通过校验的 tool_calls，拒绝降级 "
+        f"原因={summary}"
+    )
+    raise RuntimeError(f"tool_call_validation_exhausted: {summary}")
+
+
+def _get_required_tool_name(tool_choice: Any) -> str:
+    if isinstance(tool_choice, dict):
+        function_data = (
+            tool_choice.get("function")
+            if isinstance(tool_choice.get("function"), dict)
+            else {}
+        )
+        return str(function_data.get("name", "") or "").strip()
+    return ""
+
+
+def _contains_nonempty_tool_calls_field(payload: Any, depth: int = 0) -> bool:
+    """递归查找 payload 中是否存在非空的 tool_calls 列表（限深，避免深层结构开销）。"""
+    if depth > 4:
+        return False
+    if isinstance(payload, dict):
+        calls = payload.get("tool_calls")
+        if isinstance(calls, list) and calls:
+            return True
+        return any(
+            _contains_nonempty_tool_calls_field(item, depth + 1)
+            for item in payload.values()
+        )
+    if isinstance(payload, list):
+        return any(
+            _contains_nonempty_tool_calls_field(item, depth + 1)
+            for item in payload
+        )
+    return False
+
+
+def _detect_malformed_tool_payload(raw_text: str, allowed_tool_names: Optional[set[str]] = None) -> str:
+    stripped = str(raw_text or "").strip()
+    if not stripped:
+        return ""
+
+    lowered = stripped.lower()
+    if stripped[:1] in {"{", "["}:
+        # 修复(2b)：收窄 malformed 判定。旧逻辑只要以 {/[ 开头且含 "function"/"arguments"
+        # 子串就判 malformed，用户让模型输出一段 OpenAI 响应示例 JSON 会误触发重试。
+        # 现在仅当文本带 tool_calls 结构标记，且属于“解析出了部分调用结构片段但不完整”：
+        #   - JSON 本身残缺无法解析（真实调用尝试被截断），或
+        #   - JSON 可解析且带非空 tool_calls / 顶层 tool_name（真实调用尝试未能规整成有效调用）
+        # 才判定 malformed。完整可解析、又没有实际调用结构的 JSON 视为普通最终文本。
+        if any(marker in lowered for marker in ('"tool_calls"', '"tool_name"')):
+            try:
+                payload = json.loads(stripped)
+            except Exception:
+                return (
+                    "The reply looked like a structured tool payload, but it could not be parsed "
+                    "into valid tool_calls."
+                )
+            if _contains_nonempty_tool_calls_field(payload) or (
+                isinstance(payload, dict) and str(payload.get("tool_name", "") or "").strip()
+            ):
+                return (
+                    "The reply contained a tool-call structure, but it could not be normalized "
+                    "into valid tool_calls."
+                )
+
+    if _looks_like_tool_xml_payload(stripped, allowed_tool_names=allowed_tool_names):
+        return (
+            "The reply looked like an XML-style tool call, but it could not be parsed "
+            "into a valid declared tool."
+        )
+
+    return ""
+
+
+_TOOL_XML_PAYLOAD_PATTERNS = (
+    re.compile(r"<\s*(?:adapter_calls|tool_calls)\b", re.IGNORECASE),
+    re.compile(r"<\s*(?:call|invoke|tool_call)\b[^>]*(?:\bname\s*=|>)", re.IGNORECASE),
+)
+
+
+def _looks_like_tool_xml_payload(text: str, allowed_tool_names: Optional[set[str]] = None) -> bool:
+    value = str(text or "").strip()
+    if any(pattern.search(value) for pattern in _TOOL_XML_PAYLOAD_PATTERNS):
+        return True
+
+    if not allowed_tool_names:
+        return False
+
+    return False
+
+
+def _decode_tool_arguments(tool_call: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    function_data = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    raw_arguments = function_data.get("arguments")
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if isinstance(raw_arguments, str):
+        stripped = raw_arguments.strip()
+        if not stripped:
+            return {}
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            return None
+        if isinstance(parsed, dict) and not _contains_unicode_surrogate(parsed):
+            return parsed
+    return None
+
+
+# 修复(2a)：请求侧确定性错误码集合——这些错误源自客户端请求参数本身，
+# 模型重试不可能修复，命中后应立即停止内部修复重试。
+_NON_RETRYABLE_TOOL_ERROR_CODES = {"invalid_tool_schema"}
+
+
+def _has_non_retryable_tool_errors(errors: List[Dict[str, Any]]) -> bool:
+    """判断校验错误中是否存在“重试无意义”的请求侧确定性错误。"""
+    return any(
+        str(item.get("code", "") or "").strip() in _NON_RETRYABLE_TOOL_ERROR_CODES
+        for item in errors or []
+        if isinstance(item, dict)
+    )
+
+
+def _check_tool_schema_invalid_reason(schema: Any) -> str:
+    """schema 本身非法（客户端请求问题）时返回原因，合法或缺省返回空串。"""
+    if not isinstance(schema, dict):
+        return ""
+    try:
+        validator_class = validator_for(schema)
+        validator_class.check_schema(schema)
+    except Exception as e:
+        return str(e)
+    return ""
+
+
+def _validate_tool_arguments_against_schema(
+    args: Dict[str, Any],
+    schema: Any,
+    path: str,
+) -> List[str]:
+    if not isinstance(schema, dict):
+        return []
+    ref_errors = _validate_local_schema_refs(schema, path)
+    if ref_errors:
+        return ref_errors
+    finite_errors = _validate_finite_json_numbers(args, path)
+    if finite_errors:
+        return finite_errors
+    try:
+        validator_class = validator_for(schema)
+        validator_class.check_schema(schema)
+        validation_errors = sorted(
+            validator_class(schema).iter_errors(args),
+            key=lambda item: tuple(str(part) for part in item.absolute_path),
+        )
+    except Exception as e:
+        return [f"{path} could not be validated against its JSON Schema: {e}"]
+
+    errors: List[str] = []
+    for error in validation_errors:
+        location = path
+        for part in error.absolute_path:
+            if isinstance(part, int):
+                location += f"[{part}]"
+            else:
+                location += f".{part}"
+        errors.append(f"{location} {error.message}")
+    return errors
+
+
+def _validate_json_schema_value(value: Any, schema: Dict[str, Any], path: str) -> List[str]:
+    """Backward-compatible alias for the jsonschema-based validator."""
+    return _validate_tool_arguments_against_schema(value, schema, path)
+
+
+def _validate_local_schema_refs(value: Any, path: str) -> List[str]:
+    if isinstance(value, dict):
+        ref_value = value.get("$ref")
+        if isinstance(ref_value, str) and not ref_value.startswith("#"):
+            return [f"{path} contains an unsupported external JSON Schema reference."]
+        errors: List[str] = []
+        for item in value.values():
+            errors.extend(_validate_local_schema_refs(item, path))
+        return errors
+    if isinstance(value, list):
+        errors = []
+        for item in value:
+            errors.extend(_validate_local_schema_refs(item, path))
+        return errors
+    return []
+
+
+def _validate_finite_json_numbers(value: Any, path: str) -> List[str]:
+    if isinstance(value, float) and not math.isfinite(value):
+        return [f"{path} must be a finite number."]
+    if isinstance(value, dict):
+        errors: List[str] = []
+        for key, item in value.items():
+            errors.extend(_validate_finite_json_numbers(item, f"{path}.{key}"))
+        return errors
+    if isinstance(value, list):
+        errors = []
+        for index, item in enumerate(value):
+            errors.extend(_validate_finite_json_numbers(item, f"{path}[{index}]"))
+        return errors
+    return []
+
+
+def _walk_json_shape(
+    value: Any,
+    path: str,
+    depth: int,
+    counters: Dict[str, int],
+    errors: List[str],
+) -> None:
+    counters["nodes"] += 1
+    counters["max_depth"] = max(counters.get("max_depth", 0), depth)
+    max_depth = _get_max_tool_argument_depth()
+    max_nodes = _get_max_tool_argument_nodes()
+
+    if counters["nodes"] > max_nodes:
+        errors.append(f"{path} exceeds the maximum structural node count of {max_nodes}.")
+        return
+
+    if depth > max_depth:
+        errors.append(f"{path} exceeds the maximum nesting depth of {max_depth}.")
+        return
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _walk_json_shape(item, f"{path}.{key}", depth + 1, counters, errors)
+        return
+
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _walk_json_shape(item, f"{path}[{index}]", depth + 1, counters, errors)
+
+
+def _validate_tool_argument_shape_limits(args: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+    try:
+        serialized = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return ["arguments could not be serialized into a stable JSON object."]
+
+    max_chars = _get_max_tool_argument_chars()
+    if len(serialized) > max_chars:
+        errors.append(f"arguments exceed the maximum serialized size of {max_chars} characters.")
+
+    counters = {"nodes": 0, "max_depth": 0}
+    _walk_json_shape(args, "arguments", 1, counters, errors)
+    return errors
+
+
+def _build_tool_retry_messages(
+    raw_text: str,
+    parsed: Dict[str, Any],
+    errors: List[Dict[str, Any]],
+    attempt: int,
+    total_attempts: int,
+) -> List[Dict[str, Any]]:
+    messages: List[Dict[str, Any]] = []
+    assistant_message = _build_rejected_assistant_message(raw_text, parsed)
+    if assistant_message:
+        messages.append(assistant_message)
+    messages.append(
+        {
+            "role": "user",
+            "content": _format_tool_retry_feedback(errors, parsed, raw_text, attempt, total_attempts),
+        }
+    )
+    return messages
+
+
+def _build_focused_tool_retry_messages(
+    original_messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    tool_choice: Any,
+    parallel_tool_calls: Optional[bool],
+    raw_text: str,
+    parsed: Dict[str, Any],
+    errors: List[Dict[str, Any]],
+    attempt: int,
+    total_attempts: int,
+) -> List[Dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": _build_tool_repair_system_prompt(
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+            ),
+        },
+        {
+            "role": "user",
+            "content": _format_focused_tool_retry_feedback(
+                original_messages=original_messages,
+                errors=errors,
+                parsed=parsed,
+                raw_text=raw_text,
+                attempt=attempt,
+                total_attempts=total_attempts,
+            ),
+        },
+    ]
+
+
+def _build_rejected_assistant_message(
+    raw_text: str,
+    parsed: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    tool_calls = parsed.get("tool_calls") or []
+    if tool_calls:
+        content = parsed.get("content")
+        if content not in ("", None):
+            return {"role": "assistant", "content": content}
+        return None
+
+    preview = str(raw_text or "").strip()
+    if preview:
+        return {"role": "assistant", "content": preview}
+
+    content = parsed.get("content")
+    if content not in ("", None):
+        return {"role": "assistant", "content": str(content)}
+    return None
+
+
+def _format_tool_retry_feedback(
+    errors: List[Dict[str, Any]],
+    parsed: Dict[str, Any],
+    raw_text: str,
+    attempt: int,
+    total_attempts: int,
+) -> str:
+    lines = [
+        "[Tool Repair Feedback]",
+        "Your previous assistant response was rejected before execution and was not forwarded to the user.",
+        "Keep the original intent and make the smallest possible valid fix.",
+        f"Attempt: {attempt}/{total_attempts}",
+        "Validation errors:",
+    ]
+    for index, item in enumerate(errors, start=1):
+        lines.append(f"{index}. {item.get('message')}")
+
+    rejected_tool_calls = _summarize_tool_calls_for_feedback(parsed)
+    if rejected_tool_calls:
+        lines.append("Rejected tool calls:")
+        lines.append(json.dumps(rejected_tool_calls, ensure_ascii=False, indent=2))
+    else:
+        preview = str(raw_text or "").strip()
+        if preview:
+            if len(preview) > 1200:
+                preview = preview[:1197] + "..."
+            lines.append("Rejected assistant reply:")
+            lines.append(preview)
+
+    lines.extend(
+        [
+            "Return the corrected response, preserving valid assistant text outside any tool-call block.",
+            "Use the XML tool-call format for tool use.",
+            "Prefer repairing the rejected response instead of rewriting from scratch.",
+            "Do not repeat the same invalid tool call unchanged.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_tool_repair_system_prompt(
+    tools: List[Dict[str, Any]],
+    tool_choice: Any,
+    parallel_tool_calls: Optional[bool],
+) -> str:
+    choice_instruction = _describe_tool_choice(tool_choice)
+    parallel_instruction = (
+        "You may return more than one tool call in a single response."
+        if parallel_tool_calls is not False
+        else "Return at most one tool call in a single response."
+    )
+    tool_defs = _json_dumps_safe(tools or [], indent=2)
+    examples = _generate_tool_few_shot_examples(tools)
+    return (
+        "You are repairing a previously rejected assistant response for an OpenAI-compatible tool-calling adapter.\n"
+        "Do not solve the whole task again from scratch unless the rejected response is unusable.\n"
+        "Preserve the original intent and make the smallest valid correction.\n"
+        "Typical fixes include: wrong tool name, missing required tool, invalid argument JSON, schema mismatch, "
+        "tool-choice violation, or too many tool calls.\n"
+        "Use the following XML format whenever the corrected response needs a tool.\n"
+        "Tool-call format:\n"
+        f"<{_PREFERRED_XML_WRAPPER_TAG}>\n"
+        f"  <{_PREFERRED_XML_CALL_TAG} name=\"tool_name\">\n"
+        "    <arguments encoding=\"json\"><![CDATA[{\"arg_name\":\"value\"}]]></arguments>\n"
+        f"  </{_PREFERRED_XML_CALL_TAG}>\n"
+        f"</{_PREFERRED_XML_WRAPPER_TAG}>\n"
+        "Return exactly one complete tool-call XML root when a tool is needed.\n"
+        "You may retain a brief user-visible progress message before or after that XML root; when progress is required, put it before the XML root. Do not put it inside the XML.\n"
+        "If no tool is needed, answer normally in plain text.\n"
+        "Rules:\n"
+        "- Never use markdown code fences.\n"
+        "- Only use tools declared in AVAILABLE_TOOLS.\n"
+        f"- {choice_instruction}\n"
+        f"- {parallel_instruction}\n"
+        f"{examples}"
+        "AVAILABLE_TOOLS:\n"
+        f"{tool_defs}"
+    )
+
+
+def _format_focused_tool_retry_feedback(
+    original_messages: List[Dict[str, Any]],
+    errors: List[Dict[str, Any]],
+    parsed: Dict[str, Any],
+    raw_text: str,
+    attempt: int,
+    total_attempts: int,
+) -> str:
+    lines = [
+        "[Focused Repair Task]",
+        "Repair the rejected assistant JSON response below.",
+        "Do not reconsider the full conversation. Keep the original intent and change as little as possible.",
+        f"Attempt: {attempt}/{total_attempts}",
+        "Validation errors:",
+    ]
+    for index, item in enumerate(errors, start=1):
+        lines.append(f"{index}. {item.get('message')}")
+
+    compact_context = _build_compact_tool_retry_context(original_messages)
+    if compact_context:
+        lines.append("Minimal context:")
+        lines.append(compact_context)
+
+    rejected_tool_calls = _summarize_tool_calls_for_feedback(parsed)
+    if rejected_tool_calls:
+        lines.append("Rejected tool calls:")
+        lines.append(json.dumps(rejected_tool_calls, ensure_ascii=False, indent=2))
+        rejected_content = parsed.get("content")
+        if rejected_content not in ("", None):
+            lines.append("Rejected assistant content:")
+            lines.append(_trim_retry_text(str(rejected_content), 1200))
+    else:
+        preview = str(raw_text or "").strip()
+        if preview:
+            lines.append("Rejected assistant reply:")
+            lines.append(_trim_retry_text(preview, 1200))
+
+    lines.extend(
+        [
+            "Return only the corrected tool-call output.",
+            "Prefer the XML tool-call block for tool use. JSON assistant payloads are still accepted.",
+            "If the rejected response is almost correct, make the smallest possible fix.",
+            "Do not repeat the same invalid response unchanged.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_compact_tool_retry_context(
+    messages: List[Dict[str, Any]],
+    max_messages: int = 3,
+    max_chars: int = 2200,
+) -> str:
+    items = messages if isinstance(messages, Sequence) else list(messages or [])
+    selected: List[str] = []
+    anchor_indexes = set()
+
+    for index, msg in enumerate(items):
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "") or "").strip().lower()
+        if role != "system":
+            continue
+        block = _format_anchor_message_for_retry_context(msg, "Original System Message")
+        if block:
+            selected.append(block)
+            anchor_indexes.add(index)
+        break
+
+    for index, msg in enumerate(items):
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "") or "").strip().lower()
+        if role != "user":
+            continue
+        block = _format_anchor_message_for_retry_context(msg, "Original User Request")
+        if block:
+            selected.append(block)
+            anchor_indexes.add(index)
+        break
+
+    recent: List[str] = []
+    for index in range(len(items) - 1, -1, -1):
+        msg = items[index]
+        if index in anchor_indexes:
+            continue
+        block = _format_message_for_retry_context(msg)
+        if not block:
+            continue
+        recent.append(block)
+        if len(recent) >= max_messages:
+            break
+
+    recent.reverse()
+    selected.extend(recent)
+    if not selected:
+        return ""
+
+    parts: List[str] = []
+    used = 0
+    for block in selected:
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        trimmed = _trim_retry_text(block, remaining)
+        if not trimmed:
+            continue
+        parts.append(trimmed)
+        used += len(trimmed) + 2
+    return "\n\n".join(parts)
+
+
+def _format_anchor_message_for_retry_context(msg: Any, label: str) -> str:
+    if not isinstance(msg, dict):
+        return ""
+    content = _serialize_content(msg.get("content", "")).strip()
+    if not content:
+        return ""
+    return f"[{label}]\n" + _trim_retry_text(content, 1200)
+
+
+def _format_message_for_retry_context(msg: Any) -> str:
+    if not isinstance(msg, dict):
+        return ""
+
+    role = str(msg.get("role", "") or "").strip().lower()
+    if role == "system":
+        return ""
+
+    if role == "tool":
+        payload = _format_tool_result_message(
+            name=str(msg.get("name", "") or "").strip() or "tool",
+            tool_call_id=str(msg.get("tool_call_id", "") or "").strip(),
+            content=_serialize_content(msg.get("content", "")),
+        )
+        return "[Recent Tool Result]\n" + _trim_retry_text(payload, 1200)
+
+    if role == "assistant" and msg.get("tool_calls"):
+        tool_calls_payload = []
+        for item in msg.get("tool_calls") or []:
+            if not isinstance(item, dict):
+                continue
+            function_data = item.get("function") if isinstance(item.get("function"), dict) else {}
+            raw_args = function_data.get("arguments")
+            coerced_args = _coerce_arguments_object(raw_args)
+            tool_calls_payload.append(
+                {
+                    "id": item.get("id"),
+                    "type": item.get("type", "function"),
+                    "function": {
+                        "name": function_data.get("name"),
+                        "arguments": coerced_args if coerced_args is not None else raw_args,
+                    },
+                }
+            )
+        body = json.dumps(tool_calls_payload, ensure_ascii=False, indent=2)
+        content = _serialize_content(msg.get("content", "")).strip()
+        if content:
+            body = content + "\n\n" + body
+        return "[Recent Assistant Tool Calls]\n" + _trim_retry_text(body, 1200)
+
+    content = _serialize_content(msg.get("content", "")).strip()
+    if not content:
+        return ""
+
+    role_title = {
+        "user": "Recent User Message",
+        "assistant": "Recent Assistant Message",
+    }.get(role, "Recent Message")
+    return f"[{role_title}]\n" + _trim_retry_text(content, 1200)
+
+
+def _trim_retry_text(text: str, limit: int) -> str:
+    value = str(text or "")
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    if limit <= 9:
+        return value[:limit]
+
+    reserved = 5
+    head = max(1, int((limit - reserved) * 0.7))
+    tail = max(1, limit - reserved - head)
+    return value[:head] + "\n...\n" + value[-tail:]
+
+
+def _get_rejected_tool_argument_preview_limit() -> int:
+    raw_value = str(os.getenv("TOOL_CALLING_REJECTED_ARGUMENT_PREVIEW_CHARS", "500") or "500").strip()
+    try:
+        value = int(raw_value)
+    except Exception:
+        value = 500
+    return max(0, min(5000, value))
+
+
+def _truncate_rejected_tool_call_payload(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+    cloned = copy.deepcopy(tool_call)
+    function_data = cloned.get("function")
+    if not isinstance(function_data, dict):
+        return cloned
+
+    arguments = function_data.get("arguments")
+    if arguments is None:
+        return cloned
+
+    limit = _get_rejected_tool_argument_preview_limit()
+    if limit <= 0:
+        function_data["arguments"] = ""
+        return cloned
+
+    function_data["arguments"] = _trim_retry_text(str(arguments), limit)
+    return cloned
+
+
+def _summarize_tool_calls_for_feedback(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
+    summary: List[Dict[str, Any]] = []
+    limit = _get_rejected_tool_argument_preview_limit()
+    for item in parsed.get("tool_calls") or []:
+        if not isinstance(item, dict):
+            continue
+        function_data = item.get("function") if isinstance(item.get("function"), dict) else {}
+        # 修复(4)：先对“原始”参数字符串做 _decode_tool_arguments，再对解码结果做展示层截断。
+        # 旧逻辑先截断再解码，json_repair 可能把截断残片“修”出凭空捏造的假参数展示给模型。
+        arguments = _decode_tool_arguments(item)
+        if arguments is not None:
+            try:
+                serialized = json.dumps(arguments, ensure_ascii=False)
+            except Exception:
+                serialized = repr(arguments)
+            display_arguments: Any = (
+                arguments if len(serialized) <= limit else _trim_retry_text(serialized, limit)
+            )
+        else:
+            # 解码失败时退回原始参数文本的截断预览（仅作展示，不再尝试修复）
+            raw_arguments = function_data.get("arguments")
+            display_arguments = _trim_retry_text(
+                raw_arguments if isinstance(raw_arguments, str) else str(raw_arguments or ""),
+                limit,
+            )
+        summary.append(
+            {
+                "id": str(item.get("id", "") or ""),
+                "name": str(function_data.get("name", "") or ""),
+                "arguments": display_arguments,
+            }
+        )
+    return summary
+
+
+def _summarize_tool_response_errors(errors: List[Dict[str, Any]]) -> str:
+    messages = [str(item.get("message") or "").strip() for item in errors if str(item.get("message") or "").strip()]
+    if not messages:
+        return "tool_call_validation_failed"
+    return "; ".join(messages[:3])

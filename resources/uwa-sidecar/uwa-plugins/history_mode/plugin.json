@@ -1,0 +1,8 @@
+{
+  "name": "history_mode",
+  "version": "1.0.0",
+  "description": "多轮历史模式(auto/full/last) + 会话亲和续聊 + skip_on_continuation 续聊跳过",
+  "entry": "register",
+  "requires": ["plugin_host"],
+  "data_patches": ["site_patches.json", "config_patch.json"]
+}

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal Web-to-API Tutorial Redirect</title>
+    <script>
+        const target = './tutorial/index.html' + (window.location.hash || '');
+        window.location.replace(target);
+    </script>
+    <noscript>
+        <meta http-equiv="refresh" content="0; url=./tutorial/index.html">
+    </noscript>
+</head>
+<body></body>
+</html>

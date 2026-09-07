@@ -1,0 +1,7 @@
+{
+  "name": "en_logs",
+  "version": "1.0.0",
+  "description": "Translate Chinese console logs into neutral English at the display layer.",
+  "author": "s3hq4y",
+  "entry": "register"
+}

@@ -1,0 +1,2952 @@
+# app/core/browser/workflow.py
+
+# [UWA-PLUGIN] 钩子运行时：无插件/宿主缺失时行为与上游完全一致
+try:
+    from plugin_host import plugin_hooks
+except Exception:  # pragma: no cover - 宿主缺失时退化为上游行为
+    class _NullPluginHooks:
+        def has(self, name): return False
+        def call(self, name, *args, default=None, **kwargs): return default
+    plugin_hooks = _NullPluginHooks()
+
+import json
+import time
+import contextlib
+import random
+import re
+from typing import Optional, List, Dict, Any, Generator, Callable, Mapping, TYPE_CHECKING
+
+from app.core.config import (
+    logger,
+    BrowserConstants,
+    ElementNotFoundError,
+    WorkflowError,
+    MessageValidator,
+)
+from app.utils.site_url import extract_remote_site_domain, tab_url_matches
+from app.utils.image_handler import extract_images_from_messages
+from app.core.page_lifecycle import BACKGROUND_WAKE_CDP_TIMEOUT
+from app.core.workflow import WorkflowExecutor
+from app.core.workflow.error_handlers import (
+    get_workflow_retry_handler,
+    is_retriable_workflow_error,
+)
+from app.core.workflow.arena_send_watchdog import (
+    ARENA_SEND_NO_TARGET_AFTER_RETRY,
+    ArenaSendRetryRefreshError,
+    ArenaSendWatchdogCancelled,
+    refresh_arena_page_for_retry,
+)
+from app.core.workflow.arena_direct_guard import (
+    ARENA_DIRECT_UNEXPECTED_BATTLE_REDIRECT,
+    ArenaDirectRecoveryError,
+    ArenaUnexpectedBattleRedirectError,
+    is_arena_direct_preset,
+    is_arena_unexpected_battle_url,
+    recover_arena_direct_page,
+    resolve_arena_direct_entry_url,
+    resolve_arena_direct_recovery_url,
+    workflow_has_new_chat_step,
+)
+from app.core.workflow.input_chunking import PromptChunk, plan_prompt_chunks
+from app.core.tab_pool import TabSession
+from app.models.schemas import get_modality_run_policy, is_modality_enabled
+from app.services.arena_direct_models import (
+    get_model_catalog_preset,
+    resolve_arena_direct_model,
+)
+from app.services.arena_image_generation import (
+    ArenaImageGenerationError,
+    ArenaImageGenerationGuard,
+    capture_arena_result_baseline,
+    is_arena_image_generation_request,
+    validate_generated_images,
+)
+from app.utils.image_validation import filter_reference_images
+
+if TYPE_CHECKING:
+    from .main import BrowserCore
+
+
+class BrowserWorkflowMixin:
+    """工作流执行、流式/非流式响应、中断处理相关的混入类"""
+
+    @staticmethod
+    def _should_exclude_preexisting_media_nodes(
+        media_dom_baseline: Optional[Dict[str, Any]],
+    ) -> bool:
+        page_url = str((media_dom_baseline or {}).get("page_url") or "").strip()
+        domain = str(extract_remote_site_domain(page_url) or "").strip().lower()
+        return domain.removeprefix("www.") == "arena.ai"
+
+    @staticmethod
+    def _format_log_counts(counts: Dict[str, int]) -> str:
+        if not counts:
+            return "-"
+        return ",".join(f"{key}:{counts[key]}" for key in sorted(counts))
+
+    @staticmethod
+    def _compact_log_value(value: Any, max_len: int = 96) -> str:
+        text = str(value or "").replace("\r", "\\r").replace("\n", "\\n").strip()
+        if not text:
+            return "-"
+        if len(text) > max_len:
+            return f"{text[:max(0, max_len - 3)]}..."
+        return text
+
+    @staticmethod
+    def _message_declares_image(message: Dict[str, Any]) -> bool:
+        if not isinstance(message, dict):
+            return False
+
+        content = message.get("content")
+        if isinstance(content, str):
+            stripped = content.strip()
+            if "image_url" not in stripped and "data:image" not in stripped:
+                return False
+            if stripped.startswith(("[", "{")):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        parsed = [parsed]
+                    if isinstance(parsed, list):
+                        return BrowserWorkflowMixin._content_parts_declare_image(parsed)
+                except Exception:
+                    pass
+            return "base64," in stripped or "http://" in stripped or "https://" in stripped
+
+        return BrowserWorkflowMixin._content_parts_declare_image(content)
+
+    @staticmethod
+    def _content_parts_declare_image(content: Any) -> bool:
+        if not isinstance(content, (list, tuple)):
+            return False
+
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type", "") or "").strip().lower() != "image_url":
+                continue
+            image_url = item.get("image_url") or {}
+            url = image_url.get("url") if isinstance(image_url, dict) else image_url
+            if str(url or "").strip():
+                return True
+        return False
+
+    @staticmethod
+    def _select_image_source_messages(messages: List[Dict], upload_history: bool) -> List[Dict]:
+        """选择本轮图片提取来源；关闭历史上传时保留最近一条带图用户消息。"""
+        if upload_history:
+            return messages or []
+
+        last_user = None
+        last_user_with_image = None
+        for message in reversed(messages or []):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            if last_user is None:
+                last_user = message
+            if BrowserWorkflowMixin._message_declares_image(message):
+                last_user_with_image = message
+                break
+
+        selected = last_user_with_image or last_user
+        return [selected] if selected else []
+
+    @staticmethod
+    def _emit_request_block(emitted_blocks: set[int], block_no: int, title: str, detail: str = "") -> None:
+        if block_no in emitted_blocks:
+            return
+        emitted_blocks.add(block_no)
+        detail_text = f" | {detail}" if detail else ""
+        logger.debug(f"[请求块 {block_no}/4] ---------- {title}{detail_text} ----------")
+
+    @staticmethod
+    def _find_next_stream_step_index(workflow: List[Dict[str, Any]], start_index: int) -> Optional[int]:
+        for index in range(max(0, int(start_index or 0)), len(workflow or [])):
+            step = workflow[index] or {}
+            action = str(step.get("action", "") or "").strip().upper()
+            if action in {"STREAM_WAIT", "STREAM_OUTPUT"}:
+                return index
+        return None
+
+    @staticmethod
+    def _find_resume_step_after_interrupt(workflow: List[Dict[str, Any]], start_index: int) -> int:
+        index = max(0, int(start_index or 0))
+        cleanup_targets = {"retry_send_btn", "stop_btn"}
+        skipped_cleanup = False
+
+        while index < len(workflow or []):
+            step = workflow[index] or {}
+            action = str(step.get("action", "") or "").strip().upper()
+            target = str(step.get("target", "") or "").strip().lower()
+
+            if action == "WAIT":
+                next_index = index + 1
+                while next_index < len(workflow or []):
+                    next_step = workflow[next_index] or {}
+                    next_action = str(next_step.get("action", "") or "").strip().upper()
+                    if next_action != "WAIT":
+                        break
+                    next_index += 1
+                next_target = str(
+                    ((workflow or [])[next_index] or {}).get("target", "") if next_index < len(workflow or []) else ""
+                ).strip().lower()
+                next_action = str(
+                    ((workflow or [])[next_index] or {}).get("action", "") if next_index < len(workflow or []) else ""
+                ).strip().upper()
+                if next_action == "CLICK" and next_target in cleanup_targets:
+                    skipped_cleanup = True
+                    index += 1
+                    continue
+
+            if action == "CLICK" and target in cleanup_targets:
+                skipped_cleanup = True
+                index += 1
+                continue
+
+            if skipped_cleanup and action == "WAIT":
+                index += 1
+                continue
+
+            break
+
+        return index
+
+    def set_stop_checker(self, checker: Callable[[], bool]):
+        """设置停止检查器"""
+        self._should_stop_checker = checker or (lambda: False)
+
+    def _get_request_state_snapshot(self, task_id: str = "") -> Dict[str, Any]:
+        task = str(task_id or "").strip()
+        snapshot = {
+            "exists": False,
+            "status": "",
+            "cancel_reason": "",
+            "terminal": False,
+        }
+        if not task:
+            return snapshot
+
+        try:
+            from app.services.request_manager import request_manager
+            ctx = request_manager.get_request(task)
+        except Exception:
+            return snapshot
+
+        if ctx is None:
+            return snapshot
+
+        snapshot["exists"] = True
+        try:
+            status = getattr(getattr(ctx, "status", None), "value", "")
+            snapshot["status"] = str(status or "").strip().lower()
+        except Exception:
+            snapshot["status"] = ""
+        try:
+            snapshot["cancel_reason"] = str(getattr(ctx, "cancel_reason", "") or "").strip().lower()
+        except Exception:
+            snapshot["cancel_reason"] = ""
+        try:
+            snapshot["terminal"] = bool(ctx.is_terminal())
+        except Exception:
+            snapshot["terminal"] = snapshot["status"] in {"completed", "cancelled", "failed"}
+        return snapshot
+
+    def _get_request_cancel_reason(self, task_id: str = "") -> str:
+        return str(self._get_request_state_snapshot(task_id).get("cancel_reason", "") or "").strip().lower()
+
+    def _should_rollback_request_count_on_cancel(self, task_id: str = "") -> bool:
+        reason = self._get_request_cancel_reason(task_id)
+        if not reason:
+            return False
+        manual_reasons = {
+            "manual",
+            "manual_terminate",
+            "user_cancel",
+            "user_cancelled",
+            "cancel_button",
+        }
+        return reason in manual_reasons
+
+    def _build_task_ownership_stop_checker(
+        self,
+        session: Optional[TabSession],
+        task_id: str,
+        base_checker: Optional[Callable[[], bool]] = None,
+    ) -> Callable[[], bool]:
+        expected_task_id = str(task_id or "").strip()
+        base = base_checker or self._should_stop_checker
+        ownership_lost_logged = False
+
+        def _checker() -> bool:
+            nonlocal ownership_lost_logged
+            if base():
+                return True
+            if not session or not expected_task_id:
+                return False
+
+            try:
+                current_task_id = str(getattr(session, "current_task_id", "") or "").strip()
+                session_status = getattr(getattr(session, "status", None), "value", "")
+            except Exception:
+                current_task_id = ""
+                session_status = ""
+
+            ownership_lost = False
+            detail = ""
+            if current_task_id and current_task_id != expected_task_id:
+                ownership_lost = True
+                detail = f"current_task={current_task_id}"
+            elif session_status in {"error", "closed"}:
+                ownership_lost = True
+                detail = f"status={session_status}"
+            elif not current_task_id:
+                ownership_lost = True
+                detail = f"missing_task_id,status={session_status or 'unknown'}"
+
+            if ownership_lost:
+                if not ownership_lost_logged:
+                    self._cancel_request_due_to_ownership_loss(
+                        expected_task_id,
+                        session,
+                        detail=detail,
+                    )
+                    logger.warning(
+                        f"[{session.id}] 检测到工作流所有权丢失，停止当前任务 "
+                        f"(expected_task={expected_task_id}, {detail})"
+                    )
+                    ownership_lost_logged = True
+                return True
+
+            return False
+
+        return _checker
+
+    def _cancel_request_due_to_ownership_loss(
+        self,
+        task_id: str,
+        session: Optional[TabSession],
+        detail: str = "",
+    ) -> None:
+        request_id = str(task_id or "").strip()
+        if not request_id:
+            return
+
+        request_state = self._get_request_state_snapshot(request_id)
+        if request_state.get("terminal"):
+            logger.debug(
+                f"[{getattr(session, 'id', '-')}] 请求已结束，跳过所有权丢失取消: "
+                f"request={request_id}, detail={detail or '-'}, "
+                f"request_status={request_state.get('status') or '-'}, "
+                f"request_reason={request_state.get('cancel_reason') or '-'}"
+            )
+            return
+
+        if session is not None:
+            try:
+                current_task_id = str(getattr(session, "current_task_id", "") or "").strip()
+                if not current_task_id or current_task_id == request_id:
+                    setattr(session, "_workflow_stop_reason", "ownership_lost")
+            except Exception:
+                pass
+
+        try:
+            from app.services.request_manager import request_manager
+            cancelled = bool(request_manager.cancel_request(request_id, "task_ownership_lost"))
+            if cancelled:
+                logger.warning(
+                    f"[{getattr(session, 'id', '-')}] 所有权丢失后取消请求: "
+                    f"request={request_id}, cancelled={cancelled}, detail={detail or '-'}, "
+                    f"current_task={str(getattr(session, 'current_task_id', '') or '').strip() or '-'}, "
+                    f"bound_req={str(getattr(session, '_bound_request_id', '') or '').strip() or '-'}, "
+                    f"status={getattr(getattr(session, 'status', None), 'value', '') or '-'}"
+                )
+                return
+
+            refreshed_state = self._get_request_state_snapshot(request_id)
+            if refreshed_state.get("terminal"):
+                logger.debug(
+                    f"[{getattr(session, 'id', '-')}] 所有权丢失时请求已结束，忽略重复取消: "
+                    f"request={request_id}, detail={detail or '-'}, "
+                    f"request_status={refreshed_state.get('status') or '-'}, "
+                    f"request_reason={refreshed_state.get('cancel_reason') or '-'}"
+                )
+            else:
+                logger.warning(
+                    f"[{getattr(session, 'id', '-')}] 所有权丢失后取消请求: "
+                    f"request={request_id}, cancelled={cancelled}, detail={detail or '-'}, "
+                    f"current_task={str(getattr(session, 'current_task_id', '') or '').strip() or '-'}, "
+                    f"bound_req={str(getattr(session, '_bound_request_id', '') or '').strip() or '-'}, "
+                    f"status={getattr(getattr(session, 'status', None), 'value', '') or '-'}"
+                )
+        except Exception as e:
+            logger.debug(
+                f"[{getattr(session, 'id', '-')}] 所有权丢失后取消请求失败（忽略）: {e}"
+                + (f" ({detail})" if detail else "")
+            )
+
+    def _release_workflow_session(
+        self,
+        session: TabSession,
+        *,
+        effective_stop_checker: Optional[Callable[[], bool]] = None,
+        task_id: str = "",
+    ):
+        expected_task_id = str(task_id or "").strip()
+        current_task_id = str(getattr(session, "current_task_id", "") or "").strip()
+        session_status = getattr(getattr(session, "status", None), "value", "")
+        request_state = self._get_request_state_snapshot(expected_task_id) if expected_task_id else {}
+        if session_status in {"error", "closed"}:
+            logger.warning(
+                f"[{session.id}] 跳过释放：标签页已处于不可复用状态 "
+                f"(expected_task={expected_task_id or '-'}, status={session_status})"
+            )
+            return
+        if expected_task_id:
+            if current_task_id and current_task_id != expected_task_id:
+                if request_state.get("terminal"):
+                    logger.debug(
+                        f"[{session.id}] 请求已结束，跳过迟到的释放收尾 "
+                        f"(expected_task={expected_task_id}, current_task={current_task_id}, "
+                        f"request_status={request_state.get('status') or '-'}, "
+                        f"request_reason={request_state.get('cancel_reason') or '-'})"
+                    )
+                    return
+                self._cancel_request_due_to_ownership_loss(
+                    expected_task_id,
+                    session,
+                    detail=f"current_task={current_task_id}",
+                )
+                logger.warning(
+                    f"[{session.id}] 跳过释放：标签页已被其他任务接管 "
+                    f"(expected_task={expected_task_id}, current_task={current_task_id})"
+                )
+                return
+            if not current_task_id:
+                if request_state.get("terminal"):
+                    logger.debug(
+                        f"[{session.id}] 请求已结束，跳过迟到的释放收尾 "
+                        f"(expected_task={expected_task_id}, status={session_status or 'unknown'}, "
+                        f"request_status={request_state.get('status') or '-'}, "
+                        f"request_reason={request_state.get('cancel_reason') or '-'})"
+                    )
+                    return
+                self._cancel_request_due_to_ownership_loss(
+                    expected_task_id,
+                    session,
+                    detail=f"missing_task_id,status={session_status or 'unknown'}",
+                )
+                logger.warning(
+                    f"[{session.id}] 跳过释放：标签页 task_id 已丢失 "
+                    f"(expected_task={expected_task_id}, status={session_status or 'unknown'})"
+                )
+                return
+
+        cancelled = bool(effective_stop_checker and effective_stop_checker())
+        rollback_request_count = cancelled and self._should_rollback_request_count_on_cancel(task_id)
+        if cancelled and not rollback_request_count:
+            logger.debug(
+                f"[{session.id}] stop detected but request_count preserved "
+                f"(task={task_id or '-'}, reason={self._get_request_cancel_reason(task_id) or 'unknown'})"
+            )
+
+        logger.debug(
+            f"[{session.id}] 工作流释放请求: expected_task={expected_task_id or '-'}, "
+            f"current_task={current_task_id or '-'}, session_status={session_status or '-'}, "
+            f"cancelled={cancelled}, rollback_request_count={rollback_request_count}, "
+            f"bound_req={str(getattr(session, '_bound_request_id', '') or '').strip() or '-'}"
+        )
+
+        self.tab_pool.release(
+            session.id,
+            check_triggers=not rollback_request_count,
+            rollback_request_count=rollback_request_count,
+            expected_task_id=expected_task_id,
+        )
+
+    def execute_workflow(
+        self, 
+        messages: List[Dict],
+        stream: bool = True,
+        task_id: str = None,
+        stop_checker: Optional[Callable[[], bool]] = None,
+        workflow_priority: Optional[int] = None,
+        allow_media_postprocess: bool = True,
+        requested_model: Optional[str] = None,
+        history_mode: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """
+        工作流执行入口（v2.0 改进版）
+        
+        改动：
+        - 自动从池中获取标签页
+        - 执行完自动释放
+        """
+        is_valid, error_msg, sanitized_messages = MessageValidator.validate(messages)
+        
+        if not is_valid:
+            yield self.formatter.pack_error(
+                f"无效请求: {error_msg}",
+                error_type="invalid_request_error",
+                code="invalid_messages"
+            )
+            return
+        
+        if task_id is None:
+            task_id = f"task_{time.time_ns()}"
+        effective_stop_checker = stop_checker or self._should_stop_checker
+        
+        turn_hint = plugin_hooks.call(
+            "compute_turn_hint",
+            messages=sanitized_messages,
+            extract_text_fn=getattr(self, '_extract_text_from_content', None),
+            default=(),
+        )
+        session = None
+        try:
+            try:
+                session = self.tab_pool.acquire(task_id, timeout=60, turn_hint=turn_hint)
+            except TypeError:
+                session = self.tab_pool.acquire(task_id, timeout=60)
+            
+            if session is None:
+                yield self.formatter.pack_error(
+                    "服务繁忙，请稍后重试",
+                    error_type="capacity_error",
+                    code="no_available_tab"
+                )
+                yield self.formatter.pack_finish()
+                return
+
+            self._bind_request_tab_id(task_id, session)
+            effective_stop_checker = self._build_task_ownership_stop_checker(
+                session,
+                task_id,
+                effective_stop_checker,
+            )
+             
+            if stream:
+                yield from self._execute_workflow_stream(
+                    session,
+                    sanitized_messages,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+            else:
+                yield from self._execute_workflow_non_stream(
+                    session,
+                    sanitized_messages,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+        
+        finally:
+            if session:
+                self._release_workflow_session(
+                    session,
+                    effective_stop_checker=effective_stop_checker,
+                    task_id=task_id,
+                )
+                try:
+                    from app.services.command_engine import command_engine
+                    command_engine.schedule_deferred_workflow_commands(session, delay_sec=0.25)
+                except Exception:
+                    pass
+
+    def execute_workflow_for_tab_index(
+        self, 
+        tab_index: int,
+        messages: List[Dict],
+        stream: bool = True,
+        task_id: str = None,
+        preset_name: Optional[str] = None,
+        stop_checker: Optional[Callable[[], bool]] = None,
+        workflow_priority: Optional[int] = None,
+        allow_media_postprocess: bool = True,
+        requested_model: Optional[str] = None,
+        history_mode: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """使用指定编号的标签页执行工作流"""
+        is_valid, error_msg, sanitized_messages = MessageValidator.validate(messages)
+        
+        if not is_valid:
+            yield self.formatter.pack_error(
+                f"无效请求: {error_msg}",
+                error_type="invalid_request_error",
+                code="invalid_messages"
+            )
+            return
+        
+        if task_id is None:
+            task_id = f"tab{tab_index}_{time.time_ns()}"
+        effective_stop_checker = stop_checker or self._should_stop_checker
+        
+        session = None
+        try:
+            session = self.tab_pool.acquire_by_index(tab_index, task_id, timeout=60)
+            
+            if session is None:
+                yield self.formatter.pack_error(
+                    f"标签页 #{tab_index} 不可用或不存在",
+                    error_type="not_found_error",
+                    code="tab_not_found"
+                )
+                yield self.formatter.pack_finish()
+                return
+
+            self._bind_request_tab_id(task_id, session)
+            effective_stop_checker = self._build_task_ownership_stop_checker(
+                session,
+                task_id,
+                effective_stop_checker,
+            )
+             
+            if stream:
+                yield from self._execute_workflow_stream(
+                    session,
+                    sanitized_messages,
+                    preset_name=preset_name,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+            else:
+                yield from self._execute_workflow_non_stream(
+                    session,
+                    sanitized_messages,
+                    preset_name=preset_name,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+        
+        finally:
+            if session:
+                self._release_workflow_session(
+                    session,
+                    effective_stop_checker=effective_stop_checker,
+                    task_id=task_id,
+                )
+                try:
+                    from app.services.command_engine import command_engine
+                    command_engine.schedule_deferred_workflow_commands(session, delay_sec=0.25)
+                except Exception:
+                    pass
+
+    def execute_workflow_for_route_domain(
+        self,
+        route_domain: str,
+        messages: List[Dict],
+        stream: bool = True,
+        task_id: str = None,
+        preset_name: Optional[str] = None,
+        stop_checker: Optional[Callable[[], bool]] = None,
+        workflow_priority: Optional[int] = None,
+        allow_media_postprocess: bool = True,
+        allocation_mode: Optional[str] = None,
+        requested_model: Optional[str] = None,
+        history_mode: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """使用指定域名路由匹配的标签页执行工作流。"""
+        is_valid, error_msg, sanitized_messages = MessageValidator.validate(messages)
+
+        if not is_valid:
+            yield self.formatter.pack_error(
+                f"无效请求: {error_msg}",
+                error_type="invalid_request_error",
+                code="invalid_messages"
+            )
+            return
+
+        normalized_route_domain = str(route_domain or "").strip()
+        if not normalized_route_domain:
+            yield self.formatter.pack_error(
+                "域名路由不能为空",
+                error_type="invalid_request_error",
+                code="invalid_route_domain"
+            )
+            return
+
+        if task_id is None:
+            safe_route_key = normalized_route_domain.replace(".", "_")
+            task_id = f"url_{safe_route_key}_{time.time_ns()}"
+        effective_stop_checker = stop_checker or self._should_stop_checker
+
+        turn_hint = plugin_hooks.call(
+            "compute_turn_hint",
+            messages=sanitized_messages,
+            extract_text_fn=getattr(self, '_extract_text_from_content', None),
+            default=(),
+        )
+        session = None
+        try:
+            try:
+                session = self.tab_pool.acquire_by_route_domain(
+                    normalized_route_domain,
+                    task_id,
+                    timeout=60,
+                    allocation_mode=allocation_mode,
+                    turn_hint=turn_hint,
+                )
+            except TypeError:
+                session = self.tab_pool.acquire_by_route_domain(
+                    normalized_route_domain,
+                    task_id,
+                    timeout=60,
+                    allocation_mode=allocation_mode,
+                )
+
+            if session is None:
+                yield self.formatter.pack_error(
+                    f"域名路由 '{normalized_route_domain}' 没有可用标签页",
+                    error_type="not_found_error",
+                    code="route_domain_not_found"
+                )
+                yield self.formatter.pack_finish()
+                return
+
+            self._bind_request_tab_id(task_id, session)
+            effective_stop_checker = self._build_task_ownership_stop_checker(
+                session,
+                task_id,
+                effective_stop_checker,
+            )
+
+            tab = getattr(session, "tab", None)
+            tab_url = getattr(tab, "url", "") if tab else ""
+            tab_id = getattr(tab, "tab_id", "") if tab else ""
+            logger.info(
+                f"[WORKFLOW:ROUTE_DOMAIN] 分发标签页执行工作流: route_domain={normalized_route_domain!r}, "
+                f"session_id={session.id}, tab_id={tab_id}, tab_url={tab_url!r}, "
+                f"requested_model={requested_model!r}, preset={preset_name!r}"
+            )
+
+            if stream:
+                yield from self._execute_workflow_stream(
+                    session,
+                    sanitized_messages,
+                    preset_name=preset_name,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+            else:
+                yield from self._execute_workflow_non_stream(
+                    session,
+                    sanitized_messages,
+                    preset_name=preset_name,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+
+        finally:
+            if session:
+                self._release_workflow_session(
+                    session,
+                    effective_stop_checker=effective_stop_checker,
+                    task_id=task_id,
+                )
+                try:
+                    from app.services.command_engine import command_engine
+                    command_engine.schedule_deferred_workflow_commands(session, delay_sec=0.25)
+                except Exception:
+                    pass
+
+    def execute_workflow_for_route_group(
+        self,
+        group_id: str,
+        messages: List[Dict],
+        stream: bool = True,
+        task_id: str = None,
+        preset_name: Optional[str] = None,
+        stop_checker: Optional[Callable[[], bool]] = None,
+        workflow_priority: Optional[int] = None,
+        allow_media_postprocess: bool = True,
+        allocation_mode: Optional[str] = None,
+        requested_model: Optional[str] = None,
+        history_mode: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """Execute a workflow on an atomically acquired route-group member."""
+        is_valid, error_msg, sanitized_messages = MessageValidator.validate(messages)
+        if not is_valid:
+            yield self.formatter.pack_error(
+                f"无效请求: {error_msg}",
+                error_type="invalid_request_error",
+                code="invalid_messages",
+            )
+            return
+
+        normalized_group_id = str(group_id or "").strip().lower()
+        if not normalized_group_id:
+            yield self.formatter.pack_error(
+                "标签页路由组不能为空",
+                error_type="invalid_request_error",
+                code="invalid_route_group",
+            )
+            return
+
+        if task_id is None:
+            task_id = f"group_{normalized_group_id}_{time.time_ns()}"
+        effective_stop_checker = stop_checker or self._should_stop_checker
+
+        turn_hint = plugin_hooks.call(
+            "compute_turn_hint",
+            messages=sanitized_messages,
+            extract_text_fn=getattr(self, '_extract_text_from_content', None),
+            default=(),
+        )
+        session = None
+        try:
+            try:
+                session = self.tab_pool.acquire_by_route_group(
+                    normalized_group_id,
+                    task_id,
+                    timeout=60,
+                    allocation_mode=allocation_mode,
+                    requested_model=requested_model,
+                    turn_hint=turn_hint,
+                )
+            except TypeError:
+                session = self.tab_pool.acquire_by_route_group(
+                    normalized_group_id,
+                    task_id,
+                    timeout=60,
+                    allocation_mode=allocation_mode,
+                    requested_model=requested_model,
+                )
+            if session is None:
+                yield self.formatter.pack_error(
+                    f"标签页路由组 '{normalized_group_id}' 没有可用成员",
+                    error_type="not_found_error",
+                    code="route_group_not_available",
+                )
+                yield self.formatter.pack_finish()
+                return
+
+            self._bind_request_tab_id(task_id, session)
+            effective_stop_checker = self._build_task_ownership_stop_checker(
+                session,
+                task_id,
+                effective_stop_checker,
+            )
+
+            if stream:
+                yield from self._execute_workflow_stream(
+                    session,
+                    sanitized_messages,
+                    preset_name=preset_name,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+            else:
+                yield from self._execute_workflow_non_stream(
+                    session,
+                    sanitized_messages,
+                    preset_name=preset_name,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+        finally:
+            if session:
+                self._release_workflow_session(
+                    session,
+                    effective_stop_checker=effective_stop_checker,
+                    task_id=task_id,
+                )
+                try:
+                    from app.services.command_engine import command_engine
+                    command_engine.schedule_deferred_workflow_commands(session, delay_sec=0.25)
+                except Exception:
+                    pass
+
+    def execute_workflow_for_exact_url(
+        self,
+        exact_url: str,
+        messages: List[Dict],
+        stream: bool = True,
+        task_id: str = None,
+        preset_name: Optional[str] = None,
+        stop_checker: Optional[Callable[[], bool]] = None,
+        workflow_priority: Optional[int] = None,
+        allow_media_postprocess: bool = True,
+        resolved_tab_index: Optional[int] = None,
+        requested_model: Optional[str] = None,
+        history_mode: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """使用标签页完整 URL 严格匹配的唯一标签页执行工作流。"""
+        is_valid, error_msg, sanitized_messages = MessageValidator.validate(messages)
+
+        if not is_valid:
+            yield self.formatter.pack_error(
+                f"无效请求: {error_msg}",
+                error_type="invalid_request_error",
+                code="invalid_messages"
+            )
+            return
+
+        normalized_exact_url = str(exact_url or "").strip()
+        if not normalized_exact_url:
+            yield self.formatter.pack_error(
+                "URL 路由不能为空",
+                error_type="invalid_request_error",
+                code="invalid_route_url"
+            )
+            return
+
+        if task_id is None:
+            task_id = f"tab_url_{time.time_ns()}"
+        effective_stop_checker = stop_checker or self._should_stop_checker
+
+        session = None
+        try:
+            if resolved_tab_index is not None:
+                try:
+                    resolved_index = int(resolved_tab_index)
+                except Exception:
+                    resolved_index = 0
+                if resolved_index <= 0:
+                    yield self.formatter.pack_error(
+                        "URL 路由解析的标签页编号无效",
+                        error_type="invalid_request_error",
+                        code="resolved_tab_index_invalid",
+                    )
+                    yield self.formatter.pack_finish()
+                    return
+                session = self.tab_pool.acquire_by_index(resolved_index, task_id, timeout=60)
+                if session is not None:
+                    cached_url, _cached_domain = session.get_cached_route_snapshot()
+                    if not tab_url_matches(normalized_exact_url, cached_url):
+                        self.tab_pool.release(
+                            session.id,
+                            check_triggers=False,
+                            rollback_request_count=True,
+                            expected_task_id=task_id,
+                        )
+                        session = None
+                        yield self.formatter.pack_error(
+                            f"URL 路由 '{normalized_exact_url}' 已不匹配标签页 #{resolved_index}",
+                            error_type="not_found_error",
+                            code="exact_url_resolved_tab_mismatch",
+                        )
+                        yield self.formatter.pack_finish()
+                        return
+            else:
+                session = self.tab_pool.acquire_by_exact_url(normalized_exact_url, task_id, timeout=60)
+
+            if session is None:
+                yield self.formatter.pack_error(
+                    f"URL 路由 '{normalized_exact_url}' 没有唯一可用标签页",
+                    error_type="not_found_error",
+                    code="exact_url_not_found"
+                )
+                yield self.formatter.pack_finish()
+                return
+
+            self._bind_request_tab_id(task_id, session)
+            effective_stop_checker = self._build_task_ownership_stop_checker(
+                session,
+                task_id,
+                effective_stop_checker,
+            )
+
+            if stream:
+                yield from self._execute_workflow_stream(
+                    session,
+                    sanitized_messages,
+                    preset_name=preset_name,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+            else:
+                yield from self._execute_workflow_non_stream(
+                    session,
+                    sanitized_messages,
+                    preset_name=preset_name,
+                    stop_checker=effective_stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    history_mode=history_mode,
+                )
+
+        finally:
+            if session:
+                self._release_workflow_session(
+                    session,
+                    effective_stop_checker=effective_stop_checker,
+                    task_id=task_id,
+                )
+                try:
+                    from app.services.command_engine import command_engine
+                    command_engine.schedule_deferred_workflow_commands(session, delay_sec=0.25)
+                except Exception:
+                    pass
+
+    def _bind_request_tab_id(self, task_id: str, session: Optional[TabSession]):
+        if not session:
+            return
+        request_id = str(task_id or "").strip()
+        if not request_id:
+            return
+        try:
+            setattr(session, "_bound_request_id", request_id)
+            from app.services.request_manager import request_manager
+            bind_ok = bool(request_manager.bind_tab(request_id, session.id))
+            tab_index = int(getattr(session, "persistent_index", 0) or 0)
+            request_manager.update_request_metadata(
+                request_id,
+                tab_id=session.id,
+                tab_index=tab_index if tab_index > 0 else None,
+                target_domain=str(getattr(session, "current_domain", "") or "").strip(),
+                preset_name=str(getattr(session, "preset_name", "") or "").strip(),
+            )
+            logger.debug(
+                f"[{session.id}] 绑定请求标签页: request={request_id}, "
+                f"bind_ok={bind_ok}, current_task={str(getattr(session, 'current_task_id', '') or '').strip() or '-'}, "
+                f"status={getattr(getattr(session, 'status', None), 'value', '') or '-'}, "
+                f"idx=#{getattr(session, 'persistent_index', 0) or '-'}"
+            )
+        except Exception as e:
+            logger.debug(f"[{session.id}] 绑定请求标签页失败（忽略）: {e}")
+
+    def _plan_workflow_input_chunks(
+        self,
+        session: TabSession,
+        messages: List[Dict],
+        *,
+        preset_name: Optional[str],
+        requested_model: Optional[str],
+        history_mode: Optional[str] = None,
+    ) -> List[PromptChunk]:
+        """Build a chunk plan from the same final prompt used by the workflow."""
+        try:
+            tab = session.tab
+            domain = extract_remote_site_domain(tab.url)
+            if not domain:
+                return []
+
+            config_engine = self._get_config_engine()
+            effective_preset_name = preset_name if preset_name is not None else session.preset_name
+
+            site_config = config_engine.get_site_config(
+                domain,
+                html_content=lambda: getattr(tab, "html", ""),
+                preset_name=effective_preset_name,
+            )
+            if not isinstance(site_config, dict):
+                return []
+
+            file_paste_config = site_config.get("file_paste", {}) or {}
+            strategy = str(file_paste_config.get("temp_file_type") or "").strip().lower().lstrip(".")
+            if not file_paste_config.get("enabled", False) or strategy != "chunk":
+                return []
+
+            threshold = int(file_paste_config.get("threshold", 50000) or 50000)
+            current_tab_url = str(getattr(session, "last_known_url", "") or getattr(tab, "url", "") or "").strip()
+            plan_resolution = plugin_hooks.call(
+                "resolve_history",
+                session=session,
+                messages=messages,
+                history_mode=history_mode,
+                live_url=current_tab_url,
+                extract_text_fn=getattr(self, '_extract_text_from_content', None),
+                build_prompt_fn=getattr(self, '_build_prompt_from_messages', None),
+                default=None,
+            )
+            prompt_text = (
+                plan_resolution.prompt_text
+                if plan_resolution is not None
+                else self._build_prompt_from_messages(messages)
+            )
+            prompt_text = self._apply_prompt_padding(
+                prompt_text,
+                site_config.get("prompt_padding", {}) or {},
+            )
+            if len(prompt_text) <= threshold:
+                return []
+
+            chunks = plan_prompt_chunks(prompt_text, threshold)
+            logger.info(
+                f"[{session.id}] 输入超过分块阈值: total={len(prompt_text)}, "
+                f"limit={threshold}, chunks={len(chunks)}, "
+                f"lengths={[len(chunk.prompt) for chunk in chunks]}"
+            )
+            return chunks
+        except Exception as exc:
+            logger.warning(f"[{session.id}] 分块规划失败，将交由标准工作流处理: {exc}")
+            return []
+
+    def _execute_workflow_stream(
+        self,
+        session: TabSession,
+        messages: List[Dict],
+        preset_name: Optional[str] = None,
+        stop_checker: Optional[Callable[[], bool]] = None,
+        workflow_priority: Optional[int] = None,
+        allow_media_postprocess: bool = True,
+        requested_model: Optional[str] = None,
+        _prepared_prompt: Optional[str] = None,
+        _skip_chunk_planning: bool = False,
+        _chunk_continuation: bool = False,
+        _include_message_images: bool = True,
+        history_mode: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        if not _skip_chunk_planning and _prepared_prompt is None:
+            chunk_plan = self._plan_workflow_input_chunks(
+                session,
+                messages,
+                preset_name=preset_name,
+                requested_model=requested_model,
+                history_mode=history_mode,
+            )
+            if len(chunk_plan) > 1:
+                for chunk in chunk_plan:
+                    is_final_chunk = chunk.index == chunk.total
+                    part_stream = self._execute_workflow_stream(
+                        session,
+                        messages,
+                        preset_name=preset_name,
+                        stop_checker=stop_checker,
+                        workflow_priority=workflow_priority,
+                        allow_media_postprocess=(allow_media_postprocess if is_final_chunk else False),
+                        requested_model=requested_model,
+                        _prepared_prompt=chunk.prompt,
+                        _skip_chunk_planning=True,
+                        _chunk_continuation=chunk.index > 1,
+                        _include_message_images=chunk.index == 1,
+                        history_mode=history_mode,
+                    )
+                    if is_final_chunk:
+                        yield from part_stream
+                        return
+
+                    intermediate_error = None
+                    try:
+                        for response_chunk in part_stream:
+                            if self._extract_stream_error_payload(response_chunk):
+                                intermediate_error = response_chunk
+                                break
+                    finally:
+                        with contextlib.suppress(Exception):
+                            part_stream.close()
+
+                    if intermediate_error is not None:
+                        yield intermediate_error
+                        yield self.formatter.pack_finish()
+                        return
+
+                    logger.info(
+                        f"[{session.id}] 已完成第 {chunk.index}/{chunk.total} 个输入分块，"
+                        "中间回复未返回客户端"
+                    )
+                return
+
+        max_terminal_retries = 1
+        attempt = 0
+        retry_origin_chunk = None
+
+        try:
+            while True:
+                setattr(session, "_workflow_attempt", attempt)
+                stream = self._execute_workflow_stream_once(
+                    session,
+                    messages,
+                    preset_name=preset_name,
+                    stop_checker=stop_checker,
+                    workflow_priority=workflow_priority,
+                    allow_media_postprocess=allow_media_postprocess,
+                    requested_model=requested_model,
+                    _prepared_prompt=_prepared_prompt,
+                    _chunk_continuation=_chunk_continuation,
+                    _include_message_images=_include_message_images,
+                    history_mode=history_mode,
+                )
+                saw_content = False
+                retry_requested = False
+
+                try:
+                    for chunk in stream:
+                        is_terminal_error = self._is_stream_terminal_error_chunk(chunk)
+                        if (
+                            not saw_content
+                            and attempt < max_terminal_retries
+                            and is_terminal_error
+                            and self._is_retriable_stream_terminal_error_chunk(chunk)
+                            and not (stop_checker or self._should_stop_checker)()
+                        ):
+                            retry_requested = True
+                            retry_origin_chunk = chunk
+                            logger.warning(
+                                self._build_stream_terminal_alert_message(
+                                    session.id,
+                                    chunk,
+                                    retrying=True,
+                                    attempt=attempt + 1,
+                                    max_attempts=max_terminal_retries,
+                                )
+                            )
+                            break
+
+                        if not is_terminal_error and self._chunk_has_stream_content(chunk):
+                            saw_content = True
+
+                        if is_terminal_error:
+                            if retry_origin_chunk and attempt > 0 and not saw_content:
+                                first_detail = self._get_stream_terminal_error_detail(
+                                    retry_origin_chunk
+                                ).strip().lower()
+                                final_detail = self._get_stream_terminal_error_detail(
+                                    chunk
+                                ).strip().lower()
+                                if (
+                                    first_detail == "arena_send_no_target"
+                                    or final_detail == "arena_send_no_target"
+                                ):
+                                    chunk = self.formatter.pack_error(
+                                        f"stream_terminal_error:{ARENA_SEND_NO_TARGET_AFTER_RETRY}",
+                                        code=ARENA_SEND_NO_TARGET_AFTER_RETRY,
+                                        status_code=422,
+                                        retryable=False,
+                                    )
+                                else:
+                                    chunk = self._build_retry_failure_error_chunk(
+                                        retry_origin_chunk,
+                                        chunk,
+                                    )
+                            logger.error(
+                                self._build_stream_terminal_alert_message(
+                                    session.id,
+                                    chunk,
+                                    retrying=False,
+                                    saw_content=saw_content,
+                                )
+                            )
+                            self._emit_stream_terminal_alert_event(
+                                session,
+                                chunk,
+                                saw_content=saw_content,
+                            )
+
+                        yield chunk
+                finally:
+                    with contextlib.suppress(Exception):
+                        stream.close()
+
+                if not retry_requested:
+                    return
+
+                retry_detail = self._get_stream_terminal_error_detail(
+                    retry_origin_chunk or ""
+                ).strip().lower()
+                retry_handler = get_workflow_retry_handler(retry_detail)
+                if retry_handler is not None:
+                    retry_stream = retry_handler(
+                        session,
+                        stop_checker or self._should_stop_checker,
+                        self.formatter,
+                    )
+                    if retry_stream is not None:
+                        has_error_chunks = False
+                        for chunk in retry_stream:
+                            has_error_chunks = True
+                            yield chunk
+                        if has_error_chunks:
+                            return
+
+                attempt += 1
+                setattr(session, "_workflow_stop_reason", None)
+                setattr(session, "_workflow_user_stop_logged", False)
+                time.sleep(0.5)
+        finally:
+            with contextlib.suppress(Exception):
+                setattr(session, "_workflow_attempt", 0)
+                setattr(session, "_arena_direct_recovery_url", "")
+                setattr(session, "_arena_direct_input_selector", "")
+                setattr(session, "_arena_watchdog_input_selector", "")
+                setattr(session, "_arena_direct_initial_url", None)
+                setattr(session, "_arena_direct_recovered_retry", False)
+
+    @staticmethod
+    def _extract_stream_error_payload(chunk: str) -> Optional[Dict]:
+        if not isinstance(chunk, str) or not chunk.startswith("data: "):
+            return None
+        data_str = chunk[6:].strip()
+        if not data_str or data_str == "[DONE]":
+            return None
+        try:
+            payload = json.loads(data_str)
+        except json.JSONDecodeError:
+            return None
+        error = payload.get("error")
+        return error if isinstance(error, dict) else None
+
+    @classmethod
+    def _is_stream_terminal_error_chunk(cls, chunk: str) -> bool:
+        error = cls._extract_stream_error_payload(chunk)
+        if not error:
+            return False
+
+        message = str(error.get("message") or "").lower()
+        if "stream_terminal_error:" in message:
+            return True
+        if bool(error.get("terminal") or error.get("is_terminal")):
+            return True
+
+        # Structured non-retryable 4xx errors (for example moderation blocks)
+        # are terminal even when the formatter has already stripped the prefix.
+        retryable = error.get("retryable")
+        try:
+            status_code = int(error.get("status_code"))
+        except (TypeError, ValueError):
+            status_code = 0
+        return retryable is False and 400 <= status_code < 500
+
+    @classmethod
+    def _extract_stream_terminal_http_status(cls, detail: str) -> int:
+        match = re.search(r"\bhttp\s+(\d{3})\b", str(detail or ""), re.IGNORECASE)
+        if not match:
+            return 0
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 0
+
+    @classmethod
+    def _is_retriable_stream_terminal_error_chunk(cls, chunk: str) -> bool:
+        if not cls._is_stream_terminal_error_chunk(chunk):
+            return False
+
+        error = cls._extract_stream_error_payload(chunk) or {}
+        if error.get("retryable") is False:
+            return False
+        if error.get("retryable") is True:
+            return True
+
+        detail = cls._get_stream_terminal_error_detail(chunk).strip()
+        if not detail:
+            return False
+
+        detail_lower = detail.lower()
+        if is_retriable_workflow_error(detail_lower):
+            return True
+
+        status_code = error.get("status_code") or cls._extract_stream_terminal_http_status(detail)
+        if status_code:
+            return status_code >= 500
+
+        if "too many requests" in detail_lower or "rate limit" in detail_lower or "429" in detail_lower:
+            return False
+
+        if any(token in detail_lower for token in (
+            "not permitted",
+            "choose another model",
+            "terms of use",
+            "violates our terms",
+            "moderation_blocked",
+            "safety_violations",
+            "rejected by the safety",
+        )):
+            return False
+
+        return False
+
+    @classmethod
+    def _get_stream_terminal_error_detail(cls, chunk: str) -> str:
+        error = cls._extract_stream_error_payload(chunk)
+        if not error:
+            return ""
+
+        message = " ".join(str(error.get("message") or "").split())
+        if not message:
+            return ""
+
+        for marker in ("stream_terminal_error:", "execution_error:", "执行错误:"):
+            marker_index = message.lower().find(marker)
+            if marker_index >= 0:
+                detail = message[marker_index + len(marker):].strip()
+                if detail:
+                    return detail
+
+        return message
+
+    def _build_retry_failure_error_chunk(self, first_chunk: str, final_chunk: str) -> str:
+        first_detail = self._get_stream_terminal_error_detail(first_chunk)
+        final_detail = self._get_stream_terminal_error_detail(final_chunk)
+        if not first_detail or not final_detail or first_detail == final_detail:
+            return final_chunk
+
+        first_error = self._extract_stream_error_payload(first_chunk) or {}
+        final_error = self._extract_stream_error_payload(final_chunk) or {}
+        code = str(
+            first_error.get("code")
+            or final_error.get("code")
+            or "workflow_failed"
+        ).strip() or "workflow_failed"
+        return self.formatter.pack_error(
+            f"{first_detail}; retry_failed:{final_detail}",
+            code=code,
+        )
+
+    @classmethod
+    def _summarize_stream_terminal_alert(
+        cls,
+        chunk: str,
+        *,
+        retrying: bool,
+        saw_content: bool = False,
+        attempt: int = 0,
+        max_attempts: int = 0,
+    ) -> str:
+        detail = cls._get_stream_terminal_error_detail(chunk) or "unknown stream terminal error"
+        lowered = detail.lower()
+        if "not permitted" in lowered or "choose another model" in lowered:
+            category = "模型权限限制"
+        elif "too many requests" in lowered or "rate limit" in lowered or "429" in lowered:
+            category = "限流终止"
+        elif any(token in lowered for token in ("terms of use", "violates our terms", "moderation", "safety", "rejected by the safety")):
+            category = "策略违规终止"
+        else:
+            category = "异常终止"
+
+        if retrying:
+            return (
+                f"目标流告警：检测到{category}（{detail}），"
+                f"自动重试工作流 ({attempt}/{max_attempts})"
+            )
+
+        suffix = "当前工作流将报错结束（已有部分输出）" if saw_content else "当前工作流将报错结束"
+        return f"目标流告警：检测到{category}（{detail}），{suffix}"
+
+    @classmethod
+    def _build_stream_terminal_alert_message(
+        cls,
+        session_id: str,
+        chunk: str,
+        *,
+        retrying: bool,
+        saw_content: bool = False,
+        attempt: int = 0,
+        max_attempts: int = 0,
+    ) -> str:
+        summary = cls._summarize_stream_terminal_alert(
+            chunk,
+            retrying=retrying,
+            saw_content=saw_content,
+            attempt=attempt,
+            max_attempts=max_attempts,
+        )
+        return f"[ALERT][{session_id}] {summary}"
+
+    def _emit_stream_terminal_alert_event(
+        self,
+        session: TabSession,
+        chunk: str,
+        *,
+        saw_content: bool = False,
+    ) -> None:
+        summary = self._summarize_stream_terminal_alert(
+            chunk,
+            retrying=False,
+            saw_content=saw_content,
+        )
+        detail = self._get_stream_terminal_error_detail(chunk)
+        if not summary:
+            return
+
+        try:
+            from app.services.command_engine import command_engine
+            command_engine.emit_external_command_result_event(
+                session,
+                source_command_id="evt_stream_terminal_error",
+                source_command_name="ARENA_STREAM_TERMINAL_ALERT",
+                summary=summary,
+                result=detail or summary,
+                informative=True,
+                mode="external_alert",
+                group_name="arena_commands",
+            )
+        except Exception as e:
+            logger.debug(f"[{session.id}] stream terminal alert event skipped: {e}")
+
+    @staticmethod
+    def _extract_stream_delta_content(chunk: str) -> str:
+        if not isinstance(chunk, str):
+            return ""
+
+        parts = []
+        for frame in chunk.split("\n\n"):
+            frame = frame.strip()
+            if not frame.startswith("data: "):
+                continue
+
+            data_str = frame[6:].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+
+            try:
+                payload = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            choices = payload.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+
+            delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
+            content = delta.get("content", "") if isinstance(delta, dict) else ""
+            if content:
+                parts.append(str(content))
+
+        return "".join(parts)
+
+    @staticmethod
+    def _chunk_has_stream_content(chunk: str) -> bool:
+        return bool(BrowserWorkflowMixin._extract_stream_delta_content(chunk))
+
+    @staticmethod
+    def _looks_like_image_generation_request(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return False
+
+        direct_markers = (
+            "生成图片",
+            "生成图像",
+            "生成一张图",
+            "生成一张图片",
+            "画一张",
+            "画一幅",
+            "帮我画",
+            "请画",
+            "出图",
+            "做图",
+            "文生图",
+            "以图生图",
+            "image generation",
+            "generate image",
+            "generate an image",
+            "create image",
+            "create an image",
+            "draw an image",
+            "draw me",
+            "make an image",
+            "render an image",
+            "render image",
+        )
+        if any(marker in lowered for marker in direct_markers):
+            return True
+
+        english_actions = ("generate", "create", "draw", "make", "render", "design", "produce")
+        english_objects = (
+            "image",
+            "images",
+            "picture",
+            "pictures",
+            "photo",
+            "photos",
+            "illustration",
+            "artwork",
+            "poster",
+            "logo",
+            "icon",
+            "banner",
+            "wallpaper",
+            "portrait",
+        )
+        if any(action in lowered for action in english_actions) and any(obj in lowered for obj in english_objects):
+            return True
+
+        chinese_actions = ("画", "绘制", "生成", "创作", "设计")
+        chinese_objects = ("图片", "图像", "照片", "插画", "海报", "logo", "图标", "头像", "封面", "壁纸")
+        return any(action in lowered for action in chinese_actions) and any(
+            obj in lowered for obj in chinese_objects
+        )
+
+    def _execute_workflow_stream_once(
+        self,
+        session: TabSession,
+        messages: List[Dict],
+        preset_name: Optional[str] = None,
+        stop_checker: Optional[Callable[[], bool]] = None,
+        workflow_priority: Optional[int] = None,
+        allow_media_postprocess: bool = True,
+        requested_model: Optional[str] = None,
+        _prepared_prompt: Optional[str] = None,
+        _chunk_continuation: bool = False,
+        _include_message_images: bool = True,
+        history_mode: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """流式工作流执行（v2.0）"""
+        tab = session.tab
+        effective_stop_checker = stop_checker or self._should_stop_checker
+        workflow_priority_value = 2
+        workflow_runtime = None
+        executor = None
+        workflow_aborted = False
+        workflow_abort_message = ""
+        command_engine = None
+        try:
+            from app.services.command_engine import command_engine as _command_engine
+            command_engine = _command_engine
+            workflow_priority_value = command_engine._normalize_priority(
+                workflow_priority, command_engine._get_request_priority_baseline()
+            )
+        except Exception:
+            workflow_priority_value = 2
+    
+        if effective_stop_checker():
+            yield self.formatter.pack_error("请求已取消", code="cancelled")
+            yield self.formatter.pack_finish()
+            return
+    
+        try:
+            url = tab.url
+        except Exception as e:
+            logger.warning(f"[{session.id}] 标签页访问失败: {e}")
+            session.mark_error("tab_access_failed")
+            yield self.formatter.pack_error(
+                "标签页已关闭或失效，请刷新页面后重试",
+                code="tab_closed"
+            )
+            yield self.formatter.pack_finish()
+            return
+    
+        if not url:
+            yield self.formatter.pack_error(
+                "请先打开目标AI网站",
+                code="no_page"
+            )
+            yield self.formatter.pack_finish()
+            return
+    
+        invalid_urls = ("about:blank", "chrome://newtab/", "chrome://new-tab-page/")
+        if url in invalid_urls:
+            yield self.formatter.pack_error(
+                "当前是空白页，请先打开目标AI网站",
+                code="blank_page"
+            )
+            yield self.formatter.pack_finish()
+            return
+    
+        if "chrome-error://" in url or "about:neterror" in url:
+            yield self.formatter.pack_error(
+                "页面加载错误，请刷新后重试",
+                code="page_error"
+            )
+            yield self.formatter.pack_finish()
+            return
+    
+        try:
+            domain = extract_remote_site_domain(url)
+            if not domain:
+                raise ValueError(f"not a remote site url: {url}")
+            session.current_domain = domain
+        except Exception as e:
+            logger.warning(f"[{session.id}] URL 解析失败: {url}, 错误: {e}")
+            yield self.formatter.pack_error(
+                "当前页面不是可解析的网站，请打开真实的远程站点页面后再试",
+                code="invalid_url"
+            )
+            yield self.formatter.pack_finish()
+            return
+    
+        tab_url = getattr(tab, "url", "")
+        tab_id = getattr(tab, "tab_id", "")
+        logger.info(
+            f"[WORKFLOW:ENTRY] 进入工作流流式执行: session_id={session.id}, tab_id={tab_id}, "
+            f"domain={domain!r}, current_url={tab_url!r}, requested_model={requested_model!r}, "
+            f"preset={preset_name!r}, session_preset={session.preset_name!r}"
+        )
+        
+        page_status = self._check_page_status(tab)
+        if not page_status["ready"]:
+            yield self.formatter.pack_error(
+                f"页面未就绪: {page_status['reason']}",
+                code="page_not_ready"
+            )
+            yield self.formatter.pack_finish()
+            return
+        
+        config_engine = self._get_config_engine()
+        effective_preset_name = preset_name if preset_name is not None else session.preset_name
+
+        resolved_preset_name = effective_preset_name or config_engine.get_default_preset(domain) or "主预设"
+        logger.info(
+            f"[WORKFLOW:PRESET] 最终选定预设: session_id={session.id}, preset={resolved_preset_name!r}, "
+            f"requested_model={requested_model!r}, current_url={tab_url!r}"
+        )
+        site_config = config_engine.get_site_config(
+            domain,
+            html_content=lambda: getattr(tab, "html", ""),
+            preset_name=effective_preset_name,
+        )
+        if not site_config:
+            yield self.formatter.pack_error(
+                "配置加载失败",
+                code="config_error"
+            )
+            yield self.formatter.pack_finish()
+            return
+        
+        selectors = site_config.get("selectors", {})
+        setattr(
+            session,
+            "_arena_watchdog_input_selector",
+            str(selectors.get("input_box", "") or ""),
+        )
+        workflow = site_config.get("workflow", [])
+        stealth_mode = site_config.get("stealth", False)
+        force_new_conversation = bool(BrowserConstants.get("FORCE_NEW_CONVERSATION"))
+        conversation_threshold = self._get_conversation_timeout_threshold()
+
+        # [UWA-PLUGIN] resolve_history 钩子：由插件决定多轮历史决策。
+        # 无插件时返回 None，走上游原始 should_start_new_conversation 逻辑。
+        current_tab_url = str(getattr(session, "last_known_url", "") or getattr(tab, "url", "") or "").strip()
+        history_resolution = plugin_hooks.call(
+            "resolve_history",
+            session=session,
+            messages=messages,
+            history_mode=history_mode,
+            live_url=current_tab_url,
+            extract_text_fn=getattr(self, '_extract_text_from_content', None),
+            build_prompt_fn=getattr(self, '_build_prompt_from_messages', None),
+            default=None,
+        )
+        if history_resolution is not None:
+            skip_new_chat = history_resolution.skip_new_chat
+        else:
+            skip_new_chat = not session.should_start_new_conversation(
+                current_domain=domain,
+                preset_name=resolved_preset_name,
+                threshold_seconds=conversation_threshold,
+                force_new=force_new_conversation,
+            )
+        if force_new_conversation:
+            skip_new_chat = False
+            session.forget_conversation()
+        advanced_config = config_engine.get_site_advanced_config(
+            domain,
+            preset_name=resolved_preset_name,
+        )
+        workflow_attempt = int(getattr(session, "_workflow_attempt", 0) or 0)
+        skip_new_chat_on_retry = bool(advanced_config.get("skip_new_chat_on_retry", False))
+        retry_skip_new_chat = workflow_attempt > 0 and skip_new_chat_on_retry
+        if retry_skip_new_chat:
+            skip_new_chat = True
+            logger.info(
+                f"[{session.id}] 重试轮启用原地自愈，跳过新建对话: "
+                f"attempt={workflow_attempt}, domain={domain}, preset={resolved_preset_name}"
+            )
+
+        if _chunk_continuation:
+            skip_new_chat = True
+            logger.info(
+                f"[{session.id}] 分块续传复用当前对话: "
+                f"domain={domain}, preset={resolved_preset_name}"
+            )
+
+        arena_direct_active = is_arena_direct_preset(domain, resolved_preset_name, site_config)
+        arena_has_new_chat = workflow_has_new_chat_step(workflow)
+        arena_recovery_url = ""
+        model_catalog = None
+        if arena_direct_active:
+            from app.services.arena_model_catalog import get_arena_model_catalog
+            model_catalog = get_arena_model_catalog(domain, resolved_preset_name, config_engine=config_engine)
+            site_cat = site_config.get("model_catalog") if isinstance(site_config, (dict, Mapping)) else None
+            if not model_catalog or not model_catalog.get("enabled"):
+                if isinstance(site_cat, (dict, Mapping)):
+                    model_catalog = site_cat
+
+            if (
+                requested_model
+                and isinstance(model_catalog, dict)
+                and bool(model_catalog.get("enabled", False))
+                and str(model_catalog.get("source") or "arena_direct").strip().lower() == "arena_direct"
+            ):
+                available_model = resolve_arena_direct_model(
+                    tab,
+                    requested_model,
+                    catalog_config=model_catalog,
+                )
+                if not available_model:
+                    logger.warning(
+                        f"[{session.id}] 请求模型不在当前标签页预设的可用目录中，拒绝执行: "
+                        f"model={requested_model!r}, preset={resolved_preset_name!r}"
+                    )
+                    yield self.formatter.pack_error(
+                        "请求模型不在当前标签页预设的可用模型目录中",
+                        error_type="invalid_request_error",
+                        code="arena_direct_model_not_available",
+                        status_code=422,
+                        retryable=False,
+                    )
+                    yield self.formatter.pack_finish()
+                    return
+
+            current_tab_url = str(getattr(tab, "url", "") or "").strip()
+            if workflow_attempt == 0 or not getattr(session, "_arena_direct_initial_url", None):
+                setattr(session, "_arena_direct_initial_url", current_tab_url)
+            initial_recorded_url = str(getattr(session, "_arena_direct_initial_url", "") or current_tab_url)
+            is_image_modality = (
+                "image" in str(resolved_preset_name or "").lower()
+                or "生图" in str(resolved_preset_name or "")
+                or (isinstance(site_cat, (dict, Mapping)) and str(site_cat.get("modality") or "").strip().lower() == "image")
+            )
+            catalog_modality = ""
+            if isinstance(model_catalog, (dict, Mapping)):
+                catalog_modality = str(model_catalog.get("modality") or "").strip().lower()
+            fallback_direct_url = resolve_arena_direct_entry_url(
+                current_tab_url,
+                modality="image" if is_image_modality else catalog_modality,
+            )
+            arena_recovery_url = resolve_arena_direct_recovery_url(
+                workflow,
+                initial_url=initial_recorded_url,
+                skip_new_chat=skip_new_chat or _chunk_continuation,
+                fallback_url=fallback_direct_url,
+            )
+            setattr(session, "_arena_direct_recovery_url", arena_recovery_url)
+            setattr(session, "_arena_direct_input_selector", str(selectors.get("input_box", "") or ""))
+
+        is_direct_recovered_retry = bool(getattr(session, "_arena_direct_recovered_retry", False))
+        if is_direct_recovered_retry:
+            setattr(session, "_arena_direct_recovered_retry", False)
+            if arena_has_new_chat and not _chunk_continuation and not skip_new_chat:
+                skip_new_chat = False
+                retry_skip_new_chat = False
+                logger.info(
+                    f"[{session.id}] Arena direct 意外跳转恢复后重试，恢复执行新建对话步骤"
+                )
+
+        if retry_skip_new_chat:
+            logger.debug(f"[{session.id}] 重试轮跳过新建对话优先于本轮新建判定")
+        elif force_new_conversation:
+            logger.debug(f"[{session.id}] 已启用强制新建对话")
+        elif skip_new_chat:
+            if history_resolution is not None:
+                logger.info(
+                    f"[{session.id}] continuing this tab's conversation: "
+                    f"typed {history_resolution.typed_chars} of {history_resolution.full_chars} chars "
+                    f"(mode={history_resolution.mode}, turn={history_resolution.turn}, reason={history_resolution.reason})"
+                )
+            else:
+                logger.debug(
+                    f"[{session.id}] 复用当前对话: domain={domain}, "
+                    f"preset={resolved_preset_name}, threshold={conversation_threshold}s"
+                )
+        else:
+            if history_resolution is not None:
+                logger.info(
+                    f"[{session.id}] typing full history into composer: "
+                    f"{history_resolution.typed_chars} chars "
+                    f"(mode={history_resolution.mode}, turn={history_resolution.turn}, reason={history_resolution.reason})"
+                )
+            else:
+                logger.debug(
+                    f"[{session.id}] 本轮将新建对话: domain={domain}, "
+                    f"preset={resolved_preset_name}, threshold={conversation_threshold}s"
+                )
+        
+        image_config = dict(site_config.get("image_extraction", {}) or {})
+        modalities = image_config.get("modalities") or {}
+        image_extraction_enabled = bool(image_config.get("enabled", False)) or any(
+            is_modality_enabled(modalities, key) for key in ("image", "audio", "video")
+        )
+        stream_config = site_config.get("stream_config", {}) or {}
+        network_config = stream_config.get("network", {}) if isinstance(stream_config, dict) else {}
+        parser_id = str((network_config or {}).get("parser") or "").strip().lower()
+        target_side = ""
+        if parser_id != "lmarena":
+            if "right" in parser_id:
+                target_side = "right"
+            elif "left" in parser_id:
+                target_side = "left"
+        setattr(session, "_workflow_parser_id", parser_id)
+        setattr(session, "_workflow_target_side", target_side)
+        # The parser owns the Arena battle side.  Carry it into every monitor
+        # and final media extraction path so DOM geometry cannot select the
+        # other model's response when it finishes first.
+        if target_side:
+            image_config["_parser_id"] = parser_id
+            image_config["_parser_target_side"] = target_side
+        file_paste_config = site_config.get("file_paste", {}) or {}
+        prompt_padding_config = site_config.get("prompt_padding", {}) or {}
+        request_blocks: set[int] = set()
+        self._emit_request_block(
+            request_blocks,
+            1,
+            "准备",
+            f"domain={domain}, preset={resolved_preset_name}, workflow={len(workflow)}",
+        )
+
+        audio_capture_preload_enabled = (
+            is_modality_enabled(modalities, "audio")
+            and get_modality_run_policy(modalities, "audio") == "always_probe"
+            and bool(image_config.get("audio_capture_enabled", True))
+            and bool(image_config.get("audio_capture_preload_enabled", True))
+        )
+        if not audio_capture_preload_enabled:
+            if getattr(session, "_audio_capture_init_script_source", None) is not None:
+                setattr(session, "_audio_capture_init_script_source", None)
+                logger.debug("页面音频捕获预注入脚本已按配置停用")
+        if audio_capture_preload_enabled and not effective_stop_checker():
+            try:
+                from app.core.extractors.media_extractor import media_extractor
+
+                init_script = media_extractor.build_page_audio_capture_init_script(image_config)
+                capture_status = media_extractor.get_page_audio_capture_status(tab)
+                current_capture_version = int(capture_status.get("version") or 0) if isinstance(capture_status, dict) else 0
+                has_current_capture = current_capture_version == int(getattr(media_extractor, "PAGE_AUDIO_CAPTURE_SCRIPT_VERSION", 0) or 0)
+                tracked_audio_nodes = 0
+                if isinstance(capture_status, dict):
+                    tracked_audio_nodes = int(capture_status.get("tracked_media_elements") or 0) + int(capture_status.get("tracked_web_audio") or 0)
+                try:
+                    if getattr(session, "_audio_capture_init_script_source", None) != init_script:
+                        tab.run_cdp(
+                            "Page.addScriptToEvaluateOnNewDocument",
+                            source=init_script,
+                            _timeout=BACKGROUND_WAKE_CDP_TIMEOUT,
+                        )
+                        setattr(session, "_audio_capture_init_script_source", init_script)
+                        logger.debug("页面音频捕获预注入脚本已注册")
+                    else:
+                        logger.debug("页面音频捕获预注入脚本已存在")
+                except Exception as cdp_exc:
+                    logger.debug(f"页面音频捕获预注入脚本注册失败（已忽略）: {cdp_exc}")
+
+                media_extractor.prepare_page_audio_capture(tab, image_config)
+                should_reload_capture = (
+                    bool(image_config.get("audio_capture_reload_before_workflow", False))
+                    and (
+                        not has_current_capture
+                        or tracked_audio_nodes <= 0
+                    )
+                )
+                if should_reload_capture:
+                    current_tab_url = ""
+                    try:
+                        current_tab_url = str(tab.url or "")
+                    except Exception:
+                        current_tab_url = ""
+                    should_reload_for_capture = (
+                        "/settings" not in current_tab_url
+                        and "chrome://" not in current_tab_url
+                        and "about:" not in current_tab_url
+                    )
+                    if not should_reload_for_capture:
+                        logger.debug(f"页面音频捕获跳过刷新预热: url={current_tab_url!r}")
+                    else:
+                        try:
+                            tab.refresh(ignore_cache=True)
+                            try:
+                                tab.wait.doc_loaded(timeout=15)
+                            except Exception:
+                                pass
+                            input_selector = selectors.get("input_box", "")
+                            if input_selector:
+                                deadline = time.time() + 20.0
+                                while time.time() < deadline and not effective_stop_checker():
+                                    try:
+                                        if tab.ele(input_selector, timeout=0.5):
+                                            break
+                                    except Exception:
+                                        pass
+                                    time.sleep(0.5)
+                            media_extractor.prepare_page_audio_capture(tab, image_config)
+                            logger.debug("页面音频捕获已刷新页面并重新初始化")
+                        except Exception as refresh_exc:
+                            logger.debug(f"页面音频捕获刷新预热失败（已忽略）: {refresh_exc}")
+                elif bool(image_config.get("audio_capture_reload_before_workflow", False)):
+                    logger.debug(
+                        "页面音频捕获跳过刷新预热：当前脚本版本已就绪且已接管音频节点 "
+                        f"(tracked_nodes={tracked_audio_nodes})"
+                    )
+            except Exception as preload_exc:
+                logger.debug(f"页面音频捕获预热失败（已忽略）: {preload_exc}")
+
+        upload_history = self._get_upload_history_images_flag(default=True)
+        logger.debug(f"图片历史上传: {upload_history}")
+        image_source_messages = (
+            self._select_image_source_messages(messages, upload_history)
+            if _include_message_images
+            else []
+        )
+
+        logger.debug(f"图片源消息数: {len(image_source_messages)}/{len(messages)}")
+        user_images = extract_images_from_messages(image_source_messages)
+        logger.info(
+            "[IMAGE_FLOW_DIAG] backend.workflow.images | "
+            f"upload_history={upload_history} "
+            f"source_messages={len(image_source_messages)}/{len(messages)} "
+            f"roles={[str(m.get('role', '')) for m in image_source_messages if isinstance(m, dict)]} "
+            f"extracted={len(user_images)} "
+            f"paths={[str(path) for path in user_images[:3]]}"
+        )
+
+        has_declared_image = False
+        try:
+            for mm in image_source_messages:
+                c = mm.get("content")
+                if isinstance(c, str):
+                    if '"type"' in c and "image_url" in c:
+                        has_declared_image = True
+                        break
+                elif isinstance(c, (list, tuple)):
+                    for it in c:
+                        if isinstance(it, dict) and it.get("type") == "image_url":
+                            has_declared_image = True
+                            break
+                    if has_declared_image:
+                        break
+        except Exception:
+            pass
+
+        if has_declared_image and not user_images:
+            logger.warning(
+                "收到图片占位符但没有实际图片数据：image_url.url 为空或无效，"
+                "已自动忽略图片并继续执行纯文本对话。"
+            )
+        
+        if _prepared_prompt is None:
+            prompt_text = (
+                history_resolution.prompt_text
+                if history_resolution is not None
+                else self._build_prompt_from_messages(messages)
+            )
+            prompt_text = self._apply_prompt_padding(prompt_text, prompt_padding_config)
+        else:
+            prompt_text = _prepared_prompt
+
+        image_source_messages = (
+            history_resolution.typed_messages
+            if (history_resolution is not None and _prepared_prompt is None and history_resolution.is_continuation)
+            else messages
+        )
+
+        arena_image_generation_active = is_arena_image_generation_request(
+            str(getattr(tab, "url", "") or ""),
+            prompt_text,
+            image_config,
+            user_images,
+            preset_name=resolved_preset_name,
+        )
+        if arena_image_generation_active:
+            # Runtime-only flags: the Arena guard needs the uploaded originals,
+            # while site configuration remains reusable by every other domain.
+            image_config["_arena_image_generation_active"] = True
+            image_config["uploaded_image_paths"] = list(user_images)
+
+        # 预先检查字数超限且为 ERROR 策略的情况，实现毫秒级拒绝
+        if file_paste_config.get("enabled", False):
+            from app.utils.file_paste import DEFAULT_TEMP_FILE_TYPE
+            threshold = file_paste_config.get("threshold", 50000)
+            if len(prompt_text) > threshold:
+                temp_file_type = str(
+                    file_paste_config.get("temp_file_type", DEFAULT_TEMP_FILE_TYPE)
+                ).strip().lower().lstrip(".")
+                if temp_file_type == "error":
+                    error_msg = file_paste_config.get("error_hint_text") or file_paste_config.get("hint_text")
+                    error_msg = str(error_msg or "").strip()
+                    if not error_msg:
+                        error_msg = f"输入文本长度 {len(prompt_text)} 字符超过限制 {threshold} 字符，已中止发送"
+                    yield self.formatter.pack_error(
+                        error_msg,
+                        code="file_paste_length_error"
+                    )
+                    yield self.formatter.pack_finish()
+                    return
+                if temp_file_type == "chunk":
+                    yield self.formatter.pack_error(
+                        "输入分块规划失败，未发送超长内容",
+                        code="input_chunking_failed",
+                    )
+                    yield self.formatter.pack_finish()
+                    return
+
+        site_catalog_fallback = site_config.get("model_catalog") if isinstance(site_config, (dict, Mapping)) else None
+        context = {
+            "prompt": prompt_text,
+            "images": user_images,
+            "model": str(requested_model or "").strip(),
+            "model_catalog": model_catalog if isinstance(model_catalog, dict) else (
+                site_catalog_fallback if isinstance(site_catalog_fallback, dict) else {}
+            ),
+        }
+        
+        extractor = config_engine.get_site_extractor(domain, preset_name=effective_preset_name)
+        site_advanced_config = config_engine.get_site_advanced_config(
+            domain,
+            preset_name=resolved_preset_name,
+        )
+        logger.debug(f"[{session.id}] 使用提取器: {extractor.get_id()} [预设: {resolved_preset_name}]")
+
+        try:
+            from app.services.request_manager import request_manager
+            request_manager.update_request_metadata(
+                str(getattr(session, "_bound_request_id", "") or ""),
+                target_domain=domain,
+                route_domain=domain,
+                preset_name=resolved_preset_name,
+                tab_index=int(getattr(session, "persistent_index", 0) or 0) or None,
+                tab_id=session.id,
+            )
+        except Exception as e:
+            logger.debug(f"[{session.id}] 更新请求监控元数据失败（忽略）: {e}")
+
+        if command_engine is not None:
+            try:
+                workflow_runtime = command_engine.begin_workflow_runtime(
+                    session,
+                    task_id=str(getattr(session, "current_task_id", "") or ""),
+                    preset_name=resolved_preset_name,
+                    priority=workflow_priority_value,
+                )
+            except Exception as e:
+                logger.debug(f"[{session.id}] 工作流运行时注册失败（忽略）: {e}")
+
+        initial_workflow_url = str(getattr(session, "last_known_url", "") or getattr(tab, "url", "") or "").strip()
+        if initial_workflow_url and "challenges.cloudflare.com" not in initial_workflow_url and "challenge-platform" not in initial_workflow_url and initial_workflow_url.startswith("http"):
+            setattr(session, "_request_occupied_url", initial_workflow_url)
+
+        def _combined_stop_checker() -> bool:
+            if effective_stop_checker():
+                return True
+            if command_engine is not None and command_engine.workflow_interrupt_requested(session):
+                setattr(session, "_workflow_stop_reason", "command_interrupt")
+                return True
+            return False
+        
+        executor = WorkflowExecutor(
+            tab=tab,
+            stealth_mode=stealth_mode,
+            should_stop_checker=_combined_stop_checker,
+            extractor=extractor,
+            image_config=image_config,
+            stream_config=stream_config,
+            file_paste_config=file_paste_config,
+            site_advanced_config=site_advanced_config,
+            selectors=selectors,
+            session=session,
+        )
+        # Establish the owner boundary before the first page action. This also
+        # clears scripts from a previous preset when the new workflow has no JS step.
+        try:
+            executor._begin_workflow_scripts()
+        except Exception as e:
+            logger.debug(f"[{session.id}] 工作流脚本边界初始化失败（忽略）: {e}")
+        
+        result_container_selector = selectors.get("result_container", "")
+        setattr(session, "_workflow_stop_reason", None)
+        if not effective_stop_checker():
+            setattr(session, "_workflow_user_stop_logged", False)
+        streamed_text_parts: List[str] = []
+        conversation_activity_marked = False
+        media_dom_baseline: Optional[Dict[str, Any]] = None
+        media_dom_baseline_captured = False
+        arena_result_baseline_captured = False
+        
+        try:
+            with executor.workflow_execution_scope():
+                step_index = 0
+                workflow_total = len(workflow)
+                while step_index < len(workflow):
+                    if arena_direct_active and step_index > 0:
+                        current_loop_url = str(getattr(tab, "url", "") or "").strip()
+                        if is_arena_unexpected_battle_url(current_loop_url):
+                            logger.warning(
+                                f"[{session.id}] [ArenaDirectGuard] 工作流执行中检测到页面意外处于/跳转至 Battle 页面: "
+                                f"current_url={current_loop_url}, recovery_url={arena_recovery_url}, "
+                                f"step={step_index + 1}/{workflow_total}"
+                            )
+                            workflow_aborted = True
+                            yield self.formatter.pack_error(
+                                "stream_terminal_error:arena_direct_unexpected_battle_redirect",
+                                code="arena_direct_unexpected_battle_redirect",
+                            )
+                            break
+
+                    step = workflow[step_index]
+                    if command_engine is not None:
+                        command_engine.update_workflow_runtime_step(session, step_index, step)
+
+                    stop_reason = str(getattr(session, "_workflow_stop_reason", "") or "").strip()
+                    if stop_reason == "command_interrupt" or (
+                        command_engine is not None and command_engine.workflow_interrupt_requested(session)
+                    ):
+                        interrupt_result = (
+                            command_engine.handle_pending_workflow_interrupts(session)
+                            if command_engine is not None
+                            else {"handled": False, "abort": False, "message": ""}
+                        )
+                        if interrupt_result.get("abort"):
+                            workflow_aborted = True
+                            workflow_abort_message = str(
+                                interrupt_result.get("message") or "工作流已被命令打断"
+                            )
+                            logger.error(
+                                f"[{session.id}] 工作流被命令打断: "
+                                f"{interrupt_result.get('abort_by') or 'unknown'}"
+                            )
+                            yield self.formatter.pack_error(
+                                workflow_abort_message,
+                                code="workflow_interrupted",
+                            )
+                            break
+                        if interrupt_result.get("handled"):
+                            logger.info(f"[{session.id}] 工作流恢复执行")
+                            try:
+                                current_action = str(
+                                    (workflow[step_index] or {}).get("action") or ""
+                                ).strip().upper()
+                                executor.rebuild_network_listener_after_external_interruption(
+                                    "workflow_interrupt_resume",
+                                    allow_dom_image_resume=current_action
+                                    in {"STREAM_WAIT", "STREAM_OUTPUT"},
+                                )
+                            except Exception:
+                                pass
+
+                            stream_index = None
+                            try:
+                                if executor.page_looks_generating(selectors.get("send_btn", "")):
+                                    stream_index = self._find_next_stream_step_index(workflow, step_index)
+                            except Exception:
+                                stream_index = None
+
+                            if stream_index is not None and stream_index != step_index:
+                                logger.info(
+                                    f"[{session.id}] 外部验证后检测到页面已在生成，"
+                                    f"跳过到监听步骤: {step_index + 1}->{stream_index + 1}"
+                                )
+                                step_index = stream_index
+                                continue
+
+                            resume_index = self._find_resume_step_after_interrupt(
+                                workflow,
+                                step_index,
+                            )
+                            if resume_index != step_index:
+                                logger.info(
+                                    f"[{session.id}] 外部验证后跳过清理/停止步骤，"
+                                    f"恢复到安全步骤: {step_index + 1}->{resume_index + 1}"
+                                )
+                                step_index = resume_index
+                                continue
+                            continue
+
+                    if effective_stop_checker():
+                        if getattr(session, "_workflow_user_stop_logged", False):
+                            break
+                        if stop_reason == "timeout":
+                            logger.warning(f"[{session.id}] 工作流因超时停止")
+                        else:
+                            logger.info(f"[{session.id}] 工作流被用户中断")
+                        setattr(session, "_workflow_user_stop_logged", True)
+                        break
+
+                    action = step.get('action', '')
+                    target_key = step.get('target', '')
+                    optional = step.get('optional', False)
+                    param_value = step.get('value')
+                    execution_policy = step.get('execution')
+                    action_upper = str(action or "").strip().upper()
+                    target_key_normalized = str(target_key or "").strip().lower()
+
+                    # [UWA-PLUGIN] step_should_skip 钩子：续聊时跳过插件声明的步骤
+                    # （如 DeepSeek 的“专家”模式切换按钮，续聊时页面不再渲染）。
+                    is_continuation = bool(history_resolution is not None and history_resolution.is_continuation)
+                    step_should_skip = bool(plugin_hooks.call(
+                        "step_should_skip",
+                        step=step,
+                        action_upper=action_upper,
+                        target_key=target_key_normalized,
+                        is_continuation=is_continuation,
+                        session=session,
+                        history_mode=history_resolution.mode if history_resolution is not None else "full",
+                        default=False,
+                    ))
+                    if skip_new_chat and (
+                        target_key_normalized in {"new_chat_btn", "new_chat", "new_conversation"}
+                        or action_upper in {"NEW_CHAT", "NEW_CONVERSATION"}
+                        or step_should_skip
+                    ):
+                        logger.debug(
+                            f"[{session.id}] 会话仍有效，跳过新建对话/续聊不适用步骤 "
+                            f"(action={action_upper or '-'}, target={target_key_normalized or '-'}, "
+                            f"step_should_skip={step_should_skip})"
+                        )
+                        step_index += 1
+                        continue
+
+                    selector = selectors.get(target_key, '')
+                    if action_upper in {"STREAM_WAIT", "STREAM_OUTPUT", "PAGE_FETCH"}:
+                        self._emit_request_block(
+                            request_blocks,
+                            3,
+                            "响应",
+                            "网络/DOM 监听",
+                        )
+                    else:
+                        self._emit_request_block(
+                            request_blocks,
+                            2,
+                            "交互",
+                            "页面动作/输入/发送",
+                        )
+
+                    step_started_at = time.perf_counter()
+                    step_no = step_index + 1
+                    step_tag = f"[STEP {step_no}]"
+                    selector_preview = self._compact_log_value(selector, 100)
+                    step_extra_parts = [
+                        f"total={workflow_total}",
+                        f"optional={bool(optional)}",
+                        f"stealth={bool(stealth_mode)}",
+                    ]
+                    if action_upper == "FILL_INPUT":
+                        step_extra_parts.append(f"prompt_len={len(str(context.get('prompt') or ''))}")
+                        step_extra_parts.append(f"images={len(context.get('images') or [])}")
+                    elif action_upper == "WAIT":
+                        step_extra_parts.append(f"wait={param_value if param_value is not None else 0.5}")
+                    elif action_upper == "JS_EXEC":
+                        step_extra_parts.append(f"value_len={len(str(param_value or ''))}")
+                    elif action_upper in {"CLICK", "COORD_CLICK", "COORD_SCROLL", "KEY_PRESS"}:
+                        step_extra_parts.append(f"value_len={len(str(param_value or ''))}")
+
+                    logger.debug(
+                        f"{step_tag} 开始: "
+                        f"action={action_upper or action or '-'}, "
+                        f"target={target_key or '-'}, selector={selector_preview}, "
+                        f"{', '.join(step_extra_parts)}"
+                    )
+
+                    # 修复：补入 SELECT_MODEL。执行器 executor_actions.py 对空 selector 有硬编码兜底，
+                    # 且编辑器测试路径无此校验，漏配会导致"测试通过、生产报 缺少配置: model_select_btn"
+                    if not selector and action not in ("WAIT", "KEY_PRESS", "COORD_CLICK", "COORD_SCROLL", "JS_EXEC", "READONLY_HINT", "PAGE_FETCH", "SELECT_MODEL"):
+                        if optional:
+                            logger.debug(
+                                f"{step_tag} 跳过: "
+                                f"action={action_upper or action or '-'}, "
+                                f"target={target_key or '-'}, reason=missing_selector_optional"
+                            )
+                            step_index += 1
+                            continue
+                        else:
+                            logger.error(
+                                f"{step_tag} 失败: "
+                                f"action={action_upper or action or '-'}, "
+                                f"target={target_key or '-'}, elapsed=0.00s, "
+                                "error=missing_selector"
+                            )
+                            yield self.formatter.pack_error(
+                                f"缺少配置: {target_key}",
+                                code="missing_selector"
+                            )
+                            break
+
+                    submits_request = (
+                        self._step_submits_conversation_request(action, target_key, param_value)
+                        or action_upper == "PAGE_FETCH"
+                    )
+                    if (
+                        submits_request
+                        and arena_image_generation_active
+                        and not arena_result_baseline_captured
+                    ):
+                        arena_result_baseline_captured = True
+                        arena_result_baseline = capture_arena_result_baseline(
+                            tab,
+                            selectors.get("result_container", ""),
+                        )
+                        if arena_result_baseline:
+                            image_config["arena_result_baseline_token"] = str(
+                                arena_result_baseline.get("token") or ""
+                            )
+                            image_config["arena_result_baseline_property"] = str(
+                                arena_result_baseline.get("property") or ""
+                            )
+                    if (
+                        submits_request
+                        and image_extraction_enabled
+                        and not media_dom_baseline_captured
+                    ):
+                        media_dom_baseline_captured = True
+                        image_config.pop("request_baseline_references", None)
+                        media_dom_baseline = self._capture_media_dom_baseline(tab, image_config)
+                        if media_dom_baseline:
+                            image_config["request_baseline_exclude_existing_nodes"] = (
+                                self._should_exclude_preexisting_media_nodes(media_dom_baseline)
+                            )
+                            image_config["request_baseline_token"] = str(
+                                media_dom_baseline.get("token") or ""
+                            )
+                            image_config["request_baseline_property"] = str(
+                                media_dom_baseline.get("property") or ""
+                            )
+                            image_config["request_baseline_references"] = list(
+                                media_dom_baseline.get("references") or []
+                            )
+
+                    try:
+                        chunk_count = 0
+                        delta_chars = 0
+                        for chunk in executor.execute_step(
+                            action=action,
+                            selector=selector,
+                            target_key=target_key,
+                            value=param_value,
+                            optional=optional,
+                            context=context,
+                            execution=execution_policy,
+                        ):
+                            chunk_count += 1
+                            delta_content = self._extract_stream_delta_content(chunk)
+                            if delta_content:
+                                delta_chars += len(delta_content)
+                                streamed_text_parts.append(delta_content)
+                            yield chunk
+
+                        step_elapsed = time.perf_counter() - step_started_at
+                        logger.debug(
+                            f"{step_tag} 完成: "
+                            f"action={action_upper or action or '-'}, "
+                            f"target={target_key or '-'}, elapsed={step_elapsed:.2f}s, "
+                            f"chunks={chunk_count}, stream_chars={delta_chars}"
+                        )
+
+                        retry_current_stream_step = bool(
+                            getattr(session, "_workflow_retry_current_stream_step", False)
+                        )
+                        if retry_current_stream_step:
+                            setattr(session, "_workflow_retry_current_stream_step", False)
+                            if action_upper in {"STREAM_WAIT", "STREAM_OUTPUT"}:
+                                setattr(session, "_workflow_stop_reason", "command_interrupt")
+                                logger.info(
+                                    f"[{session.id}] 当前监听步骤被验证码/限流打断，"
+                                    f"保持在 {step_tag} 等待命令恢复"
+                                )
+                                continue
+
+                        if command_engine is not None and command_engine.workflow_interrupt_requested(session):
+                            setattr(session, "_workflow_stop_reason", "command_interrupt")
+                            if action_upper in {"STREAM_WAIT", "STREAM_OUTPUT"}:
+                                logger.info(
+                                    f"[{session.id}] 监听步骤收到命令插队请求，"
+                                    f"保持在 {step_tag} 等待恢复"
+                                )
+                            else:
+                                step_index += 1
+                            continue
+
+                        if effective_stop_checker():
+                            logger.info(f"[{session.id}] 步骤完成后检测到取消，提前结束工作流")
+                            if command_engine is not None and command_engine.workflow_interrupt_requested(session):
+                                setattr(session, "_workflow_stop_reason", "command_interrupt")
+                                if action_upper not in {"STREAM_WAIT", "STREAM_OUTPUT"}:
+                                    step_index += 1
+                                continue
+                            break
+
+                        page_fetch_sent = False
+                        if action in ("STREAM_WAIT", "STREAM_OUTPUT"):
+                            result_container_selector = selector
+                        if (
+                            action == "PAGE_FETCH"
+                            and hasattr(executor, "consume_last_request_transport_sent")
+                        ):
+                            page_fetch_sent = bool(executor.consume_last_request_transport_sent())
+                            if page_fetch_sent:
+                                step_index = executor._consume_request_transport_followup_steps(
+                                    workflow,
+                                    step_index,
+                                )
+                        if (
+                            not conversation_activity_marked
+                            and (
+                                self._step_submits_conversation_request(action, target_key, param_value)
+                                or page_fetch_sent
+                                or action_upper in {"STREAM_WAIT", "STREAM_OUTPUT"}
+                            )
+                        ):
+                            session.mark_conversation_activity(domain, resolved_preset_name)
+                            conversation_activity_marked = True
+                        step_index += 1
+
+                    except ArenaImageGenerationError as e:
+                        step_elapsed = time.perf_counter() - step_started_at
+                        workflow_aborted = True
+                        logger.warning(
+                            f"{step_tag} Arena 图片生成终止: "
+                            f"action={action_upper or action or '-'}, "
+                            f"elapsed={step_elapsed:.2f}s, code={e.code}"
+                        )
+                        yield self.formatter.pack_error(
+                            e.message,
+                            error_type="invalid_request_error",
+                            code=e.code,
+                            status_code=e.status_code,
+                            retryable=e.retryable,
+                        )
+                        break
+                    except (ElementNotFoundError, WorkflowError) as e:
+                        step_elapsed = time.perf_counter() - step_started_at
+                        logger.warning(
+                            f"{step_tag} 中断: "
+                            f"action={action_upper or action or '-'}, "
+                            f"target={target_key or '-'}, elapsed={step_elapsed:.2f}s, "
+                            f"error={str(e).strip() or type(e).__name__}"
+                        )
+                        if arena_direct_active:
+                            current_err_url = str(getattr(tab, "url", "") or "").strip()
+                            if is_arena_unexpected_battle_url(current_err_url):
+                                logger.warning(
+                                    f"[{session.id}] [ArenaDirectGuard] 步骤失败时检测到页面处于意外 Battle 页面: "
+                                    f"current_url={current_err_url}, recovery_url={arena_recovery_url}"
+                                )
+                                workflow_aborted = True
+                                yield self.formatter.pack_error(
+                                    "stream_terminal_error:arena_direct_unexpected_battle_redirect",
+                                    code="arena_direct_unexpected_battle_redirect",
+                                )
+                                break
+
+                        if isinstance(e, WorkflowError):
+                            err_str = str(e)
+                            if err_str in {
+                                "new_chat_transition_timeout",
+                                "send_unconfirmed",
+                                "arena_direct_unexpected_battle_redirect",
+                                "arena_send_no_target",
+                            }:
+                                error_code = err_str
+                                workflow_aborted = True
+                                yield self.formatter.pack_error(
+                                    f"stream_terminal_error:{error_code}",
+                                    code=error_code,
+                                )
+                            elif err_str.startswith("stream_terminal_error:"):
+                                workflow_aborted = True
+                                if chunk_count == 0:
+                                    yield self.formatter.pack_error(err_str)
+                        break
+                    except Exception as e:
+                        step_elapsed = time.perf_counter() - step_started_at
+                        if effective_stop_checker():
+                            logger.info(f"[{session.id}] 取消后忽略步骤异常: {e}")
+                            break
+                        logger.error(
+                            f"{step_tag} 失败: "
+                            f"action={action_upper or action or '-'}, "
+                            f"target={target_key or '-'}, elapsed={step_elapsed:.2f}s, "
+                            f"optional={bool(optional)}, error={str(e).strip() or type(e).__name__}"
+                        )
+                        if arena_direct_active:
+                            current_err_url = str(getattr(tab, "url", "") or "").strip()
+                            if is_arena_unexpected_battle_url(current_err_url):
+                                logger.warning(
+                                    f"[{session.id}] [ArenaDirectGuard] 通用异常时检测到页面处于意外 Battle 页面: "
+                                    f"current_url={current_err_url}, recovery_url={arena_recovery_url}"
+                                )
+                                workflow_aborted = True
+                                yield self.formatter.pack_error(
+                                    "stream_terminal_error:arena_direct_unexpected_battle_redirect",
+                                    code="arena_direct_unexpected_battle_redirect",
+                                )
+                                break
+                        if not optional:
+                            yield self.formatter.pack_error(f"执行中断: {str(e)}")
+                            break
+
+            if (
+                not workflow_aborted
+                and command_engine is not None
+                and command_engine.workflow_interrupt_requested(session)
+            ):
+                interrupt_result = command_engine.handle_pending_workflow_interrupts(session)
+                if interrupt_result.get("abort"):
+                    workflow_aborted = True
+                    workflow_abort_message = str(
+                        interrupt_result.get("message") or "工作流已被命令打断"
+                    )
+                    logger.error(
+                        f"[{session.id}] 流程结束时工作流被命令打断: "
+                        f"{interrupt_result.get('abort_by') or 'unknown'}"
+                    )
+                    yield self.formatter.pack_error(
+                        workflow_abort_message,
+                        code="workflow_interrupted",
+                    )
+                elif interrupt_result.get("handled"):
+                    logger.info(f"[{session.id}] 工作流收尾阶段已执行挂起命令")
+
+            # [UWA-PLUGIN] on_workflow_end 钩子：记录会话连续性指纹（无插件则无操作）
+            if history_resolution is not None:
+                plugin_hooks.call(
+                    "on_workflow_end",
+                    session=session,
+                    tab=tab,
+                    resolution=history_resolution,
+                    messages=messages,
+                    prompt_text=prompt_text,
+                    domain=domain,
+                    preset_name=resolved_preset_name,
+                    aborted=workflow_aborted,
+                    stop_requested=bool(effective_stop_checker()),
+                    default=None,
+                )
+
+            # 多模态提取
+            self._emit_request_block(
+                request_blocks,
+                4,
+                "收尾",
+                f"image_enabled={image_extraction_enabled}, stop={effective_stop_checker()}",
+            )
+            logger.debug(f"[WORKFLOW] 主循环结束: image_enabled={image_extraction_enabled}, should_stop={effective_stop_checker()}")
+            if (
+                allow_media_postprocess
+                and image_extraction_enabled
+                and not effective_stop_checker()
+                and not workflow_aborted
+            ):
+                response_text_hint = "".join(streamed_text_parts)
+                request_text_hint = str(context.get("prompt") or "")
+                media_generation_state = getattr(executor, "_last_stream_media_state", None)
+                stream_media_items = getattr(executor, "_last_stream_media_items", None)
+                dom_stream_media_items = []
+                dom_image_detected = False
+                dom_final_image_urls = []
+                try:
+                    stream_monitor = getattr(executor, "_stream_monitor", None)
+                    if stream_monitor is not None:
+                        dom_stream_media_items = stream_monitor.get_final_images() or []
+                        dom_image_detected = bool(stream_monitor.has_detected_images())
+                        dom_final_image_urls = stream_monitor.get_final_image_urls() or []
+                except Exception:
+                    dom_stream_media_items = []
+                    dom_image_detected = False
+                    dom_final_image_urls = []
+
+                should_run_media_postprocess, media_postprocess_diag = self._should_run_media_postprocess(
+                    image_config,
+                    request_text_hint=request_text_hint,
+                    response_text_hint=response_text_hint,
+                    media_generation_state=media_generation_state,
+                    stream_media_items=stream_media_items,
+                    dom_stream_media_items=dom_stream_media_items,
+                    dom_image_detected=dom_image_detected,
+                    dom_final_image_urls=dom_final_image_urls,
+                )
+                if arena_image_generation_active and not should_run_media_postprocess:
+                    # The Arena DOM gate has already confirmed a new result;
+                    # extraction is mandatory so the uploaded-image check runs.
+                    logger.debug("[Arena Image] 强制执行媒体提取和上传图比对")
+                    should_run_media_postprocess = True
+                if not should_run_media_postprocess:
+                    logger.debug(
+                        "[WORKFLOW] 跳过多模态提取分支："
+                        f"{json.dumps(media_postprocess_diag, ensure_ascii=False)}"
+                    )
+                else:
+                    logger.debug(
+                        "[WORKFLOW] 进入多模态提取分支："
+                        f"{json.dumps(media_postprocess_diag, ensure_ascii=False)}"
+                    )
+                try:
+                    if arena_image_generation_active:
+                        arena_observation = ArenaImageGenerationGuard(
+                            tab,
+                            result_selector=result_container_selector,
+                            baseline_token=image_config.get("arena_result_baseline_token", ""),
+                            baseline_property=image_config.get("arena_result_baseline_property", ""),
+                        ).observe(False)
+                        if (
+                            arena_observation.is_complete
+                            and arena_observation.terminal_error is not None
+                        ):
+                            raise arena_observation.terminal_error
+                    media_items = []
+                    if should_run_media_postprocess:
+                        if dom_stream_media_items:
+                            media_items = [
+                                dict(item)
+                                for item in dom_stream_media_items
+                                if isinstance(item, dict)
+                            ]
+                            media_items = self._merge_dom_and_stream_media_items(
+                                media_items,
+                                stream_media_items or [],
+                                image_config,
+                            )
+                            image_items = [item for item in media_items if item.get("media_type") == "image"]
+                            if image_items:
+                                localized_images = self._localize_images_with_background_cache(
+                                    image_items,
+                                    wait_seconds=float(
+                                        image_config.get("background_download_wait_seconds")
+                                        or image_config.get("download_wait_seconds")
+                                        or 1.0
+                                    ),
+                                )
+                                other_items = [item for item in media_items if item.get("media_type") != "image"]
+                                media_items = localized_images + other_items
+                            logger.debug(
+                                f"[WORKFLOW] 复用 DOM 监听已提取的媒体结果: {len(media_items)} 项"
+                            )
+                        else:
+                            direct_modalities = (
+                                media_postprocess_diag.get("direct_postprocess_modalities")
+                                if media_postprocess_diag.get("decision") == "direct_postprocess_modalities"
+                                else None
+                            )
+                            media_items = self._extract_media_after_stream(
+                                tab=tab,
+                                extractor=extractor,
+                                image_config=image_config,
+                                result_selector=result_container_selector,
+                                message_wrapper_selector=selectors.get("message_wrapper", ""),
+                                completion_id=executor._completion_id,
+                                stop_checker=_combined_stop_checker,
+                                response_text_hint=response_text_hint,
+                                request_text_hint=request_text_hint,
+                                media_generation_state=media_generation_state,
+                                stream_media_items=stream_media_items,
+                                direct_modalities=direct_modalities,
+                                media_dom_baseline=media_dom_baseline,
+                            )
+
+                            if not media_items and stream_media_items:
+                                valid_stream_images = [
+                                    item
+                                    for item in stream_media_items
+                                    if isinstance(item, dict)
+                                    and str(item.get("media_type") or "image").strip().lower() == "image"
+                                    and (item.get("url") or item.get("data_uri"))
+                                ]
+                                if valid_stream_images:
+                                    logger.info(
+                                        f"[{session.id}] DOM 媒体提取为空，安全激活网络流图片候选 ({len(valid_stream_images)} 张) 进行本地化"
+                                    )
+                                    media_items = self._merge_dom_and_stream_media_items(
+                                        [],
+                                        valid_stream_images,
+                                        image_config,
+                                    )
+                    
+                    if media_items:
+                        download_urls = image_config.get("download_urls", False)
+                        if download_urls:
+                            image_items = [item for item in media_items if item.get("media_type") == "image"]
+                            other_items = [item for item in media_items if item.get("media_type") != "image"]
+                            image_items = self._download_url_images(image_items, tab=tab)
+                            media_items = image_items + other_items
+
+                        media_items = self._persist_remote_media_urls_to_local(
+                            media_items,
+                            tab=tab,
+                            max_size_mb=int(image_config.get("max_size_mb", 10) or 10),
+                            image_config=image_config,
+                        )
+
+                    if media_items and user_images:
+                        media_items = filter_reference_images(
+                            media_items,
+                            user_images,
+                            tab=tab,
+                            logger_context=f"{session.id}:workflow",
+                        )
+
+                    if arena_image_generation_active:
+                        generated_images = [
+                            item
+                            for item in media_items
+                            if isinstance(item, dict)
+                            and str(item.get("media_type") or item.get("type") or "image").lower()
+                            in {"image", "image_url", "input_image"}
+                        ]
+                        if not generated_images:
+                            raise ArenaImageGenerationError(
+                                "arena_image_generation_failed",
+                                "Arena 图片生成失败：未能提取新的生成图片",
+                            )
+                        validate_generated_images(
+                            user_images,
+                            generated_images,
+                            tab=tab,
+                        )
+
+                    if media_items:
+                        logger.debug(f"[PROBE] 即将发送多模态资源（Markdown），数量={len(media_items)}")
+
+                        try:
+                            response_media = self._prepare_media_items_for_response(media_items)
+                            md = self._build_media_markdown_block(media_items)
+                            if md:
+                                yield self.formatter.pack_chunk(
+                                    md,
+                                    completion_id=executor._completion_id,
+                                    media=response_media,
+                                )
+                                logger.debug(f"[MD_MEDIA] 已发送结构化多模态资源，共 {len(media_items)} 项")
+                            else:
+                                yield self.formatter.pack_chunk(
+                                    "",
+                                    completion_id=executor._completion_id,
+                                    media=response_media,
+                                )
+                                logger.debug(f"[MD_MEDIA] 已发送纯结构化多模态资源，共 {len(media_items)} 项")
+                        except Exception as e:
+                            logger.warning(f"[MD_MEDIA] 发送 Markdown 媒体链接失败: {e}")
+                except ArenaImageGenerationError as e:
+                    workflow_aborted = True
+                    logger.warning(
+                        f"[{session.id}] Arena 图片媒体校验失败: code={e.code}, error={e.message}"
+                    )
+                    yield self.formatter.pack_error(
+                        e.message,
+                        error_type="invalid_request_error",
+                        code=e.code,
+                        status_code=e.status_code,
+                        retryable=e.retryable,
+                    )
+                except Exception as e:
+                    logger.warning(f"[{session.id}] 多模态提取失败: {e}")
+        
+        except Exception as e:
+            if not (effective_stop_checker()):
+                logger.error(f"[{session.id}] 工作流执行异常: {e}", exc_info=True)
+                yield self.formatter.pack_error(f"系统错误: {str(e)}")
+            yield self.formatter.pack_finish()
+        finally:
+            # [UWA-PLUGIN] on_workflow_finally 钩子：插件决定是否清空会话记忆
+            if plugin_hooks.has("on_workflow_finally"):
+                _command_interrupted = bool(command_engine is not None and command_engine.workflow_interrupt_requested(session))
+                plugin_hooks.call(
+                    "on_workflow_finally",
+                    session=session,
+                    aborted=workflow_aborted,
+                    stop_requested=bool(effective_stop_checker()),
+                    command_interrupted=_command_interrupted,
+                )
+            if executor is not None:
+                try:
+                    executor.cleanup_after_workflow()
+                except Exception as e:
+                    logger.debug(f"[{session.id}] 工作流执行器清理失败（忽略）: {e}")
+            if command_engine is not None and workflow_runtime is not None:
+                try:
+                    stop_reason = str(getattr(session, "_workflow_stop_reason", "") or "").strip()
+                    externally_stopped = bool(effective_stop_checker()) and stop_reason != "command_interrupt"
+                    command_engine.finish_workflow_runtime(
+                        session,
+                        aborted=workflow_aborted or bool(workflow_abort_message) or externally_stopped,
+                    )
+                except Exception as e:
+                    logger.debug(f"[{session.id}] 工作流运行时清理失败（忽略）: {e}")
+            yield self.formatter.pack_finish()
+
+    def _execute_workflow_non_stream(
+        self, 
+        session: TabSession,
+        messages: List[Dict],
+        preset_name: Optional[str] = None,
+        stop_checker: Optional[Callable[[], bool]] = None,
+        workflow_priority: Optional[int] = None,
+        allow_media_postprocess: bool = True,
+        requested_model: Optional[str] = None,
+        history_mode: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """非流式工作流执行"""
+        collected_content = []
+        collected_media = []
+        error_data = None
+        
+        stream = self._execute_workflow_stream(
+            session,
+            messages,
+            preset_name=preset_name,
+            stop_checker=stop_checker,
+            workflow_priority=workflow_priority,
+            allow_media_postprocess=allow_media_postprocess,
+            requested_model=requested_model,
+            history_mode=history_mode,
+        )
+
+        try:
+            for chunk in stream:
+                if chunk.startswith("data: [DONE]"):
+                    continue
+                
+                if chunk.startswith("data: "):
+                    try:
+                        data_str = chunk[6:].strip()
+                        if not data_str:
+                            continue
+                        data = json.loads(data_str)
+                        
+                        if "error" in data:
+                            error_data = data
+                            break
+
+                        media_items = data.get("media")
+                        if isinstance(media_items, list):
+                            collected_media.extend(media_items)
+                        
+                        if "choices" in data and data["choices"]:
+                            delta = data["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                collected_content.append(content)
+                    except json.JSONDecodeError:
+                        continue
+        except GeneratorExit:
+            with contextlib.suppress(Exception):
+                stream.close()
+            raise
+        finally:
+            with contextlib.suppress(Exception):
+                stream.close()
+        
+        if error_data:
+            yield json.dumps(error_data, ensure_ascii=False)
+        else:
+            full_content = "".join(collected_content)
+            if allow_media_postprocess and not collected_media and full_content.strip():
+                extra_media_items = self._retry_pending_media_from_response_text(
+                    session,
+                    full_content,
+                    preset_name=preset_name,
+                    stop_checker=stop_checker,
+                )
+                if extra_media_items:
+                    collected_media.extend(extra_media_items)
+            response = self.formatter.pack_non_stream(
+                full_content,
+                media=self._dedupe_media_items(collected_media),
+            )
+            yield json.dumps(response, ensure_ascii=False)

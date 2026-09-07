@@ -1,0 +1,861 @@
+"""
+main.py - FastAPI 应用入口
+"""
+import asyncio
+import logging
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+import os
+import logging
+import socket
+import mimetypes
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from typing import Any, Dict, Optional
+from urllib.request import urlopen
+from pathlib import Path
+from contextlib import asynccontextmanager
+from app import __version__ as APP_VERSION
+from app.core import get_browser
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, FileResponse, Response
+# ================= 导入配置 =================
+
+from app.core.config import AppConfig, get_logger, get_shared_file_log_handler
+from app.services.restart_guard import RestartGuard
+
+
+# ================= 日志配置 =================
+
+# 保留 basicConfig 用于 uvicorn 等第三方库
+logging.basicConfig(
+    level=getattr(logging, AppConfig.get_log_level()),
+    format='%(message)s',
+    datefmt='%H:%M:%S'
+)
+
+_root_logger = logging.getLogger()
+_root_file_handler = get_shared_file_log_handler()
+if _root_file_handler is not None and all(
+    handler is not _root_file_handler for handler in _root_logger.handlers
+):
+    _root_logger.addHandler(_root_file_handler)
+# [UWA-PLUGIN] 插件系统引导：无插件时零副作用；插件故障不影响主程序
+try:
+    from plugin_host import boot
+    boot()
+except Exception as _plugin_boot_error:  # pragma: no cover
+    print(f"[plugin_host] 插件加载失败，已忽略: {_plugin_boot_error}")
+
+
+# 使用统一的 SecureLogger
+logger = get_logger("MAIN")
+logger.debug(f"[startup] Python executable: {sys.executable}")
+
+
+_STARTUP_EMPTY_URLS = ("", "about:blank", "chrome://newtab/", "chrome://new-tab-page/")
+restart_guard: Optional[RestartGuard] = None
+
+
+def _get_scheduled_restart_active_work() -> int:
+    """Count workflow work separately from ordinary HTTP requests."""
+    try:
+        from app.services.request_manager import request_manager
+
+        status = request_manager.get_status() or {}
+        counts = status.get("status_counts") or {}
+        return int(status.get("running_count", 0) or 0) + int(counts.get("queued", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _exit_for_scheduled_restart() -> None:
+    logger.warning("定时守护已排空工作流，服务将重启（浏览器和标签页保持不变）")
+    os._exit(3)
+
+def _setup_windows_event_loop_policy():
+    """
+    在 Windows 上优先使用 SelectorEventLoop，规避 Proactor 在连接断开时
+    偶发抛出的 _ProactorBasePipeTransport/_call_connection_lost 噪音栈。
+    """
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception as e:
+        logger.debug(f"设置 WindowsSelectorEventLoopPolicy 失败（忽略）: {e}")
+
+
+def _install_asyncio_exception_filter():
+    """过滤已知且无害的 Windows 连接断开噪音异常。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except Exception:
+        return
+
+    default_handler = loop.get_exception_handler()
+
+    def _handler(l, context):
+        exc = context.get("exception")
+        message = str(context.get("message", "") or "")
+        callback = str(context.get("handle", "") or "")
+        is_known_reset = isinstance(exc, ConnectionResetError)
+        is_proactor_noise = "_ProactorBasePipeTransport._call_connection_lost" in callback or "proactor_events" in message
+
+        if is_known_reset and is_proactor_noise:
+            logger.debug(f"[asyncio] 忽略已知连接断开噪音: {exc}")
+            return
+        if is_known_reset and isinstance(exc, OSError) and getattr(exc, "errno", None) in (10054, 10053):
+            logger.debug(f"[asyncio] 忽略连接重置噪音: {exc}")
+            return
+
+        if default_handler is not None:
+            default_handler(l, context)
+        else:
+            l.default_exception_handler(context)
+
+    loop.set_exception_handler(_handler)
+
+
+_setup_windows_event_loop_policy()
+
+
+# ================= Lifespan =================
+
+def _open_startup_page_non_blocking(page_url: str, page_name: str, initial_delay_sec: float = 1.2):
+    """Use the system browser for a local startup page, not the controlled browser."""
+    def _worker():
+        try:
+            time.sleep(max(0.0, float(initial_delay_sec)))
+
+            # 等待本地 HTTP 服务可达，避免 lifespan 内部自访问卡住。
+            if not _wait_for_local_page(page_url):
+                logger.warning(f"[startup] {page_name}未就绪，跳过自动打开: {page_url}")
+                return
+
+            webbrowser.open_new_tab(page_url)
+            logger.info(f"[startup] {page_name}已在系统浏览器打开: {page_url}")
+        except Exception as e:
+            logger.warning(f"[startup] 打开{page_name}失败: {e}")
+
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name="open-startup-page-non-blocking",
+    ).start()
+
+
+def _wait_for_local_page(page_url: str, attempts: int = 12, interval_sec: float = 0.5) -> bool:
+    for _ in range(max(1, int(attempts))):
+        try:
+            with urlopen(page_url, timeout=1.2) as resp:
+                status_code = int(getattr(resp, "status", 200) or 200)
+                if 200 <= status_code < 500:
+                    return True
+        except Exception:
+            time.sleep(max(0.0, float(interval_sec)))
+    return False
+
+
+def _resolve_local_startup_host() -> str:
+    host = str(AppConfig.get_host() or "").strip()
+    if host in ("", "0.0.0.0", "::", "[::]", "::0"):
+        return "127.0.0.1"
+    return host
+
+
+def _get_local_startup_base_url() -> str:
+    return f"http://{_resolve_local_startup_host()}:{AppConfig.get_port()}"
+
+
+def _count_existing_remote_pages(browser) -> int:
+    """只统计真实远程网页，排除空白页、本地页、扩展页等内部标签。"""
+    from app.utils.site_url import extract_remote_site_domain
+
+    count = 0
+    try:
+        tabs = browser.get_tabs() or []
+    except Exception as e:
+        logger.debug(f"读取浏览器标签页失败: {e}")
+        return 0
+
+    for tab in tabs:
+        try:
+            url = str(getattr(tab, "url", "") or "").strip()
+        except Exception:
+            url = ""
+
+        if not url or url in _STARTUP_EMPTY_URLS:
+            continue
+
+        try:
+            if extract_remote_site_domain(url):
+                count += 1
+        except Exception:
+            continue
+
+    return count
+
+
+def _get_tab_url(tab) -> str:
+    try:
+        return str(getattr(tab, "url", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _find_startup_blank_tab_id(browser) -> str:
+    """查找可复用的启动空白页，忽略内部 target 与异常 target。"""
+    try:
+        for raw_tab_id in browser.get_tab_ids() or []:
+            tab_id = str(raw_tab_id or "").strip()
+            if not tab_id:
+                continue
+            try:
+                tab = browser.get_tab(tab_id)
+            except Exception:
+                continue
+            if _get_tab_url(tab) in _STARTUP_EMPTY_URLS:
+                return tab_id
+    except Exception as e:
+        logger.debug(f"扫描启动空白标签页失败: {e}")
+    return ""
+
+
+def _should_open_startup_pages(browser) -> bool:
+    try:
+        return _count_existing_remote_pages(browser) == 0
+    except Exception as e:
+        logger.debug(f"检查标签页状态失败: {e}")
+    return False
+
+
+def _capture_startup_blank_tab_id(browser) -> str:
+    """
+    在启动瞬间捕获可用于引导页的初始空白标签页。
+
+    目的：
+    - 避免延迟线程在 0.8s 后重新检查时，被用户刚刚新开的工作标签页“抢跑”
+    - 只要最初那张 blank 页还在，就仍然把引导页打开到那张页里
+    """
+    try:
+        return _find_startup_blank_tab_id(browser)
+    except Exception as e:
+        logger.debug(f"捕获启动空白标签页失败: {e}")
+        return ""
+
+
+def _open_controlled_browser_page_non_blocking(
+    browser,
+    page_url: str,
+    page_name: str,
+    initial_delay_sec: float = 1.0,
+    startup_blank_tab_id: str = "",
+):
+    """Navigate the controlled browser only if the captured startup blank page is still available."""
+
+    def _worker():
+        try:
+            time.sleep(max(0.0, float(initial_delay_sec)))
+
+            if not _wait_for_local_page(page_url):
+                logger.warning(f"[startup] {page_name}未就绪，跳过自动打开: {page_url}")
+                return
+
+            target_tab = None
+            startup_tab_id = str(startup_blank_tab_id or "").strip()
+
+            if startup_tab_id:
+                try:
+                    target_tab = browser.get_tab(startup_tab_id)
+                except Exception:
+                    logger.info(f"[startup] 启动时的空白页已不存在，跳过打开{page_name}")
+                    return
+
+                current_url = ""
+                try:
+                    current_url = str(getattr(target_tab, "url", "") or "")
+                except Exception:
+                    current_url = ""
+                if current_url not in _STARTUP_EMPTY_URLS:
+                    logger.info(f"[startup] 启动时的空白页已被使用，跳过打开{page_name}")
+                    return
+            else:
+                if not _should_open_startup_pages(browser):
+                    logger.info(f"[startup] 受控浏览器已离开空白页，跳过打开{page_name}")
+                    return
+
+                fallback_blank_tab_id = _find_startup_blank_tab_id(browser)
+                if fallback_blank_tab_id:
+                    try:
+                        target_tab = browser.get_tab(fallback_blank_tab_id)
+                    except Exception:
+                        target_tab = None
+
+                if target_tab is None:
+                    try:
+                        target_tab = browser.get_browser_handle().new_tab(
+                            url=page_url,
+                            background=False,
+                            new_window=True,
+                        )
+                        logger.info(f"[startup] {page_name}已在受控浏览器新标签页打开: {page_url}")
+                        return
+                    except Exception:
+                        target_tab = None
+
+                try:
+                    target_tab = target_tab or browser.get_latest_tab()
+                except Exception:
+                    target_tab = target_tab or None
+                if target_tab is None:
+                    return
+
+            target_tab.get(page_url)
+            logger.info(f"[startup] {page_name}已在受控浏览器打开: {page_url}")
+        except Exception as e:
+            logger.warning(f"[startup] 打开{page_name}失败: {e}")
+
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name="open-controlled-browser-page-non-blocking",
+    ).start()
+
+
+def _build_controlled_browser_guide_data() -> Dict[str, Any]:
+    from app.services.config_engine import config_engine
+
+    all_sites = config_engine.list_site_catalog()
+    local_patterns = ("127.0.0.1", "localhost", "0.0.0.0", "::1")
+
+    sites = []
+    for site in all_sites:
+        normalized = str((site or {}).get("domain") or "").strip()
+        lowered = normalized.lower()
+        if not normalized or normalized.startswith("_"):
+            continue
+        if any(pattern in lowered for pattern in local_patterns):
+            continue
+        startup_url = str((site or {}).get("url") or "").strip()
+        if not startup_url:
+            startup_url = f"https://{normalized}"
+        sites.append({
+            "domain": normalized,
+            "name": str((site or {}).get("display_name") or normalized).strip() or normalized,
+            "id": str((site or {}).get("card_id") or "").strip(),
+            "url": startup_url,
+        })
+
+    base_url = _get_local_startup_base_url()
+
+    return {
+        "dashboard_url": f"{base_url}/",
+        "guide_url": f"{base_url}/static/controlled-browser-guide.html",
+        "sites": sites,
+    }
+def _resolve_dashboard_path():
+    configured = (AppConfig.get_dashboard_file() or "").strip()
+    candidates = []
+
+    if configured:
+        configured_path = Path(configured)
+        if configured_path.is_absolute():
+            candidates.append(configured_path)
+        else:
+            candidates.append(configured_path)
+            candidates.append(Path("static") / configured_path)
+
+    candidates.append(Path("static/index.html"))
+
+    seen = set()
+    for candidate in candidates:
+        normalized = str(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    return None
+
+
+def _dashboard_info_response():
+    return JSONResponse({
+        "service": "Universal Web-to-API",
+        "version": APP_VERSION,
+        "dashboard": "disabled",
+        "docs": "/docs"
+    })
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    global restart_guard
+    _install_asyncio_exception_filter()
+    logger.info("=" * 60)
+    logger.info("Universal Web-to-API 服务启动中...")       
+    # 启动时清理临时文件目录
+    try:
+        from app.utils.file_paste import cleanup_temp_dir
+        cleanup_temp_dir()
+    except Exception as e:
+        logger.debug(f"临时目录清理跳过: {e}")
+    logger.info(f"监听地址: http://{AppConfig.get_host()}:{AppConfig.get_port()}")
+    logger.info(f"调试模式: {AppConfig.is_debug()}")
+    logger.info(f"浏览器端口: {AppConfig.get_browser_port()}")
+    logger.info("=" * 60)
+
+    try:
+        from app.api.system import schedule_startup_update_check
+        schedule_startup_update_check()
+        logger.info("[startup] 已启动一次性版本检查")
+    except Exception as e:
+        logger.debug(f"[startup] 版本检查启动失败: {e}")
+
+    # main.py 中 lifespan 函数的浏览器检查部分
+
+    try:
+        
+        browser = get_browser(auto_connect=False)
+        health = await asyncio.to_thread(browser.health_check)
+    
+        if health["connected"]:
+            startup_blank_tab_id = _capture_startup_blank_tab_id(browser)
+            if _should_open_startup_pages(browser):
+                try:
+                    base_url = _get_local_startup_base_url()
+                    tutorial_url = f"{base_url}/static/tutorial/index.html"
+                    guide_url = f"{base_url}/static/controlled-browser-guide.html"
+                    logger.info(f"[startup] 首次启动，使用系统浏览器打开教程页: {tutorial_url}")
+                    _open_startup_page_non_blocking(
+                        tutorial_url,
+                        page_name="教程页",
+                        initial_delay_sec=1.2,
+                    )
+                    logger.info(f"[startup] 首次启动，准备在受控浏览器打开引导页: {guide_url}")
+                    _open_controlled_browser_page_non_blocking(
+                        browser,
+                        guide_url,
+                        page_name="受控浏览器引导页",
+                        initial_delay_sec=0.8,
+                        startup_blank_tab_id=startup_blank_tab_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ 无法打开教程页: {e}")
+            else:
+                # 显示已连接状态
+                try:
+                    existing_tab_count = _count_existing_remote_pages(browser)
+                except Exception:
+                    existing_tab_count = "?"
+                logger.info(f"✅ 浏览器已连接 (检测到 {existing_tab_count} 个现有网页，跳过教程)")
+        else:
+            logger.warning(f"⚠️ 浏览器未连接: {health.get('error', '未知')}")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ 浏览器检查跳过: {e}")
+
+    # 显式预热命令调度器，避免依赖控制面板接口后才初始化。
+    try:
+        from app.services.command_engine import command_engine
+        command_engine.ensure_scheduler_running()
+        logger.info(
+            f"[startup] 命令调度器: "
+            f"{'running' if command_engine.is_scheduler_running() else 'stopped'}"
+        )
+    except Exception as e:
+        logger.warning(f"[startup] 命令调度器初始化失败: {e}")
+
+    restart_guard = RestartGuard(
+        enabled=AppConfig.is_scheduled_restart_enabled(),
+        interval_seconds=AppConfig.get_scheduled_restart_interval_seconds(),
+        drain_timeout_seconds=AppConfig.get_scheduled_restart_drain_timeout_seconds(),
+        activity_probe=_get_scheduled_restart_active_work,
+        restart_callback=_exit_for_scheduled_restart,
+    )
+    await restart_guard.start()
+    if restart_guard.is_enabled:
+        logger.info(
+            f"[restart-guard] 已启用：每 {AppConfig.get_scheduled_restart_interval_seconds()}s 检查，"
+            f"排空上限 {AppConfig.get_scheduled_restart_drain_timeout_seconds()}s"
+        )
+
+    logger.info("")
+    logger.info("🚀 服务已就绪！")
+    if AppConfig.is_dashboard_enabled():
+        logger.info(f"   Dashboard: http://{AppConfig.get_host()}:{AppConfig.get_port()}/")
+    else:
+        logger.info("   Dashboard: disabled")
+    logger.info(f"   健康检查: http://{AppConfig.get_host()}:{AppConfig.get_port()}/health")
+    logger.info("")
+
+    yield
+
+    logger.info("服务正在关闭...")
+    if restart_guard is not None:
+        await restart_guard.stop()
+        restart_guard = None
+    try:
+        from app.services.command_engine import command_engine
+        command_engine.shutdown()
+    except Exception as e:
+        logger.debug(f"关闭命令引擎: {e}")
+
+    try:
+        from app.core.background_image_downloader import background_image_downloader
+        background_image_downloader.shutdown()
+    except Exception as e:
+        logger.debug(f"关闭后台图片下载器: {e}")
+
+    try:
+        browser = get_browser(auto_connect=False)
+        browser.close()
+    except Exception as e:
+        logger.debug(f"关闭浏览器: {e}")
+
+    try:
+        from app.utils.file_paste import cleanup_temp_dir
+        cleanup_temp_dir()
+    except Exception as e:
+        logger.debug(f"关闭时清理临时目录: {e}")
+
+    logger.info("👋 服务已停止")
+
+
+# ================= FastAPI 应用 =================
+
+app = FastAPI(
+    title="Universal Web-to-API",
+    description="将任意 AI Web 界面转换为 OpenAI 兼容 API",
+    version=APP_VERSION,
+    docs_url="/docs" if AppConfig.DEBUG else None,
+    redoc_url="/redoc" if AppConfig.DEBUG else None,
+    lifespan=lifespan
+)
+
+# CORS 配置
+if AppConfig.is_cors_enabled():
+    _cors_origins = AppConfig.get_cors_origins()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        # 安全：origins 为 "*" 时 Starlette 在 allow_credentials=True 下会
+        # 反射任意 Origin 并允许携带凭据，等于任何网页都可跨源读取本服务。
+        # 仅在明确配置了具体来源时才开启 credentials。
+        allow_credentials="*" not in _cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+@app.middleware("http")
+async def disable_dashboard_cache(request, call_next):
+    guard = restart_guard
+    if guard is not None:
+        async with guard.track_request() as admitted:
+            if not admitted:
+                # Do not reject arrivals during a handoff.  The launcher proxy
+                # retries this request when the new backend instance is ready.
+                await guard.wait_for_handoff()
+            return await _call_next_without_dashboard_cache(request, call_next)
+    return await _call_next_without_dashboard_cache(request, call_next)
+
+
+async def _call_next_without_dashboard_cache(request, call_next):
+    try:
+        response = await call_next(request)
+    except RuntimeError as e:
+        if str(e) == "No response returned." and await request.is_disconnected():
+            logger.debug("客户端已断开连接，忽略空响应中间件噪音")
+            return Response(status_code=204)
+        raise
+    path = request.url.path or ""
+    if path in ("/", "/dashboard") or path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
+# ================= Dashboard 路由（优先级最高）=================
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """首页 - Dashboard"""
+    if not AppConfig.is_dashboard_enabled():
+        return _dashboard_info_response()
+
+    dashboard_path = _resolve_dashboard_path()
+    if dashboard_path:
+        return FileResponse(dashboard_path)
+    # 如果没有 Dashboard，返回 API 信息
+    return JSONResponse({
+        "service": "Universal Web-to-API",
+        "version": APP_VERSION,
+        "dashboard": "请确保 DASHBOARD_FILE 指向的文件存在",
+        "docs": "/docs"
+    })
+
+
+@app.get("/dashboard", include_in_schema=False)
+async def dashboard():
+    """Dashboard 页面"""
+    if not AppConfig.is_dashboard_enabled():
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": "Dashboard 已禁用"}}
+        )
+
+    dashboard_path = _resolve_dashboard_path()
+    if dashboard_path:
+        return FileResponse(dashboard_path)
+    return JSONResponse(
+        status_code=404,
+        content={"error": {"message": "Dashboard 未找到，请确保 DASHBOARD_FILE 指向的文件存在"}}
+    )
+
+
+@app.get("/api/startup/controlled-browser-guide-data", include_in_schema=False)
+async def controlled_browser_guide_data():
+    try:
+        return JSONResponse(_build_controlled_browser_guide_data())
+    except Exception as e:
+        logger.warning(f"[startup] 生成受控浏览器引导页数据失败: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": "无法加载受控浏览器引导页数据"}}
+        )
+
+
+_MEDIA_MIME_OVERRIDES = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".webm": "audio/webm",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".ogv": "video/ogg",
+}
+
+_MEDIA_TRANSCODE_FORMATS = {
+    "mp3": {
+        "ext": ".mp3",
+        "mime": "audio/mpeg",
+        "args": ["-vn", "-codec:a", "libmp3lame", "-b:a", "128k"],
+    },
+    "m4a": {
+        "ext": ".m4a",
+        "mime": "audio/mp4",
+        "args": ["-vn", "-codec:a", "aac", "-b:a", "128k"],
+    },
+}
+
+
+def _resolve_download_media_path(filename: str) -> Path:
+    safe_name = Path(str(filename or "")).name
+    if not safe_name or safe_name != str(filename or ""):
+        raise HTTPException(status_code=400, detail="invalid_media_filename")
+
+    base_dir = Path("download_images").resolve()
+    path = (base_dir / safe_name).resolve()
+    if base_dir not in path.parents or not path.is_file():
+        raise HTTPException(status_code=404, detail="media_not_found")
+    return path
+
+
+def _guess_media_mime(path: Path) -> str:
+    suffix = path.suffix.lower()
+    return _MEDIA_MIME_OVERRIDES.get(suffix) or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+
+def _transcode_media(path: Path, fmt: str) -> Path:
+    spec = _MEDIA_TRANSCODE_FORMATS.get(fmt)
+    if not spec:
+        raise HTTPException(status_code=400, detail="unsupported_media_format")
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise HTTPException(status_code=503, detail="ffmpeg_not_available")
+
+    cache_dir = path.parent / "_transcoded"
+    cache_dir.mkdir(exist_ok=True)
+    # Include the complete source filename in the cache key.  Different input
+    # formats can share a stem (for example voice.wav and voice.ogg).
+    out_path = cache_dir / f"{path.name}{spec['ext']}"
+    if out_path.exists() and out_path.stat().st_mtime >= path.stat().st_mtime and out_path.stat().st_size > 0:
+        return out_path
+
+    temp_path = cache_dir / (
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}{spec['ext']}"
+    )
+
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        *spec["args"],
+        str(temp_path),
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=504, detail="media_transcode_timeout")
+    except Exception as e:
+        temp_path.unlink(missing_ok=True)
+        logger.warning(f"媒体转码启动失败: {e}")
+        raise HTTPException(status_code=500, detail="media_transcode_failed")
+
+    if completed.returncode != 0 or not temp_path.exists() or temp_path.stat().st_size <= 0:
+        temp_path.unlink(missing_ok=True)
+        stderr = str(completed.stderr or "").strip()[:240]
+        logger.warning(f"媒体转码失败: format={fmt}, file={path.name}, error={stderr}")
+        raise HTTPException(status_code=500, detail="media_transcode_failed")
+
+    os.replace(temp_path, out_path)
+    return out_path
+
+
+@app.get("/media/{filename}", include_in_schema=False)
+async def media_file(
+    filename: str,
+    format: Optional[str] = Query(default=None, pattern="^(mp3|m4a)$"),
+):
+    source_path = _resolve_download_media_path(filename)
+    requested_format = str(format or "").strip().lower() if isinstance(format, str) else ""
+
+    if requested_format:
+        # ffmpeg 转码最长可达 60 秒，必须放到线程池执行，
+        # 否则会同步阻塞事件循环，冻结所有并发 SSE 流。
+        media_path = await asyncio.to_thread(_transcode_media, source_path, requested_format)
+        media_type = _MEDIA_TRANSCODE_FORMATS[requested_format]["mime"]
+    else:
+        media_path = source_path
+        media_type = _guess_media_mime(media_path)
+
+    return FileResponse(
+        media_path,
+        media_type=media_type,
+        filename=media_path.name,
+        content_disposition_type="inline",
+    )
+# ================= 注册 API 路由（在 Dashboard 之后）=================
+
+from app.api import router as api_router
+app.include_router(api_router)
+
+
+# ================= 挂载静态文件 =================
+
+if Path("static").exists():
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# 🆕 挂载图片下载目录
+download_images_dir = Path("download_images")
+download_images_dir.mkdir(exist_ok=True)  # 自动创建目录
+app.mount("/download_images", StaticFiles(directory="download_images"), name="download_images")
+logger.info(f"📁 图片下载目录: {download_images_dir.absolute()}")
+
+
+# ================= 异常处理 =================
+
+def _sanitize_validation_errors(errors: Any) -> list:
+    safe_errors = []
+    for item in errors if isinstance(errors, list) else []:
+        if not isinstance(item, dict):
+            continue
+        safe_item = {
+            "type": item.get("type"),
+            "loc": item.get("loc"),
+            "msg": item.get("msg"),
+        }
+        if item.get("url"):
+            safe_item["url"] = item.get("url")
+        safe_errors.append(safe_item)
+    return safe_errors
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request, exc):
+    details = _sanitize_validation_errors(exc.errors())
+    message = "请求参数校验失败"
+    if details:
+        first = details[0]
+        loc = ".".join(str(part) for part in first.get("loc", []) if part != "body")
+        msg = str(first.get("msg") or "").strip()
+        if loc and msg:
+            message = f"{loc}: {msg}"
+        elif msg:
+            message = msg
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "validation_error",
+                "details": details,
+            }
+        },
+    )
+
+
+@app.exception_handler(404)
+async def not_found_handler(request, exc):
+    return JSONResponse(
+        status_code=404,
+        content={"error": {"message": "接口不存在", "path": str(request.url.path)}}
+    )
+
+
+@app.exception_handler(500)
+async def internal_error_handler(request, exc):
+    logger.error(f"内部错误: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": {"message": "服务器内部错误"}}
+    )
+
+
+# ================= 主入口 =================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    print("\n" + "=" * 60)
+    print("环境变量配置（可选）:")
+    print("  APP_HOST=0.0.0.0          # 监听地址")
+    print("  APP_PORT=8199             # 监听端口")
+    print("  APP_DEBUG=true            # 调试模式")
+    print("  BROWSER_PORT=9222         # 浏览器端口")
+    print("=" * 60 + "\n")
+
+    uvicorn.run(
+        app,
+        host=AppConfig.get_host(),
+        port=AppConfig.get_port(),
+        log_level="warning",  # 隐藏 uvicorn 的 INFO 日志
+        access_log=False
+    )

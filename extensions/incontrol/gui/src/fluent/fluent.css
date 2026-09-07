@@ -1,0 +1,119 @@
+/*
+ * Fluent 2 alignment for the webview.
+ *
+ * Every value is a chain over the `--vscode-*` properties that the extension
+ * host pushes into the webview, so this layer follows the active color theme by
+ * itself (no JS). Real Fluent components read their own token theme from
+ * gui/src/fluent/theme.ts, which derives the same numbers.
+ */
+:root {
+  /* Geometry: Fluent's radius scale, set to sharp corners on request.
+   * Everything (fields, buttons, popups, cards) reads these, so this is the
+   * single knob for the corner treatment. */
+  --fluent-radius: 0px;
+  --fluent-radius-sm: 0px;
+  --fluent-radius-lg: 0px;
+  --fluent-radius-xl: 0px;
+  /* Motion: Fluent's decelerate curve + short durations */
+  --fluent-ease: cubic-bezier(0.1, 0.9, 0.2, 1);
+  --fluent-duration: 120ms;
+  /* Surfaces */
+  --fluent-bg: var(
+    --vscode-sideBar-background,
+    var(--vscode-editor-background, #1e1e1e)
+  );
+  --fluent-bg-raised: var(--vscode-editor-background, #1e1e1e);
+  --fluent-bg-input: var(--vscode-input-background, #2d2d2d);
+  --fluent-bg-hover: var(--vscode-list-hoverBackground, #383838);
+  --fluent-fg: var(
+    --vscode-editor-foreground,
+    var(--vscode-sideBar-foreground, #e6e6e6)
+  );
+  --fluent-fg-muted: var(--vscode-descriptionForeground, #b3b3b3);
+  /* Strokes */
+  --fluent-stroke: var(
+    --vscode-input-border,
+    var(--vscode-commandCenter-inactiveBorder, #555555)
+  );
+  --fluent-stroke-muted: var(
+    --vscode-sideBar-border,
+    var(--vscode-panel-border, #2a2a2a)
+  );
+  --fluent-stroke-focus: var(--vscode-focusBorder, #3a6db3);
+  /* Accent */
+  --fluent-accent: var(--vscode-button-background, #2c5aa0);
+  --fluent-accent-hover: var(--vscode-button-hoverBackground, #3a6db3);
+  --fluent-accent-fg: var(--vscode-button-foreground, #ffffff);
+  /* Elevation: Fluent shadow2 / shadow8 / shadow16 */
+  --fluent-shadow-2: 0 1px 1px rgba(0, 0, 0, 0.14),
+    0 0px 1px rgba(0, 0, 0, 0.12);
+  --fluent-shadow-8: 0 2px 4px rgba(0, 0, 0, 0.18),
+    0 0px 2px rgba(0, 0, 0, 0.16);
+  --fluent-shadow-16: 0 4px 8px rgba(0, 0, 0, 0.24),
+    0 0px 2px rgba(0, 0, 0, 0.18);
+  /* Type: Fluent's stack, but honoring the user's editor font choice */
+  --fluent-font: "Segoe UI Variable Text", "Segoe UI",
+    var(--vscode-font-family, system-ui), sans-serif;
+  --fluent-font-mono: "Cascadia Mono", "JetBrains Mono",
+    var(--vscode-editor-font-family, monospace);
+}
+
+html,
+body,
+#root {
+  font-family: var(--fluent-font);
+  line-height: 1.4;
+}
+
+code,
+pre,
+kbd,
+samp,
+textarea.code {
+  font-family: var(--fluent-font-mono);
+}
+
+/* The repo kills all outlines (`*:focus { outline: none }`); Fluent keeps a
+ * ring, but only for keyboard focus. `!important` + later position wins over
+ * that rule without touching every component. */
+:focus-visible {
+  outline: 2px solid var(--fluent-stroke-focus) !important;
+  outline-offset: -2px;
+}
+
+button,
+a,
+input,
+select,
+textarea,
+[role="button"],
+[role="tab"],
+[role="menuitem"],
+[role="option"] {
+  transition: background-color var(--fluent-duration) var(--fluent-ease),
+    color var(--fluent-duration) var(--fluent-ease),
+    border-color var(--fluent-duration) var(--fluent-ease),
+    box-shadow var(--fluent-duration) var(--fluent-ease);
+}
+
+/* Existing utilities that hard-code the old look, re-pointed at the tokens. */
+.rounded-default {
+  border-radius: var(--fluent-radius);
+}
+
+/* The main input, its toolbar row and the buttons in it also carry Tailwind
+ * rounding utilities, which no token can reach. Pin the whole surface sharp. */
+.chat-input-surface,
+.chat-input-surface *,
+.chat-input-surface *::before,
+.chat-input-surface *::after {
+  border-radius: 0 !important;
+}
+/* 兜底：任何按视口宽度或固定像素写死的子元素，都不允许把输入块顶得比容器宽 */
+.chat-input-surface,
+.chat-input-surface * {
+  max-width: 100%;
+}
+.shadow-md {
+  box-shadow: var(--fluent-shadow-16);
+}

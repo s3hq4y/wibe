@@ -1,0 +1,8 @@
+{
+  "name": "uwa_desktop",
+  "version": "1.1.0",
+  "description": "GNOME 风格桌面控制台 + Fluent UI 受控浏览器引导页覆盖（纯 CSS 无图片）",
+  "entry": "register",
+  "requires": ["plugin_host"],
+  "env": { "DASHBOARD_FILE": "dashboard/index.html" }
+}

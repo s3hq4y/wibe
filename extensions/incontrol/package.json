@@ -1,0 +1,718 @@
+{
+  "name": "incontrol",
+  "icon": "media/icon.png",
+  "author": {
+    "name": "incontrol"
+  },
+  "version": "0.1.1-dev.20260904-231437",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/s3hq4y/incontrol"
+  },
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "bugs": {
+    "url": "https://github.com/s3hq4y/incontrol/issues"
+  },
+  "homepage": "https://github.com/s3hq4y/incontrol",
+  "license": "Apache-2.0",
+  "displayName": "incontrol",
+  "pricing": "Free",
+  "description": "Local AI agent for VS Code - chat, agent, inline edit and autocomplete against your own models and config.",
+  "publisher": "incontrol",
+  "engines": {
+    "vscode": "^1.70.0",
+    "node": ">=20.20.1"
+  },
+  "engine-strict": true,
+  "galleryBanner": {
+    "color": "#1E1E1E",
+    "theme": "dark"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages",
+    "Snippets"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "chat",
+    "autocomplete",
+    "edit",
+    "mcp"
+  ],
+  "activationEvents": [
+    "onUri",
+    "onStartupFinished",
+    "onView:incontrolGUIView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "filenames": [
+          "config.json",
+          ".incontrolrc.json"
+        ],
+        "id": "jsonc"
+      },
+      {
+        "id": "promptLanguage",
+        "extensions": [
+          ".prompt"
+        ],
+        "aliases": [
+          "Prompt Language"
+        ],
+        "configuration": "./prompt-file-language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "promptLanguage",
+        "scopeName": "source.prompt",
+        "path": "./media/prompt.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "incontrol",
+      "properties": {
+        "incontrol.telemetryEnabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "%configuration.incontrol.telemetryEnabled%",
+          "markdownDeprecationMessage": "This setting is deprecated and will be removed in a later version. Please use the _Telemetry > Allow Anonymous Telemetry_ setting in the extension's User Settings page.",
+          "deprecationMessage": "Please use the _Telemetry > Allow Anonymous Telemetry_ setting in the extension's User Settings page."
+        },
+        "incontrol.showInlineTip": {
+          "type": "boolean",
+          "default": true,
+          "description": "%configuration.incontrol.showInlineTip%"
+        },
+        "incontrol.disableQuickFix": {
+          "type": "boolean",
+          "default": false,
+          "description": "%configuration.incontrol.disableQuickFix%"
+        },
+        "incontrol.enableQuickActions": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "%configuration.incontrol.enableQuickActions%"
+        },
+        "incontrol.enableTabAutocomplete": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "%configuration.incontrol.enableTabAutocomplete%"
+        },
+        "incontrol.enableNextEdit": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "%configuration.incontrol.enableNextEdit%"
+        },
+        "incontrol.pauseTabAutocompleteOnBattery": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "%configuration.incontrol.pauseTabAutocompleteOnBattery%",
+          "deprecationMessage": "%configuration.incontrol.pauseTabAutocompleteOnBattery.deprecated%"
+        },
+        "incontrol.enableConsole": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "%configuration.incontrol.enableConsole%"
+        },
+        "incontrol.remoteConfigServerUrl": {
+          "type": "string",
+          "default": null,
+          "markdownDescription": "%configuration.incontrol.remoteConfigServerUrl%"
+        },
+        "incontrol.userToken": {
+          "type": "string",
+          "default": null,
+          "markdownDescription": "%configuration.incontrol.userToken%"
+        },
+        "incontrol.remoteConfigSyncPeriod": {
+          "type": "number",
+          "default": 60,
+          "description": "%configuration.incontrol.remoteConfigSyncPeriod%"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "incontrol.applyCodeFromChat",
+        "category": "incontrol",
+        "title": "%command.incontrol.applyCodeFromChat%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.acceptDiff",
+        "category": "incontrol",
+        "title": "%command.incontrol.acceptDiff%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.rejectDiff",
+        "category": "incontrol",
+        "title": "%command.incontrol.rejectDiff%",
+        "group": "incontrol",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "incontrol.acceptVerticalDiffBlock",
+        "category": "incontrol",
+        "title": "%command.incontrol.acceptVerticalDiffBlock%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.rejectVerticalDiffBlock",
+        "category": "incontrol",
+        "title": "%command.incontrol.rejectVerticalDiffBlock%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.focusEdit",
+        "category": "incontrol",
+        "title": "%command.incontrol.focusEdit%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.focusIncontrolInput",
+        "category": "incontrol",
+        "title": "%command.incontrol.focusIncontrolInput.0%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.focusIncontrolInputWithoutClear",
+        "category": "incontrol",
+        "title": "%command.incontrol.focusIncontrolInputWithoutClear%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.debugTerminal",
+        "category": "incontrol",
+        "title": "%command.incontrol.debugTerminal%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.exitEditMode",
+        "category": "incontrol",
+        "title": "%command.incontrol.exitEditMode%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.openConfigPage",
+        "category": "incontrol",
+        "title": "%command.incontrol.openConfigPage%",
+        "icon": "$(gear)",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.toggleTabAutocompleteEnabled",
+        "category": "incontrol",
+        "title": "%command.incontrol.toggleTabAutocompleteEnabled%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.forceAutocomplete",
+        "title": "%command.incontrol.forceAutocomplete%",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.selectFilesAsContext",
+        "category": "incontrol",
+        "title": "%command.incontrol.selectFilesAsContext%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.newSession",
+        "category": "incontrol",
+        "title": "%command.incontrol.newSession%",
+        "icon": "$(add)",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.shareSession",
+        "category": "incontrol",
+        "title": "%command.incontrol.shareSession%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.viewHistory",
+        "category": "incontrol",
+        "title": "%command.incontrol.viewHistory%",
+        "icon": "$(history)",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.viewLogs",
+        "category": "incontrol",
+        "title": "%command.incontrol.viewLogs%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.clearConsole",
+        "category": "incontrol",
+        "title": "%command.incontrol.clearConsole%",
+        "icon": "$(clear-all)",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.navigateTo",
+        "category": "incontrol",
+        "title": "%command.incontrol.navigateTo%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.writeCommentsForCode",
+        "category": "incontrol",
+        "title": "%command.incontrol.writeCommentsForCode%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.writeDocstringForCode",
+        "category": "incontrol",
+        "title": "%command.incontrol.writeDocstringForCode%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.fixCode",
+        "category": "incontrol",
+        "title": "%command.incontrol.fixCode%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.optimizeCode",
+        "category": "incontrol",
+        "title": "%command.incontrol.optimizeCode%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.fixGrammar",
+        "category": "incontrol",
+        "title": "%command.incontrol.fixGrammar%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.focusIncontrolInput",
+        "category": "incontrol",
+        "title": "%command.incontrol.focusIncontrolInput.1%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.enterEnterpriseLicenseKey",
+        "category": "incontrol",
+        "title": "%command.incontrol.enterEnterpriseLicenseKey%",
+        "group": "incontrol"
+      },
+      {
+        "command": "incontrol.toggleNextEditEnabled",
+        "title": "%command.incontrol.toggleNextEditEnabled%"
+      },
+      {
+        "command": "incontrol.nextEditWindow.hideNextEditSuggestion",
+        "category": "incontrol",
+        "title": "%command.incontrol.nextEditWindow.hideNextEditSuggestion%"
+      },
+      {
+        "command": "incontrol.nextEditWindow.acceptNextEditSuggestion",
+        "category": "incontrol",
+        "title": "%command.incontrol.nextEditWindow.acceptNextEditSuggestion%"
+      },
+      {
+        "command": "incontrol.forceNextEdit",
+        "category": "incontrol",
+        "title": "%command.incontrol.forceNextEdit%"
+      },
+      {
+        "command": "incontrol.acceptJump",
+        "category": "incontrol",
+        "title": "%command.incontrol.acceptJump%"
+      },
+      {
+        "command": "incontrol.rejectJump",
+        "category": "incontrol",
+        "title": "%command.incontrol.rejectJump%"
+      },
+      {
+        "command": "incontrol.openInNewWindow",
+        "category": "incontrol",
+        "title": "%command.incontrol.openInNewWindow%",
+        "group": "incontrol"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "incontrol.focusIncontrolInput",
+        "mac": "cmd+l",
+        "key": "ctrl+l"
+      },
+      {
+        "command": "incontrol.focusIncontrolInputWithoutClear",
+        "mac": "cmd+shift+l",
+        "key": "ctrl+shift+l"
+      },
+      {
+        "command": "incontrol.acceptDiff",
+        "mac": "shift+cmd+enter",
+        "key": "shift+ctrl+enter",
+        "when": "incontrol.diffVisible"
+      },
+      {
+        "command": "incontrol.rejectDiff",
+        "mac": "shift+cmd+backspace",
+        "key": "shift+ctrl+backspace",
+        "when": "incontrol.diffVisible"
+      },
+      {
+        "command": "incontrol.rejectDiff",
+        "mac": "cmd+z",
+        "key": "ctrl+z",
+        "when": "incontrol.diffVisible"
+      },
+      {
+        "command": "incontrol.quickEditHistoryUp",
+        "mac": "up",
+        "key": "up",
+        "when": "false && incontrol.quickEditHistoryFocused"
+      },
+      {
+        "command": "incontrol.quickEditHistoryDown",
+        "mac": "down",
+        "key": "down",
+        "when": "false && incontrol.quickEditHistoryFocused"
+      },
+      {
+        "command": "incontrol.acceptVerticalDiffBlock",
+        "mac": "alt+cmd+y",
+        "key": "alt+ctrl+y"
+      },
+      {
+        "command": "incontrol.rejectVerticalDiffBlock",
+        "mac": "alt+cmd+n",
+        "key": "alt+ctrl+n"
+      },
+      {
+        "command": "incontrol.focusEdit",
+        "title": "Edit code with natural language",
+        "mac": "cmd+i",
+        "key": "ctrl+i"
+      },
+      {
+        "command": "incontrol.exitEditMode",
+        "mac": "escape",
+        "key": "escape",
+        "when": "incontrol.inEditMode && editorFocus"
+      },
+      {
+        "command": "incontrol.debugTerminal",
+        "mac": "cmd+shift+r",
+        "key": "ctrl+shift+r"
+      },
+      {
+        "command": "incontrol.openInNewWindow",
+        "mac": "cmd+k cmd+m",
+        "key": "ctrl+k ctrl+m",
+        "when": "!terminalFocus"
+      },
+      {
+        "command": "incontrol.toggleTabAutocompleteEnabled",
+        "mac": "cmd+k cmd+a",
+        "key": "ctrl+k ctrl+a",
+        "when": "!terminalFocus"
+      },
+      {
+        "command": "incontrol.forceAutocomplete",
+        "key": "ctrl+alt+space",
+        "mac": "cmd+alt+space",
+        "when": "editorTextFocus && !editorHasSelection && !editorReadOnly && !inSnippetMode"
+      },
+      {
+        "command": "incontrol.applyCodeFromChat",
+        "mac": "alt+a",
+        "key": "alt+a"
+      },
+      {
+        "command": "incontrol.toggleNextEditEnabled",
+        "key": "ctrl+k ctrl+n",
+        "mac": "cmd+k cmd+n",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "incontrol.nextEditWindow.hideNextEditSuggestion",
+        "key": "escape",
+        "when": "editorTextFocus && nextEditWindowActive && !incontrol.jumpDecorationVisible"
+      },
+      {
+        "command": "incontrol.nextEditWindow.acceptNextEditSuggestion",
+        "key": "tab",
+        "when": "editorTextFocus && nextEditWindowActive && !incontrol.jumpDecorationVisible"
+      },
+      {
+        "command": "incontrol.acceptJump",
+        "key": "tab",
+        "when": "editorTextFocus && incontrol.jumpDecorationVisible"
+      },
+      {
+        "command": "incontrol.rejectJump",
+        "key": "escape",
+        "when": "editorTextFocus && incontrol.jumpDecorationVisible"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "incontrol.incontrolSubMenu",
+        "label": "incontrol"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "incontrol.focusIncontrolInput"
+        },
+        {
+          "command": "incontrol.focusIncontrolInputWithoutClear"
+        },
+        {
+          "command": "incontrol.debugTerminal"
+        },
+        {
+          "command": "incontrol.newSession"
+        },
+        {
+          "command": "incontrol.enterEnterpriseLicenseKey"
+        },
+        {
+          "command": "incontrol.openInNewWindow"
+        }
+      ],
+      "editor/context": [
+        {
+          "submenu": "incontrol.incontrolSubMenu",
+          "group": "0_acontinue"
+        }
+      ],
+      "editor/title/run": [
+        {
+          "command": "incontrol.rejectDiff",
+          "group": "incontrol",
+          "when": "incontrol.streamingDiff"
+        }
+      ],
+      "incontrol.incontrolSubMenu": [
+        {
+          "command": "incontrol.focusIncontrolInputWithoutClear",
+          "group": "incontrol"
+        },
+        {
+          "command": "incontrol.focusEdit",
+          "group": "incontrol",
+          "when": "!editorReadonly"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "incontrol.selectFilesAsContext",
+          "group": "1_debug@1"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "incontrol.newSession",
+          "group": "navigation@1",
+          "when": "view == incontrol.incontrolGUIView"
+        },
+        {
+          "command": "incontrol.viewHistory",
+          "group": "navigation@2",
+          "when": "view == incontrol.incontrolGUIView"
+        },
+        {
+          "command": "incontrol.openConfigPage",
+          "group": "navigation@4",
+          "when": "view == incontrol.incontrolGUIView"
+        },
+        {
+          "command": "incontrol.clearConsole",
+          "group": "navigation@1",
+          "when": "view == incontrol.incontrolConsoleView"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "incontrol.newSession",
+          "group": "navigation@1",
+          "when": "activeWebviewPanelId == incontrol.incontrolGUIView"
+        },
+        {
+          "command": "incontrol.viewHistory",
+          "group": "navigation@2",
+          "when": "activeWebviewPanelId == incontrol.incontrolGUIView"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "incontrol.debugTerminal",
+          "group": "navigation@top"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "incontrol",
+          "title": "%viewContainer.incontrol%",
+          "icon": "media/sidebar-icon.png"
+        }
+      ],
+      "panel": [
+        {
+          "id": "incontrolConsole",
+          "title": "%viewContainer.incontrolConsole%",
+          "icon": "$(window)"
+        }
+      ]
+    },
+    "views": {
+      "incontrol": [
+        {
+          "type": "webview",
+          "id": "incontrol.incontrolGUIView",
+          "name": "%view.incontrol.incontrolGUIView%",
+          "icon": "media/sidebar-icon.png",
+          "visibility": "visible"
+        }
+      ],
+      "incontrolConsole": [
+        {
+          "type": "webview",
+          "id": "incontrol.incontrolConsoleView",
+          "name": "%view.incontrol.incontrolConsoleView%",
+          "icon": "$(window)",
+          "visibility": "visible",
+          "when": "config.incontrol.enableConsole"
+        }
+      ]
+    },
+    "jsonValidation": [
+      {
+        "fileMatch": "**/.incontrol*/config.json",
+        "url": "./config_schema.json"
+      },
+      {
+        "fileMatch": ".incontrolrc.json",
+        "url": "./incontrol_rc_schema.json"
+      },
+      {
+        "fileMatch": "**/config.yaml",
+        "url": "./config-yaml-schema.json"
+      }
+    ]
+  },
+  "scripts": {
+    "esbuild-base": "node scripts/esbuild.js",
+    "vscode:prepublish": "npm run build",
+    "esbuild": "npm run esbuild-base -- --sourcemap",
+    "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
+    "esbuild-notify": "npm run esbuild-base -- --sourcemap --notify",
+    "esbuild:visualize": "esbuild-visualizer --metadata ./build/meta.json --filename ./build/stats.html --open",
+    "tsc": "tsc -p ./",
+    "tsc:check": "tsc -p ./ --noEmit",
+    "tsc-watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "lint:fix": "eslint . --ext ts --fix",
+    "test": "vitest run",
+    "vitest": "vitest run",
+    "write-build-timestamp": "node scripts/write-build-timestamp.js",
+    "prepackage": "node scripts/prepackage-standalone.js",
+    "package": "node scripts/package.js",
+    "package:pre-release": "node scripts/package.js --pre-release",
+    "build:gui": "npm --prefix ./gui run build && node ./scripts/copy-gui-assets.js",
+    "build": "npm run build:gui && npm run esbuild-base -- --minify"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.6.4",
+    "@nestjs/common": "^11.0.16",
+    "@openapitools/openapi-generator-cli": "^2.23.1",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/follow-redirects": "^1.14.4",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "16.x",
+    "@types/node-fetch": "^2.6.12",
+    "@types/react-dom": "^18.2.4",
+    "@types/request": "^2.48.8",
+    "@types/uuid": "^10.0.0",
+    "@types/vscode": "1.70",
+    "@types/ws": "^8.5.4",
+    "@typescript-eslint/eslint-plugin": "^5.45.0",
+    "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.25.0",
+    "esbuild-visualizer": "^0.6.0",
+    "eslint": "^8.28.0",
+    "json-schema-to-typescript": "^12.0.0",
+    "ovsx": "^0.8.3",
+    "rimraf": "^5.0.5",
+    "tailwindcss": "^3.3.2",
+    "typescript": "^5.6.3",
+    "vite": "^4.5.14",
+    "vitest": "^3.1.4",
+    "binaryen": "^116.0.0"
+  },
+  "dependencies": {
+    "@incontrol/config-types": "file:./packages/config-types",
+    "@incontrol/fetch": "file:./packages/fetch",
+    "@reduxjs/toolkit": "^1.9.3",
+    "axios": "^1.13.1",
+    "core": "file:./core",
+    "cors": "^2.8.5",
+    "diff": "^8.0.4",
+    "downshift": "^7.6.0",
+    "express": "^4.18.2",
+    "fkill": "^8.1.0",
+    "follow-redirects": "^1.15.4",
+    "handlebars": "^4.7.8",
+    "highlight.js": "^11.7.0",
+    "highlightable": "^1.3.0-beta.0",
+    "http-proxy": "^1.18.1",
+    "http-proxy-agent": "^7.0.0",
+    "http-proxy-middleware": "^2.0.9",
+    "https-proxy-agent": "^7.0.2",
+    "ignore": "^5.3.0",
+    "jsdom": "^24.0.0",
+    "lru-cache": "^11.2.4",
+    "minisearch": "^7.0.0",
+    "monaco-vscode-textmate-theme-converter": "^0.1.7",
+    "ncp": "^2.0.0",
+    "node-fetch": "^3.3.2",
+    "node-machine-id": "^1.1.12",
+    "react-markdown": "^8.0.7",
+    "react-redux": "^8.0.5",
+    "read-last-lines": "^1.8.0",
+    "socket.io-client": "^4.7.2",
+    "strip-ansi": "^7.1.0",
+    "svg-builder": "^2.0.0",
+    "undici": "^6.24.0",
+    "uuid": "^9.0.1",
+    "uuidv4": "^6.2.13",
+    "vscode-languageclient": "^8.0.2",
+    "ws": "^8.19.0",
+    "linkedom": "^0.18.6"
+  },
+  "overrides": {
+    "vitest": {
+      "@types/node": "^16.18.119"
+    },
+    "diff": "$diff",
+    "picomatch": "^4.0.2",
+    "rollup": "^4.34.9",
+    "vite": {
+      "esbuild": "^0.25.0"
+    },
+    "tar": "^7.5.13",
+    "undici-types@~7.18.0": "7.18.1"
+  }
+}

@@ -1,0 +1,180 @@
+"""
+app/core/parsers/base.py - 响应解析器基类
+
+定义网络响应解析的标准接口（支持增量响应）
+"""
+
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Any
+
+
+class ResponseParser(ABC):
+    """
+    响应解析器抽象基类
+    
+    职责：
+    - 解析网络拦截到的原始响应体
+    - 支持增量响应（流式传输）
+    - 提取文本内容和图片
+    """
+    
+    # ============ 抽象方法（子类必须实现）============
+    
+    @abstractmethod
+    def parse_chunk(self, raw_response: str) -> Dict[str, Any]:
+        """
+        解析单次响应数据（增量）
+        
+        Args:
+            raw_response: 原始响应体（字符串）
+        
+        Returns:
+            {
+                "content": str,           # 本次增量的文本内容
+                "images": List[Dict],     # 本次增量的图片（可选）
+                "done": bool,             # 是否为最后一块数据
+                "error": Optional[str]    # 解析错误信息
+            }
+        
+        注意：
+        - content 为空字符串表示本次无新增文本
+        - images 为空列表表示本次无新增图片
+        - done=True 表示流式传输结束
+        - error 不为 None 表示解析失败
+        """
+        pass
+    
+    @abstractmethod
+    def reset(self):
+        """
+        重置解析器状态
+        
+        用于新一轮对话开始时清空累积状态
+        """
+        pass
+
+    def _prepare_incremental_raw_response(self, raw_response: str) -> str:
+        """
+        Return the append-only delta for a full raw response snapshot.
+
+        Network listeners usually pass a growing full body to parsers. When the
+        browser replaces that snapshot with another response of the same or
+        greater length, slicing by length alone loses content. This helper
+        preserves the fast append path and resets parser state when the new
+        snapshot is not a prefix extension of the previous one.
+        """
+        if not isinstance(raw_response, str):
+            raw_response = str(raw_response)
+
+        previous = getattr(self, "_last_raw_response", "")
+        try:
+            previous_len = int(getattr(self, "_last_raw_length", 0) or 0)
+        except Exception:
+            previous_len = 0
+
+        if previous_len > 0 and previous:
+            if raw_response == previous:
+                return ""
+            if raw_response.startswith(previous):
+                new_data = raw_response[len(previous):]
+            else:
+                self.reset()
+                new_data = raw_response
+        else:
+            new_data = raw_response
+
+        self._last_raw_length = len(raw_response)
+        self._last_raw_response = raw_response
+        return new_data
+    
+    # ============ 可选覆盖方法 ============
+    
+    def validate_response(self, raw_response: str) -> bool:
+        """
+        验证响应格式是否匹配此解析器
+        
+        Args:
+            raw_response: 原始响应体
+        
+        Returns:
+            True 表示格式匹配，False 表示不匹配
+        """
+        try:
+            result = self.parse_chunk(raw_response)
+            return result.get("error") is None
+        except Exception:
+            return False
+
+    def should_abort_on_error(self) -> bool:
+        """
+        当 parse_chunk 返回 error 时，是否应立即终止当前工作流。
+
+        默认仅记录并继续，交给具体解析器按需升级为硬失败。
+        """
+        return False
+
+    def should_fallback_to_dom_when_no_visible_content(self) -> bool:
+        """
+        网络流存在但长期拿不到可见正文时，是否优先回退 DOM 监听。
+
+        适用于网络协议里混入推理/中间态，而页面真实正文由前端二次拼装的站点。
+        """
+        return False
+
+    def should_require_explicit_done(self) -> bool:
+        """Whether a stream must expose its protocol-level completion event."""
+        return False
+
+    def should_wait_for_replacement_stream_on_incomplete_capture(self) -> bool:
+        """Whether an incomplete captured response may be followed by another stream."""
+        return False
+
+    def get_media_generation_state(
+        self,
+        raw_response: str = "",
+        parse_result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        提取通用的媒体生成状态。
+
+        返回约定：
+            {
+                "pending": bool,
+                "media_type": "image" | "audio" | "video" | "",
+                "hint_text": str,
+                "wait_timeout_seconds": float | int | None,
+            }
+
+        通用工作流层只消费这些字段，不关心站点私有协议细节。
+        """
+        return {}
+    
+    # ============ 元数据接口 ============
+    
+    @classmethod
+    def get_id(cls) -> str:
+        """解析器唯一标识符"""
+        return cls.__name__.lower().replace('parser', '')
+    
+    @classmethod
+    def get_name(cls) -> str:
+        """解析器显示名称"""
+        return cls.__name__
+    
+    @classmethod
+    def get_description(cls) -> str:
+        """解析器描述"""
+        return "未提供描述"
+    
+    @classmethod
+    def get_supported_patterns(cls) -> List[str]:
+        """
+        返回此解析器支持的 URL 匹配模式
+        
+        Returns:
+            URL 子串列表（用于 page.listen.start()）
+        """
+        return []
+
+
+__all__ = ['ResponseParser']

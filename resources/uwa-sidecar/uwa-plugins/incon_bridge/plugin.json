@@ -1,0 +1,8 @@
+{
+  "name": "incon_bridge",
+  "version": "1.0.0",
+  "description": "IDE 桥接：新增 ide 历史模式（显式控制新对话）+ 回传 conversation_url",
+  "entry": "register",
+  "requires": ["plugin_host", "history_mode"],
+  "data_patches": []
+}

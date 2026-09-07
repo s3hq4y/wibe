@@ -1,0 +1,6 @@
+{
+  "_comment": "合并进 config/browser_config.json 顶层。HISTORY_MODE 为插件必需；其余两项为原 fork 的偏好值，可按需删改。",
+  "HISTORY_MODE": "last",
+  "CONVERSATION_TIMEOUT_THRESHOLD": 1200,
+  "TEXT_INPUT_CHUNK_SIZE": 999999
+}

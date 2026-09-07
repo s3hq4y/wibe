@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UWA Desktop</title>
+<style>
+/* ==========================================================================
+   UWA Desktop —— GNOME 风格桌面控制台（单文件，无外部依赖）
+   全局配置见文末内联脚本中的 window.UWA_DESKTOP_CONFIG
+   ========================================================================== */
+:root{
+  --accent:#d70a53;            /* magenta */
+  --accent-2:#8a2be2;
+  --bg-panel:rgba(24,24,32,.88);
+  --bg-panel-solid:#181820;
+  --win-bg:#26262e;
+  --win-title:#2e2e38;
+  --win-title-active:#3a3a46;
+  --border:#3f3f4a;
+  --text:#e8e8ee;
+  --text-dim:#9a9aa6;
+  --font-ui:-apple-system,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",system-ui,sans-serif;
+  --font-mono:"Cascadia Code","JetBrains Mono",Consolas,"Noto Sans Mono CJK SC",monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;overflow:hidden;font-family:var(--font-ui);color:var(--text);user-select:none;-webkit-user-select:none}
+body{background:#14141c}
+
+/* ---------- 壁纸 ---------- */
+#wallpaper{
+  position:fixed;inset:0;z-index:0;
+  background:
+    radial-gradient(1200px 700px at 75% 20%, rgba(215,10,83,.28), transparent 60%),
+    radial-gradient(900px 600px at 18% 78%, rgba(90,60,220,.30), transparent 62%),
+    radial-gradient(700px 500px at 50% 45%, rgba(40,60,140,.20), transparent 60%),
+    linear-gradient(150deg,#0f1230 0%,#1a1740 38%,#241038 72%,#160f26 100%);
+}
+#wallpaper::after{ /* 涡旋 */
+  content:"";position:absolute;right:4%;bottom:5%;width:320px;height:320px;opacity:.18;
+  background:conic-gradient(from 0deg, transparent 0deg, #d70a53 40deg, transparent 90deg,
+              transparent 120deg, #8a2be2 170deg, transparent 220deg,
+              transparent 250deg, #d70a53 300deg, transparent 360deg);
+  border-radius:50%;filter:blur(28px);
+}
+
+/* ---------- 顶栏 ---------- */
+#topbar{
+  position:fixed;top:0;left:0;right:0;height:36px;z-index:9000;
+  display:flex;align-items:center;gap:8px;padding:0 12px;
+  background:var(--bg-panel);backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,.06);
+  font-size:13px;
+}
+.tb-left{display:flex;align-items:center;gap:6px;min-width:0}
+.tb-center{position:absolute;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:6px;font-size:13px;color:#d8d8e0}
+.tb-right{margin-left:auto;display:flex;align-items:center;gap:6px}
+.tb-btn{display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:6px;cursor:pointer;color:var(--text);background:transparent;border:none;font-size:13px}
+.tb-btn:hover{background:rgba(255,255,255,.08)}
+.tb-btn svg{width:16px;height:16px}
+.tb-ico{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;cursor:pointer;color:var(--text)}
+.tb-ico:hover{background:rgba(255,255,255,.08)}
+.tb-ico svg{width:16px;height:16px}
+#tb-hostname{font-weight:600;color:#fff}
+#tb-clock{font-variant-numeric:tabular-nums;letter-spacing:.3px}
+
+/* ---------- 左侧 Dock ---------- */
+#dock{
+  position:fixed;left:10px;top:50%;transform:translateY(-50%);z-index:8000;
+  display:flex;flex-direction:column;gap:6px;padding:8px 6px;border-radius:14px;
+  background:var(--bg-panel);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.07);
+}
+.dock-item{position:relative;width:46px;height:46px;display:flex;align-items:center;justify-content:center;border-radius:10px;cursor:pointer;transition:transform .12s}
+.dock-item:hover{transform:scale(1.1);background:rgba(255,255,255,.08)}
+.dock-item svg{width:24px;height:24px}
+.dock-item .emoji{font-size:24px;line-height:1}
+.dock-item .run-dot{position:absolute;left:-9px;top:50%;transform:translateY(-50%);width:4px;height:16px;border-radius:3px;background:var(--accent);opacity:0}
+.dock-item.running .run-dot{opacity:1}
+.dock-tip{position:absolute;left:58px;top:50%;transform:translateY(-50%);white-space:nowrap;padding:4px 10px;border-radius:6px;background:#000c;color:#fff;font-size:12px;opacity:0;pointer-events:none;transition:opacity .12s}
+.dock-item:hover .dock-tip{opacity:1}
+
+/* ---------- 桌面图标 ---------- */
+#desktop-icons{position:fixed;top:46px;left:78px;bottom:46px;z-index:10;display:flex;flex-direction:column;flex-wrap:wrap;align-content:flex-start;gap:10px;padding:8px}
+.dicon{width:84px;height:92px;display:flex;flex-direction:column;align-items:center;gap:5px;border-radius:10px;cursor:pointer;padding:6px 4px}
+.dicon:hover{background:rgba(255,255,255,.10)}
+.dicon.sel{background:rgba(215,10,83,.25)}
+.dicon .ico{width:46px;height:46px;display:flex;align-items:center;justify-content:center;border-radius:10px;background:rgba(255,255,255,.06);box-shadow:0 2px 8px rgba(0,0,0,.35)}
+.dicon .ico svg{width:26px;height:26px;color:#fff}
+.dicon .ico .emoji{font-size:26px;line-height:1}
+.dicon .lbl{font-size:12px;color:#fff;text-align:center;text-shadow:0 1px 3px rgba(0,0,0,.9);max-width:82px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ---------- 底部任务栏 ---------- */
+#taskbar{
+  position:fixed;bottom:0;left:0;right:0;height:42px;z-index:9000;display:flex;align-items:center;gap:6px;padding:0 10px;
+  background:var(--bg-panel);backdrop-filter:blur(10px);border-top:1px solid rgba(255,255,255,.06);
+}
+.task-btn{display:flex;align-items:center;gap:8px;height:32px;padding:0 12px;border-radius:8px;cursor:pointer;border:1px solid transparent;background:transparent;color:var(--text);font-size:12.5px;max-width:220px}
+.task-btn svg{width:16px;height:16px;flex:none}
+.task-btn .emoji{font-size:16px;line-height:1}
+.task-btn .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-btn:hover{background:rgba(255,255,255,.08)}
+.task-btn.active{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.12)}
+#task-sep{flex:1}
+.task-ws{margin-left:auto;display:flex;gap:6px;align-items:center;padding:4px 8px;border-radius:8px;color:var(--text-dim);font-size:12px}
+.task-ws .ws{width:26px;height:18px;border:1px solid #555;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:10px}
+.task-ws .ws.cur{background:var(--accent);border-color:var(--accent);color:#fff}
+
+/* ---------- 窗口 ---------- */
+.window{
+  position:fixed;z-index:100;min-width:340px;min-height:240px;display:flex;flex-direction:column;
+  background:var(--win-bg);border:1px solid var(--border);border-radius:10px;overflow:hidden;
+  box-shadow:0 18px 60px rgba(0,0,0,.55);
+}
+.window.focused{box-shadow:0 22px 70px rgba(0,0,0,.7)}
+.window.minimized{display:none}
+.window.maximized{border-radius:0;border:none}
+.win-titlebar{height:34px;flex:none;display:flex;align-items:center;gap:8px;padding:0 8px;background:var(--win-title);cursor:default;border-bottom:1px solid rgba(255,255,255,.05)}
+.window.focused .win-titlebar{background:var(--win-title-active)}
+.win-titlebar .wt-ico{width:18px;height:18px;display:flex;align-items:center;justify-content:center}
+.win-titlebar .wt-ico svg{width:16px;height:16px;color:var(--text-dim)}
+.win-titlebar .wt-title{flex:1;font-size:12.5px;color:#d6d6de;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.win-btn{width:30px;height:26px;display:flex;align-items:center;justify-content:center;border-radius:6px;cursor:pointer;color:#c9c9d2}
+.win-btn:hover{background:rgba(255,255,255,.12)}
+.win-btn.close:hover{background:#e81123;color:#fff}
+.win-btn svg{width:13px;height:13px}
+.win-body{flex:1;position:relative;background:#fff}
+.win-body iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#fff}
+/* 缩放把手 */
+.rz{position:absolute;z-index:5}
+.rz.n{top:-3px;left:8px;right:8px;height:6px;cursor:ns-resize}
+.rz.s{bottom:-3px;left:8px;right:8px;height:6px;cursor:ns-resize}
+.rz.e{right:-3px;top:8px;bottom:8px;width:6px;cursor:ew-resize}
+.rz.w{left:-3px;top:8px;bottom:8px;width:6px;cursor:ew-resize}
+.rz.ne{top:-4px;right:-4px;width:12px;height:12px;cursor:nesw-resize}
+.rz.nw{top:-4px;left:-4px;width:12px;height:12px;cursor:nwse-resize}
+.rz.se{bottom:-4px;right:-4px;width:12px;height:12px;cursor:nwse-resize}
+.rz.sw{bottom:-4px;left:-4px;width:12px;height:12px;cursor:nesw-resize}
+
+/* ---------- 应用网格（活动/显示应用） ---------- */
+#appgrid{
+  position:fixed;inset:0;z-index:9500;display:none;background:rgba(12,12,20,.72);backdrop-filter:blur(14px);
+}
+#appgrid.show{display:flex;flex-direction:column;align-items:center;padding:70px 40px 40px}
+#appgrid .ag-title{font-size:20px;margin-bottom:26px;color:#fff}
+#appgrid .ag-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:16px;width:100%;max-width:900px;overflow:auto}
+.ag-item{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px 8px;border-radius:12px;cursor:pointer}
+.ag-item:hover{background:rgba(255,255,255,.09)}
+.ag-item .ico{width:52px;height:52px;display:flex;align-items:center;justify-content:center;border-radius:12px;background:rgba(255,255,255,.07)}
+.ag-item .ico svg{width:28px;height:28px;color:#fff}
+.ag-item .ico .emoji{font-size:28px}
+.ag-item .lbl{font-size:13px;color:#e6e6ec}
+
+/* ---------- 右键菜单 ---------- */
+#ctxmenu{position:fixed;z-index:9999;display:none;min-width:180px;padding:5px;border-radius:8px;background:#23232c;border:1px solid #3a3a46;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.ctx-item{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:6px;cursor:pointer;font-size:13px;color:#dcdce4}
+.ctx-item:hover{background:var(--accent);color:#fff}
+.ctx-item svg{width:15px;height:15px}
+.ctx-sep{height:1px;background:#3a3a46;margin:4px 6px}
+
+/* ---------- 通知 ---------- */
+#notify{position:fixed;top:48px;left:50%;transform:translateX(-50%) translateY(-20px);z-index:9800;display:none;
+  padding:10px 18px;border-radius:10px;background:#000d;color:#fff;font-size:13px;backdrop-filter:blur(6px);opacity:0;transition:all .25s}
+#notify.show{display:block;opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* ---------- 内联面板（终端/关于） ---------- */
+.panel{padding:14px;font-size:13px;line-height:1.6;color:#e6e6ec;height:100%;overflow:auto}
+#terminal{height:100%;background:#0c0c12;color:#c8f0c8;font-family:var(--font-mono);font-size:13px;line-height:1.5;padding:12px;overflow-y:auto;cursor:text}
+#terminal .line{white-space:pre-wrap;word-break:break-all}
+#terminal .in{color:#8fd3ff}
+#terminal .err{color:#ff7a7a}
+#terminal .ok{color:#c8f0c8}
+#terminal .accent{color:#ff8fb3}
+#term-input{display:flex;align-items:center;gap:6px}
+#term-input .ps{color:#8fd3ff;flex:none}
+#term-cmd{flex:1;background:transparent;border:none;outline:none;color:#e8e8ee;font-family:var(--font-mono);font-size:13px;caret-color:#fff}
+.about-h{font-size:20px;font-weight:700;margin-bottom:4px}
+.about-sub{color:var(--text-dim);margin-bottom:16px}
+.about-row{display:flex;justify-content:space-between;gap:16px;padding:6px 0;border-bottom:1px dashed #3a3a46;font-size:13px}
+.about-row .k{color:var(--text-dim)}
+.about-logo{width:64px;height:64px;border-radius:50%;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;
+  background:conic-gradient(from 0deg,#d70a53,#8a2be2,#d70a53);font-size:30px;color:#fff}
+kbd{background:#33333d;border:1px solid #4a4a56;border-radius:4px;padding:1px 6px;font-family:var(--font-mono);font-size:11px}
+</style>
+</head>
+<body>
+
+<div id="wallpaper"></div>
+<div id="desktop-icons"></div>
+
+<header id="topbar">
+  <div class="tb-left">
+    <button class="tb-btn" id="btn-activities" title="活动 / 显示应用">
+      <span id="act-ico"></span><span>活动</span>
+    </button>
+    <span class="tb-btn" id="tb-hostname" style="cursor:default"></span>
+  </div>
+  <div class="tb-center"><span id="tb-clock"></span></div>
+  <div class="tb-right" id="tb-tray"></div>
+</header>
+
+<nav id="dock"></nav>
+
+<div id="appgrid"><div class="ag-title">应用</div><div class="ag-grid" id="ag-grid"></div></div>
+
+<div id="ctxmenu"></div>
+<div id="notify"></div>
+
+<footer id="taskbar">
+  <div id="task-btns" style="display:flex;gap:6px;overflow:hidden"></div>
+  <div id="task-sep"></div>
+  <div class="task-ws" id="task-ws" title="工作区（装饰）"></div>
+</footer>
+
+<script>
+/* ==========================================================================
+   全局配置 —— 按需修改（系统图标/变量都在这里）
+   ========================================================================== */
+window.UWA_DESKTOP_CONFIG = {
+  /* 系统信息 */
+  hostname: "uwa",               // 顶栏主机名
+  username: "uwa",                 // 终端用户名
+  accent: "#d70a53",               // 强调色（magenta）
+
+  /* 壁纸：可用 "gradient"（内置） 或 任意 CSS background 值 / 图片 dataURI */
+  wallpaper: "gradient",
+
+  /* 桌面图标：icon 支持 —— 内置图标id | emoji | 内联SVG字符串
+     url: iframe 打开的地址；app: 内置面板（terminal / about） */
+  desktopIcons: [
+    { id:"settings", label:"设置",      icon:"settings", url:"/static/index.html",                     w:1160, h:760 },
+    { id:"tutorial", label:"教程",      icon:"book",     url:"/static/tutorial/index.html",            w:1080, h:760 },
+    { id:"selector", label:"选择器练习",icon:"flask",    url:"/static/selector-practice.html",         w:1080, h:760 },
+    { id:"probe",    label:"生命周期探针",icon:"gauge",  url:"/static/lifecycle-probe.html",           w:900,  h:700 },
+    { id:"terminal", label:"终端",      icon:"terminal", app:"terminal", w:780, h:500 },
+    { id:"about",    label:"关于",      icon:"info",     app:"about",    w:520, h:430 },
+  ],
+
+  /* 左侧 Dock 图标 */
+  dockIcons: [
+    { id:"settings", label:"设置",      icon:"settings", url:"/static/index.html", w:1160, h:760 },
+    { id:"terminal", label:"终端",      icon:"terminal", app:"terminal", w:780, h:500 },
+    { id:"tutorial", label:"教程",      icon:"book",     url:"/static/tutorial/index.html", w:1080, h:760 },
+    { id:"docs",     label:"API 文档",  icon:"globe",    url:"/docs", w:1080, h:760 },   // 仅 DEBUG 开启时可用
+  ],
+
+  /* 顶栏右侧托盘图标 */
+  tray: [
+    { icon:"wifi",    label:"网络" },
+    { icon:"volume",  label:"音量" },
+    { icon:"battery", label:"电池" },
+  ],
+
+  /* 时间 24 小时制 */
+  clock24: true,
+};
+
+/* ==========================================================================
+   内置 SVG 图标集（Feather 风格，可被配置里的 emoji / 自定义 SVG 覆盖）
+   ========================================================================== */
+const ICONS = {
+  apps:   '<circle cx="5" cy="5" r="1.6"/><circle cx="12" cy="5" r="1.6"/><circle cx="19" cy="5" r="1.6"/><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/><circle cx="5" cy="19" r="1.6"/><circle cx="12" cy="19" r="1.6"/><circle cx="19" cy="19" r="1.6"/>',
+  settings:'<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+  terminal:'<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
+  folder: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+  book:   '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+  compass:'<circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/>',
+  flask:  '<path d="M10 2v6L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 8V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="12" x2="17" y2="12"/>',
+  gauge:  '<path d="M12 15l4-6"/><path d="M20.5 15a8.5 8.5 0 1 0-17 0"/><circle cx="12" cy="15" r="1.4"/>',
+  globe:  '<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
+  info:   '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>',
+  power:  '<path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>',
+  wifi:   '<path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/>',
+  volume: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>',
+  battery:'<rect x="1" y="6" width="18" height="12" rx="2"/><line x1="23" y1="13" x2="23" y2="11"/><rect x="4" y="9" width="12" height="6" rx="1"/>',
+  user:   '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  code:   '<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>',
+  image:  '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
+  window: '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="8" x2="21" y2="8"/>',
+  close:  '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  minus:  '<line x1="5" y1="12" x2="19" y2="12"/>',
+  square: '<rect x="5" y="5" width="14" height="14" rx="1"/>',
+  restore:'<rect x="4" y="9" width="12" height="12" rx="1"/><path d="M8 6h9a2 2 0 0 1 2 2v9"/>',
+  refresh:'<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+};
+function svg(name, size){
+  const inner = ICONS[name] || ICONS.apps;
+  return '<svg width="'+size+'" height="'+size+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'+inner+'</svg>';
+}
+/* icon 字段解析：内置id -> svg；emoji -> emoji 文本；以 < 开头 -> 原样内联 SVG */
+function iconHTML(icon, size){
+  if(!icon) return svg('apps', size);
+  if(icon.trim().startsWith('<')) return icon;
+  if(ICONS[icon]) return svg(icon, size);
+  return '<span class="emoji">'+icon+'</span>';
+}
+
+/* ==========================================================================
+   运行时状态
+   ========================================================================== */
+const CFG = Object.assign({}, window.UWA_DESKTOP_CONFIG || {});
+const $ = (s)=>document.querySelector(s);
+const APPS = {};                                  // id -> app def
+(CFG.desktopIcons||[]).forEach(a=>APPS[a.id]=a);
+(CFG.dockIcons||[]).forEach(a=>{ if(!APPS[a.id]) APPS[a.id]=a; });
+
+const windows = {};          // id -> win obj
+let zTop = 100;
+let selIcon = null;
+
+/* ==========================================================================
+   窗口管理器
+   ========================================================================== */
+function openApp(id){
+  const a = APPS[id]; if(!a) return;
+  if(windows[id]){
+    const w = windows[id];
+    if(w.minimized){ w.restore(); }
+    focusWin(w);
+    return;
+  }
+  createWindow(a);
+}
+function createWindow(a){
+  const W = a.w || 900, H = a.h || 600;
+  const x = Math.max(8, Math.round((innerWidth - W)/2) + (Object.keys(windows).length%5)*28 - 40);
+  const y = Math.max(44, Math.round((innerHeight - H)/2) + (Object.keys(windows).length%5)*22 - 20);
+
+  const el = document.createElement('div');
+  el.className = 'window';
+  el.style.width = W+'px'; el.style.height = H+'px';
+  el.style.left = x+'px';  el.style.top  = y+'px';
+
+  let bodyHTML = '';
+  if(a.app === 'terminal'){ bodyHTML = '<div id="terminal" tabindex="0"></div>'; }
+  else if(a.app === 'about'){ bodyHTML = aboutHTML(); }
+  else { bodyHTML = '<iframe src="'+a.url+'" allow="clipboard-read;clipboard-write" loading="eager"></iframe>'; }
+
+  el.innerHTML =
+    '<div class="win-titlebar">'+
+      '<span class="wt-ico">'+iconHTML(a.icon,16)+'</span>'+
+      '<span class="wt-title">'+a.label+'</span>'+
+      '<span class="win-btn min" title="最小化">'+svg('minus',13)+'</span>'+
+      '<span class="win-btn max" title="最大化">'+svg('square',13)+'</span>'+
+      '<span class="win-btn close" title="关闭">'+svg('close',13)+'</span>'+
+    '</div>'+
+    '<div class="win-body">'+bodyHTML+'</div>'+
+    '<span class="rz n"></span><span class="rz s"></span><span class="rz e"></span><span class="rz w"></span>'+
+    '<span class="rz ne"></span><span class="rz nw"></span><span class="rz se"></span><span class="rz sw"></span>';
+
+  document.body.appendChild(el);
+
+  const win = { id:a.id, app:a, el, minimized:false, maximized:false, prev:null,
+    restore(){ this.minimized=false; this.el.classList.remove('minimized'); focusWin(this); },
+    minimize(){ this.minimized=true; this.el.classList.add('minimized'); renderTaskbar(); },
+    toggleMax(){ this.maximize(); },
+    maximize(){
+      if(this.maximized){
+        this.maximized=false; this.el.classList.remove('maximized');
+        Object.assign(this.el.style, this.prev);
+        this.el.querySelector('.win-btn.max').innerHTML = svg('square',13);
+      } else {
+        this.prev = {left:this.el.style.left, top:this.el.style.top, width:this.el.style.width, height:this.el.style.height};
+        this.maximized=true; this.el.classList.add('maximized');
+        this.el.style.left='0px'; this.el.style.top='36px';
+        this.el.style.width='100%'; this.el.style.height=(innerHeight-36-42)+'px';
+        this.el.querySelector('.win-btn.max').innerHTML = svg('restore',13);
+      }
+    },
+    close(){
+      delete windows[this.id];
+      this.el.remove();
+      renderTaskbar(); renderDock();
+    }
+  };
+  windows[a.id] = win;
+
+  // 事件
+  el.addEventListener('pointerdown', ()=>focusWin(win));
+  const tb = el.querySelector('.win-titlebar');
+  tb.querySelector('.min').onclick = ()=>win.minimize();
+  tb.querySelector('.max').onclick = ()=>win.maximize();
+  tb.querySelector('.close').onclick = ()=>win.close();
+  // 拖动
+  tb.addEventListener('pointerdown', e=>{
+    if(e.target.closest('.win-btn')) return;
+    if(win.maximized) return;
+    focusWin(win);
+    const sx=e.clientX, sy=e.clientY, ox=parseFloat(el.style.left), oy=parseFloat(el.style.top);
+    const move=(ev)=>{ el.style.left=Math.min(innerWidth-120, Math.max(-el.offsetWidth+120, ox+ev.clientX-sx))+'px';
+                        el.style.top =Math.min(innerHeight-60, Math.max(36, oy+ev.clientY-sy))+'px'; };
+    const up=()=>{ removeEventListener('pointermove',move); removeEventListener('pointerup',up); };
+    addEventListener('pointermove',move); addEventListener('pointerup',up);
+  });
+  // 缩放
+  el.querySelectorAll('.rz').forEach(h=>{
+    h.addEventListener('pointerdown', e=>{
+      e.preventDefault(); e.stopPropagation(); focusWin(win);
+      const dir=h.className.split(' ')[1];
+      const sx=e.clientX, sy=e.clientY;
+      const o={l:parseFloat(el.style.left), t:parseFloat(el.style.top), w:el.offsetWidth, h:el.offsetHeight};
+      const move=(ev)=>{
+        const dx=ev.clientX-sx, dy=ev.clientY-sy; let {l,t,w,h:hh}=o;
+        if(dir.includes('e')) w=Math.max(340, o.w+dx);
+        if(dir.includes('s')) hh=Math.max(240, o.h+dy);
+        if(dir.includes('w')){ w=Math.max(340, o.w-dx); l=o.l+ (o.w-w); }
+        if(dir.includes('n')){ hh=Math.max(240, o.h-dy); t=Math.max(36, o.t+(o.h-hh)); }
+        el.style.width=w+'px'; el.style.height=hh+'px'; el.style.left=l+'px'; el.style.top=t+'px';
+      };
+      const up=()=>{ removeEventListener('pointermove',move); removeEventListener('pointerup',up); };
+      addEventListener('pointermove',move); addEventListener('pointerup',up);
+    });
+  });
+
+  focusWin(win);
+  if(a.app==='terminal') initTerminal(el.querySelector('#terminal'));
+  renderTaskbar(); renderDock();
+}
+function focusWin(win){
+  if(win.minimized) return;
+  zTop++; win.el.style.zIndex = zTop;
+  Object.values(windows).forEach(w=>w.el.classList.remove('focused'));
+  win.el.classList.add('focused');
+  renderTaskbar();
+}
+
+/* ==========================================================================
+   桌面图标 / Dock / 顶栏 / 任务栏 / 应用网格
+   ========================================================================== */
+function renderDesktopIcons(){
+  const host = $('#desktop-icons'); host.innerHTML='';
+  (CFG.desktopIcons||[]).forEach(a=>{
+    const d=document.createElement('div');
+    d.className='dicon'; d.dataset.id=a.id;
+    d.innerHTML='<div class="ico">'+iconHTML(a.icon,26)+'</div><div class="lbl">'+a.label+'</div>';
+    d.addEventListener('click', e=>{ e.stopPropagation(); selectIcon(d); });
+    d.addEventListener('dblclick', ()=>openApp(a.id));
+    host.appendChild(d);
+  });
+}
+function selectIcon(el){
+  document.querySelectorAll('.dicon').forEach(x=>x.classList.remove('sel'));
+  if(el){ el.classList.add('sel'); selIcon=el; }
+}
+function renderDock(){
+  const d=$('#dock'); d.innerHTML='';
+  (CFG.dockIcons||[]).forEach(a=>{
+    const it=document.createElement('div');
+    it.className='dock-item'+(windows[a.id]?' running':'');
+    it.innerHTML=iconHTML(a.icon,24)+'<span class="dock-tip">'+a.label+'</span>';
+    it.onclick=()=>{
+      if(windows[a.id]){ const w=windows[a.id]; if(w.minimized) w.restore(); else if(w.el.classList.contains('focused')) w.minimize(); else focusWin(w); }
+      else openApp(a.id);
+    };
+    d.appendChild(it);
+  });
+}
+function renderTopbar(){
+  $('#tb-hostname').textContent = CFG.hostname||'uwa';
+  $('#act-ico').innerHTML = svg('apps',16);
+  const tray=$('#tb-tray'); tray.innerHTML='';
+  (CFG.tray||[]).forEach(t=>{
+    const b=document.createElement('span'); b.className='tb-ico'; b.title=t.label;
+    b.innerHTML=iconHTML(t.icon,16); tray.appendChild(b);
+  });
+  const power=document.createElement('span'); power.className='tb-ico'; power.title='重新加载';
+  power.innerHTML=svg('refresh',16);
+  power.onclick=()=>location.reload();
+  tray.appendChild(power);
+  const user=document.createElement('span'); user.className='tb-ico'; user.title=CFG.username;
+  user.innerHTML=svg('user',16); tray.appendChild(user);
+}
+function tickClock(){
+  const d=new Date();
+  const h=d.getHours(), m=d.getMinutes();
+  const hm = CFG.clock24 ? (String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')) :
+                           ((h%12||12)+':'+String(m).padStart(2,'0')+(h>=12?' PM':' AM'));
+  $('#tb-clock').textContent = (d.getMonth()+1)+'月'+d.getDate()+'日 '+hm;
+}
+function renderTaskbar(){
+  const host=$('#task-btns'); host.innerHTML='';
+  Object.values(windows).forEach(w=>{
+    const b=document.createElement('button');
+    b.className='task-btn'+(w.el.classList.contains('focused')&&!w.minimized?' active':'');
+    b.innerHTML=iconHTML(w.app.icon,16)+'<span class="t">'+w.app.label+'</span>';
+    b.onclick=()=>{ if(w.minimized) w.restore(); else if(w.el.classList.contains('focused')) w.minimize(); else focusWin(w); };
+    host.appendChild(b);
+  });
+  const show=document.createElement('button');
+  show.className='task-btn'; show.title='显示桌面';
+  show.innerHTML=svg('window',16)+'<span class="t">显示桌面</span>';
+  show.onclick=()=>Object.values(windows).forEach(w=>w.minimize());
+  host.appendChild(show);
+  $('#task-ws').innerHTML='<span class="ws cur">1</span><span class="ws">2</span><span class="ws">3</span>';
+}
+function renderAppGrid(){
+  const g=$('#ag-grid'); g.innerHTML='';
+  Object.values(APPS).forEach(a=>{
+    const it=document.createElement('div'); it.className='ag-item';
+    it.innerHTML='<div class="ico">'+iconHTML(a.icon,28)+'</div><div class="lbl">'+a.label+'</div>';
+    it.onclick=()=>{ $('#appgrid').classList.remove('show'); openApp(a.id); };
+    g.appendChild(it);
+  });
+}
+/* 右键菜单 */
+function showMenu(x,y,items){
+  const m=$('#ctxmenu'); m.innerHTML='';
+  items.forEach(it=>{
+    if(it==='-'){ const s=document.createElement('div'); s.className='ctx-sep'; m.appendChild(s); return; }
+    const d=document.createElement('div'); d.className='ctx-item';
+    d.innerHTML=iconHTML(it.icon,15)+'<span>'+it.label+'</span>';
+    d.onclick=()=>{ hideMenu(); it.fn&&it.fn(); };
+    m.appendChild(d);
+  });
+  m.style.display='block';
+  m.style.left=Math.min(x, innerWidth-200)+'px';
+  m.style.top =Math.min(y, innerHeight-m.offsetHeight-8)+'px';
+}
+function hideMenu(){ $('#ctxmenu').style.display='none'; }
+function notify(text){
+  const n=$('#notify'); n.textContent=text; n.classList.add('show');
+  setTimeout(()=>n.classList.remove('show'), 3200);
+}
+
+/* ==========================================================================
+   终端（装饰性，但能执行几条命令）
+   ========================================================================== */
+function initTerminal(term){
+  term.innerHTML='';
+  const print=(txt,cls)=>{ const l=document.createElement('div'); l.className='line '+(cls||''); l.textContent=txt; term.appendChild(l); term.scrollTop=term.scrollHeight; };
+  const now=new Date().toLocaleString('zh-CN');
+  print('UWA Desktop 终端 —— 输入 help 查看可用命令','accent');
+  print('', '');
+  print(CFG.username+'@'+CFG.hostname+':~$ 输入 help 查看命令','in');
+  const inputLine=document.createElement('div'); inputLine.id='term-input';
+  inputLine.innerHTML='<span class="ps">'+CFG.username+'@'+CFG.hostname+':~$</span><input id="term-cmd" autocomplete="off" spellcheck="false">';
+  term.appendChild(inputLine);
+  const inp=$('#term-cmd'); inp.focus();
+  term.addEventListener('click', ()=>inp.focus());
+
+  const exec=(raw)=>{
+    const cmd=(raw||'').trim(); if(!cmd) return;
+    print(CFG.username+'@'+CFG.hostname+':~$ '+cmd,'in');
+    const [c,...args]=cmd.split(/\s+/); const arg=args.join(' ');
+    switch(c){
+      case 'help':
+        print('可用命令: help, ls, pwd, whoami, date, neofetch, open <应用id>, apps, clear', 'ok'); break;
+      case 'ls': print('Desktop  Documents  Downloads  plugins  README.md','ok'); break;
+      case 'pwd': print('/home/'+CFG.username,'ok'); break;
+      case 'whoami': print(CFG.username,'ok'); break;
+      case 'date': print(new Date().toString(),'ok'); break;
+      case 'apps': print('应用: '+Object.keys(APPS).join(', '),'ok'); break;
+      case 'open':
+        if(APPS[arg]){ openApp(arg); print('已打开 '+arg,'ok'); }
+        else print('未知应用: '+arg+'（可用 apps 查看）','err'); break;
+      case 'clear': term.innerHTML=''; break;
+      case 'neofetch':
+        print('         _,met$$$$$gg.','accent');
+        print('      ,g$$$$$$$$$$$$$$$P.','accent');
+        print('    ,g$$P"     """Y$$.".','accent');
+        print('   ,$$P\'              `$$$.','accent');
+        print('  \',$$P       ,ggs.     `$$b:','accent');
+        print('  `d$$\'     ,$P"\'   .    $$$','accent');
+        print('   $$P      d$\'     ,    $$P','accent');
+        print('   $$:      $$.   -    ,d$$\'','accent');
+        print('   $$;      Y$b._   _,d$P\'','accent');
+        print('   Y$$.    `.`"Y$$$$P"\'','accent');
+        print('   `$$b      "-.__','accent');
+        print('    `Y$$','accent');
+        print('     `Y$$.','accent');
+        print('       `$$b.','accent');
+        print('         `Y$$b.','accent');
+        print('            `"Y$b._','accent');
+        print('                `"""','accent');
+        print('','');
+        print('  OS       UWA Desktop (plugin)');
+        print('  Host     '+CFG.hostname);
+        print('  User     '+CFG.username);
+        print('  Accent   '+CFG.accent);
+        print('  Windows  '+Object.keys(windows).length+' 打开');
+        print('  Time     '+now);
+        break;
+      default: print('命令未找到: '+c+'（输入 help）','err');
+    }
+    term.scrollTop=term.scrollHeight;
+  };
+  inp.addEventListener('keydown', e=>{
+    if(e.key==='Enter'){ exec(inp.value); inp.value=''; }
+  });
+}
+
+/* 关于面板 */
+function aboutHTML(){
+  const V='1.0.0';
+  return '<div class="panel">'+
+    '<div class="about-logo">'+svg('window',30)+'</div>'+
+    '<div class="about-h" style="text-align:center">UWA Desktop</div>'+
+    '<div class="about-sub" style="text-align:center">GNOME 风格桌面控制台 · 插件 v'+V+'</div>'+
+    '<div class="about-row"><span class="k">系统</span><span>'+CFG.hostname+'</span></div>'+
+    '<div class="about-row"><span class="k">用户</span><span>'+CFG.username+'</span></div>'+
+    '<div class="about-row"><span class="k">强调色</span><span>'+CFG.accent+'</span></div>'+
+    '<div class="about-row"><span class="k">窗口</span><span>'+Object.keys(windows).length+' 个</span></div>'+
+    '<div class="about-row"><span class="k">应用</span><span>'+Object.keys(APPS).length+' 个</span></div>'+
+    '<p style="margin-top:14px;color:var(--text-dim)">所有设置与教程均以窗口形式打开。桌面图标、Dock、托盘可在 '+
+    '<code>UWA_DESKTOP_CONFIG</code> 中配置。</p>'+
+  '</div>';
+}
+
+/* ==========================================================================
+   启动
+   ========================================================================== */
+function boot(){
+  if(CFG.wallpaper && CFG.wallpaper!=='gradient'){
+    $('#wallpaper').style.background = CFG.wallpaper;
+  }
+  renderTopbar(); renderDesktopIcons(); renderDock(); renderTaskbar(); renderAppGrid();
+  tickClock(); setInterval(tickClock, 1000);
+
+  $('#btn-activities').onclick = e=>{ e.stopPropagation(); $('#appgrid').classList.toggle('show'); };
+  $('#appgrid').addEventListener('click', e=>{ if(e.target.id==='appgrid') e.target.classList.remove('show'); });
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ $('#appgrid').classList.remove('show'); hideMenu(); } });
+
+  // 桌面空白处：取消选择 / 右键菜单
+  document.addEventListener('pointerdown', e=>{
+    if(e.target.id==='wallpaper' || e.target.id==='desktop-icons' || e.target.closest('#desktop-icons')){
+      selectIcon(null);
+    }
+    hideMenu();
+  });
+  document.addEventListener('contextmenu', e=>{
+    if(e.target.id==='wallpaper' || e.target.id==='desktop-icons'){
+      e.preventDefault();
+      showMenu(e.clientX, e.clientY, [
+        {icon:'terminal', label:'打开终端', fn:()=>openApp('terminal')},
+        {icon:'settings', label:'打开设置', fn:()=>openApp('settings')},
+        '-',
+        {icon:'refresh', label:'刷新桌面', fn:()=>location.reload()},
+        {icon:'info', label:'关于', fn:()=>openApp('about')},
+      ]);
+    }
+  });
+
+  // 开机通知
+  setTimeout(()=>notify('欢迎使用 '+CFG.hostname+' · 双击桌面图标或点击 Dock 打开窗口'), 500);
+}
+boot();
+</script>
+</body>
+</html>

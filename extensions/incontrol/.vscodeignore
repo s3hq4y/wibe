@@ -1,0 +1,114 @@
+.vscode/**
+.vscode-test/**
+build/**
+src/**
+.gitignore
+.yarnrc
+vsc-extension-quickstart.md
+**/tsconfig.json
+**/.eslintrc.json
+**/*.map
+**/*.ts
+**/.env
+**/env
+node_modules/**
+
+**/.pytest_cache
+**/__pycache__
+
+manual-testing-sandbox
+esbuild.js
+importMetaUrl.js
+scripts
+
+server/exe/**
+!out/node_modules/**
+
+# Do not ship esbuild in VSIX
+out/node_modules/esbuild/**
+out/node_modules/@esbuild/**
+
+# --- standalone (flattened) layout additions ---------------------------------
+# In this folder core/, gui/ and packages/ are vendored inside the extension
+# root instead of being siblings of extensions/vscode. They are build-time
+# inputs (everything is bundled into out/extension.js by esbuild), and the
+# webview only needs <ext>/gui/assets and gui/fonts, so keep the rest out of
+# the VSIX. Note that
+# "node_modules/**" above only matches the root one, hence the explicit
+# nested entries here.
+core/**
+packages/**
+gui/node_modules/**
+gui/core_modules/**
+gui/dist/**
+gui/src/**
+gui/public/**
+gui/index.html
+gui/indexConsole.html
+gui/package.json
+gui/package-lock.json
+gui/*.config.cjs
+gui/.eslintrc.json
+.incontrol-backup-before-completion/**
+__cmp_incontrol.js
+check_refs.js
+build_pkg.log
+
+# build logs and scratch files that must not ship
+*.log
+__inspect_vsix.ps1
+__cmp_incontrol.js
+prepackage.log
+*.ps1
+__*
+**/__*
+**/__*/**
+
+# --- portal / scratch: 调试工具与临时脚本目录，绝不能进产品包 -----------------
+.portal/**
+.portal-tmp/**
+
+# --- root-level scratch files -------------------------------------------------
+build_script.sh
+check_clean.sh
+check_vsix.sh
+find_gradient.sh
+fix_build_step1.sh
+hello_remote.sh
+inspect_script.sh
+verify_new.sh
+
+# --- dropped features: local embeddings model + onnxruntime binaries ----------
+# @codebase / @docs indexing (LanceDB) and the bundled all-MiniLM-L6-v2
+# embedding model were removed from the source tree. Stale folders from older
+# builds may still exist on a developer machine, so keep them out of the VSIX.
+models/**
+bin/**
+gui/textmate-syntaxes/**
+# ripgrep is no longer bundled either (@search reuses VS Code's own rg)
+out/node_modules/@vscode/ripgrep/**
+
+
+# --- size trimming: keep workerpool runtime (src/) out of the VSIX ----------
+# NODE_MODULES_TO_COPY in prepackage-standalone.js now copies only src/ +
+# package.json for workerpool; these rules belt-and-suspender the dist maps,
+# type declarations and docs out of the package.
+out/node_modules/**/*.map
+out/node_modules/**/*.md
+out/node_modules/**/types/**
+out/node_modules/**/dist/**
+
+# --- size trimming: tag/code-snippet queries for grammars we do not ship ----
+# (kept in sync with DROPPED_TREE_SITTER_WASMS in prepackage-standalone.js)
+tag-qry/tree-sitter-c_sharp-tags.scm
+tag-qry/tree-sitter-elisp-tags.scm
+tag-qry/tree-sitter-elixir-tags.scm
+tag-qry/tree-sitter-ocaml-tags.scm
+tag-qry/tree-sitter-ql-tags.scm
+tag-qry/tree-sitter-ruby-tags.scm
+tree-sitter/code-snippet-queries/c_sharp.scm
+tree-sitter/code-snippet-queries/elisp.scm
+tree-sitter/code-snippet-queries/elixir.scm
+tree-sitter/code-snippet-queries/ocaml.scm
+tree-sitter/code-snippet-queries/ql.scm
+tree-sitter/code-snippet-queries/ruby.scm

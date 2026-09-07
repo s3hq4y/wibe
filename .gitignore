@@ -57,3 +57,17 @@ dist
 
 # LFS test fixtures not present in source snapshot
 extensions/copilot/test/simulation/cache/
+
+# uwa sidecar runtime artifacts
+resources/uwa-sidecar/venv/
+resources/uwa-sidecar/logs/
+resources/uwa-sidecar/temp/
+resources/uwa-sidecar/chrome_profile/
+resources/uwa-sidecar/__pycache__/
+resources/uwa-sidecar/**/__pycache__/
+resources/uwa-sidecar/download_images/
+
+# incontrol build artifacts
+extensions/incontrol/out/
+extensions/incontrol/gui/dist/
+extensions/incontrol/**/node_modules/

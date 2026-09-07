@@ -1,0 +1,12 @@
+This plugin (uwa_desktop) has been DISABLED (soft) on 2026-09-02.
+
+Reason : user asked to cancel the desktop plugin and restore the original mode.
+Effect : plugin_host/loader.py only scans direct child dirs of uwa-plugins/ that
+         contain plugin.json, so uwa-plugins/_disabled/uwa_desktop is never loaded.
+         -> DASHBOARD_FILE is no longer set, so / and /dashboard serve the original
+            static/index.html again.
+         -> static/controlled-browser-guide.html was restored from HEAD (git blob
+            192bde7d, identical to the guide.original.html backup).
+
+To re-enable: move this folder back to uwa-plugins/uwa_desktop
+    Move-Item uwa-plugins\_disabled\uwa_desktop uwa-plugins\uwa_desktop
