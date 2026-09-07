@@ -81,3 +81,5 @@ extensions/incontrol/out/
 extensions/incontrol/src/.buildTimestamp.ts
 extensions/incontrol/packages/*/dist/
 extensions/incontrol/_tsc*.log
+
+_build*.log

@@ -18,6 +18,11 @@
     "core/dist/**/*",
     "core/**/*.test.ts",
     "core/**/test/**/*",
-    "core/**/*.skip.ts"
+    "core/**/*.skip.ts",
+    // vitest specs are not part of the shipped build and several reference
+    // helper modules trimmed out of incon-mini; gulp typechecks the whole
+    // folder, so leaving them in turns dead tests into hard build failures.
+    "core/**/*.vitest.ts",
+    "src/**/*.vitest.ts"
   ]
 }

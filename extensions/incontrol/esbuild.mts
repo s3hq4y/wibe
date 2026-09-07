@@ -92,10 +92,18 @@ run({
 			'sqlite3',
 			'@vscode/sqlite3',
 			'web-tree-sitter',
+			// win-ca (transitive dep of core/util/ca setupCa) ships prebuilt
+			// crypt32-*.node addons and resolves them via a computed require
+			// on process.arch, which esbuild cannot statically bundle.
+			'win-ca',
+			'mac-ca',
+			'esbuild',
 		],
 		// core/ 里有大量 CommonJS 依赖，保持 cjs 输出避免 ESM 互操作问题
 		format: 'cjs',
 		// tree-sitter 的 wasm 以文件形式加载
-		loader: { '.wasm': 'file' },
+		// .node addons are emitted as files rather than inlined; anything
+		// still reachable at build time must not abort the bundle.
+		loader: { '.wasm': 'file', '.node': 'file' },
 	},
 }, process.argv, copyAssets);
