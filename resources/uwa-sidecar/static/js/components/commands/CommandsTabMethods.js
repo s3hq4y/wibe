@@ -1,0 +1,2613 @@
+// ==================== CommandsTab Methods ====================
+window.CommandsTabMethods = {
+        async apiRequest(url, options) {
+            const token = window.getDashboardAuthToken ? window.getDashboardAuthToken() : '';
+            const headers = { 'Content-Type': 'application/json', ...(options || {}).headers };
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+            const response = await fetch(url, { ...options, headers });
+            if (!response.ok) {
+                const err = await response.json().catch(() => ({}));
+                const detail = err.detail;
+                let message = 'HTTP ' + response.status;
+                if (typeof detail === 'string' && detail) {
+                    message = detail;
+                } else if (detail && typeof detail === 'object') {
+                    try {
+                        message = JSON.stringify(detail, null, 2);
+                    } catch (_) {
+                        message = String(detail);
+                    }
+                }
+                throw new Error(message);
+            }
+            return response.json();
+        },
+
+        makeCommandsResponseSignature(data) {
+            try {
+                return JSON.stringify(Array.isArray(data && data.commands) ? data.commands : []);
+            } catch (e) {
+                return '';
+            }
+        },
+
+        async fetchCommands() {
+            const requestSeq = Number(this.fetchCommandsSeq || 0) + 1;
+            this.fetchCommandsSeq = requestSeq;
+            this.loading = true;
+            try {
+                const data = await this.apiRequest('/api/commands');
+                if (requestSeq !== this.fetchCommandsSeq) {
+                    return this.commands;
+                }
+                const signature = this.makeCommandsResponseSignature(data);
+                const signatureChanged = !signature || signature !== this.commandsResponseSignature;
+                if (signatureChanged) {
+                    this.commands = (data.commands || []).map(cmd => this.normalizeCommand(cmd));
+                    this.commandsResponseSignature = signature;
+                    const validIds = new Set(this.commands.map(cmd => cmd.id));
+                    const nextSelectedCommandIds = (this.selectedCommandIds || []).filter(id => validIds.has(id));
+                    if (
+                        nextSelectedCommandIds.length !== (this.selectedCommandIds || []).length
+                        || nextSelectedCommandIds.some((id, index) => id !== this.selectedCommandIds[index])
+                    ) {
+                        this.selectedCommandIds = nextSelectedCommandIds;
+                    }
+                    this.syncGroupCollapseState();
+                    this.syncSourceCommandPickerState();
+                    const hasExistingSelection = (this.commandGroups || []).some(group => group.name === this.selectedExistingGroupName);
+                    if (!hasExistingSelection) {
+                        this.selectedExistingGroupName = this.commandGroups[0]?.name || '';
+                    }
+                    this.clearGroupDragState();
+                    this.ensureValidPage();
+                }
+                if (this.error) {
+                    this.error = null;
+                }
+            } catch (e) {
+                if (requestSeq !== this.fetchCommandsSeq) {
+                    return this.commands;
+                }
+                this.$emit('notify', { type: 'error', message: '加载命令失败: ' + e.message });
+            } finally {
+                if (requestSeq === this.fetchCommandsSeq) {
+                    this.loading = false;
+                }
+            }
+            return this.commands;
+        },
+
+        normalizeAction(action, index = 0) {
+            const next = { ...(action || {}) };
+            if (!next.action_id) {
+                next.action_id = 'step_' + (index + 1);
+            }
+            if (next.type === 'switch_preset') {
+                next.type = 'execute_preset';
+            }
+            if (next.type === 'execute_workflow' && next.prompt === undefined) {
+                next.prompt = '';
+            }
+            if (['execute_preset', 'execute_workflow'].includes(next.type)) {
+                next.preset_name = this.normalizePresetActionValue(next.preset_name);
+            }
+            this.initClickAction(next);
+            this.initProxyAction(next);
+            this.initWebhookAction(next);
+            this.initNapcatAction(next);
+            this.initCommandGroupAction(next);
+            this.initReleaseLockAction(next);
+            this.initAutomationAction(next);
+            this.initHttpRequestAction(next);
+            this.initAppendFileAction(next);
+            this.initRunJsFileAction(next);
+            // 新增：run_js / 人机验证点击 / 中止任务的参数默认值
+            this.initRunJsAction(next);
+            this.initCaptchaChallengeAction(next);
+            this.initAbortTaskAction(next);
+            // 记录初始类型，供 handleActionTypeChange 判断语义分组是否真的变化
+            this.rememberActionType(next);
+            return next;
+        },
+
+        getFollowDefaultPresetValue() {
+            return '__DEFAULT__';
+        },
+
+        normalizePresetActionValue(value) {
+            const normalized = String(value || '').trim();
+            return normalized || this.getFollowDefaultPresetValue();
+        },
+
+        getFollowDefaultPresetLabel() {
+            return '跟随站点默认预设';
+        },
+
+        normalizeCommandLogLevel(level) {
+            const normalized = String(level || 'GLOBAL').trim().toUpperCase();
+            return ['GLOBAL', 'DEBUG', 'INFO', 'WARNING', 'ERROR'].includes(normalized)
+                ? normalized
+                : 'GLOBAL';
+        },
+
+        normalizeCommand(command) {
+            const normalized = JSON.parse(JSON.stringify(command || {}));
+            normalized.advanced_ui = this.normalizeAdvancedUi(normalized.advanced_ui);
+            normalized.trigger = normalized.trigger || {
+                type: 'request_count',
+                value: 10,
+                command_id: '',
+                command_ids: [],
+                listen_all_commands: false,
+                informative_only: true,
+                action_ref: '',
+                match_rule: 'equals',
+                expected_value: '',
+                match_mode: 'keyword',
+                status_codes: '403,429,500,502,503,504',
+                abort_on_match: true,
+                scope: 'all',
+                domain: '',
+                tab_index: null,
+                priority: 2,
+                fire_mode: 'edge',
+                cooldown_sec: 0,
+                stable_for_sec: 0,
+                check_while_busy_workflow: true,
+                allow_during_workflow: false,
+                interrupt_policy: 'auto',
+                interrupt_message: '',
+                probe_js: '',
+                periodic_enabled: true,
+                periodic_interval_sec: 8,
+                periodic_jitter_sec: 2
+            };
+            normalized.trigger = this.ensureTriggerDefaults(normalized.trigger);
+            if (normalized.stop_on_error === undefined) {
+                normalized.stop_on_error = false;
+            }
+            if (normalized.log_enabled === undefined) {
+                normalized.log_enabled = true;
+            } else {
+                normalized.log_enabled = !!normalized.log_enabled;
+            }
+            normalized.log_level = this.normalizeCommandLogLevel(normalized.log_level);
+            if (normalized.trigger.command_id === undefined) {
+                normalized.trigger.command_id = '';
+            }
+            if (normalized.group_name === undefined || normalized.group_name === null) {
+                normalized.group_name = '';
+            } else {
+                normalized.group_name = String(normalized.group_name).trim();
+            }
+            normalized.actions = (normalized.actions || []).map((action, index) => this.normalizeAction(action, index));
+            return normalized;
+        },
+
+        normalizeAdvancedUi(ui) {
+            const next = { ...(ui || {}) };
+            const kind = String(next.kind || '').trim().toLowerCase();
+            next.kind = kind === 'form' ? 'form' : 'none';
+            next.title = String(next.title || '').trim();
+            next.description = String(next.description || '').trim();
+            next.results_enabled = !!next.results_enabled;
+            next.fields = Array.isArray(next.fields)
+                ? next.fields
+                    .filter(field => field && typeof field === 'object')
+                    .map(field => this.normalizeAdvancedUiField(field))
+                    .filter(field => !!field.key)
+                : [];
+            const values = next.values && typeof next.values === 'object' && !Array.isArray(next.values)
+                ? { ...next.values }
+                : {};
+            for (const field of next.fields) {
+                if (!field || !field.key) continue;
+                if (!Object.prototype.hasOwnProperty.call(values, field.key)) {
+                    values[field.key] = this.getAdvancedUiFieldDefaultValue(field);
+                }
+            }
+            next.values = values;
+            return next;
+        },
+
+        normalizeAdvancedUiField(field) {
+            const kind = String(field?.type || 'text').trim().toLowerCase();
+            const type = ['text', 'textarea', 'number', 'boolean', 'select', 'password', 'rule_list', 'image'].includes(kind)
+                ? kind
+                : 'text';
+            const options = Array.isArray(field?.options) ? field.options.filter(option => option !== undefined && option !== null).map(option => {
+                if (option && typeof option === 'object') {
+                    return {
+                        label: String(option.label || option.value || '').trim(),
+                        value: option.value !== undefined ? option.value : option.label,
+                    };
+                }
+                const value = String(option ?? '').trim();
+                return { label: value, value };
+            }).filter(option => option.label || option.value !== '') : [];
+            return {
+                key: String(field?.key || '').trim(),
+                label: String(field?.label || '').trim(),
+                type,
+                help: String(field?.help || '').trim(),
+                placeholder: String(field?.placeholder || '').trim(),
+                default: field?.default,
+                required: !!field?.required,
+                rows: Number.isFinite(Number(field?.rows)) ? Number(field.rows) : 3,
+                options,
+                item_defaults: field?.item_defaults && typeof field.item_defaults === 'object'
+                    ? { ...field.item_defaults }
+                    : {}
+            };
+        },
+
+        getAdvancedUiFieldDefaultValue(field) {
+            if (!field) return '';
+            if (field.default !== undefined) {
+                if (field.type === 'number') {
+                    const numericDefault = Number(field.default);
+                    return Number.isFinite(numericDefault) ? numericDefault : '';
+                }
+                if (field.type === 'boolean') {
+                    return !!field.default;
+                }
+                if (field.type === 'rule_list') {
+                    return Array.isArray(field.default) ? JSON.parse(JSON.stringify(field.default)) : [];
+                }
+                return field.default;
+            }
+            if (field.type === 'boolean') {
+                return false;
+            }
+            if (field.type === 'rule_list') {
+                return [];
+            }
+            return '';
+        },
+
+        getAdvancedUiFieldValue(field) {
+            if (!field || !this.editingCommand) return '';
+            const values = this.editingCommand.advanced_ui?.values || {};
+            if (Object.prototype.hasOwnProperty.call(values, field.key)) {
+                return values[field.key];
+            }
+            if (field.default !== undefined) {
+                return field.default;
+            }
+            if (field.type === 'boolean') {
+                return false;
+            }
+            if (field.type === 'number') {
+                return '';
+            }
+            return '';
+        },
+
+        setAdvancedUiFieldValue(field, value) {
+            if (!this.editingCommand || !field || !field.key) return;
+            const nextValues = { ...(this.editingCommand.advanced_ui?.values || {}) };
+            nextValues[field.key] = field.type === 'number' && value !== '' && value !== null && value !== undefined
+                ? Number(value)
+                : value;
+            this.editingCommand.advanced_ui = {
+                ...(this.editingCommand.advanced_ui || {}),
+                values: nextValues
+            };
+        },
+
+        async uploadAdvancedUiImage(field, event) {
+            const input = event?.target;
+            const file = input?.files?.[0];
+            if (!file) return;
+            try {
+                if (!String(file.type || '').startsWith('image/')) {
+                    throw new Error('请选择图片文件');
+                }
+                if (file.size > 25 * 1024 * 1024) {
+                    throw new Error('图片必须小于 25 MB');
+                }
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(String(reader.result || ''));
+                    reader.onerror = () => reject(new Error('读取图片失败'));
+                    reader.readAsDataURL(file);
+                });
+                const result = await this.apiRequest('/api/commands/assets/image', {
+                    method: 'POST',
+                    body: JSON.stringify({ filename: file.name, data_url: dataUrl })
+                });
+                this.setAdvancedUiFieldValue(field, result.path || '');
+                this.$emit('notify', { type: 'success', message: '参考图片已上传' });
+            } catch (error) {
+                this.$emit('notify', { type: 'error', message: '上传图片失败: ' + error.message });
+            } finally {
+                if (input) input.value = '';
+            }
+        },
+
+        getRuleList(field) {
+            const value = this.getAdvancedUiFieldValue(field);
+            return Array.isArray(value) ? value : [];
+        },
+
+        addAdvancedRule(field) {
+            const rules = this.getRuleList(field).map(item => ({ ...item }));
+            const sequence = rules.length + 1;
+            rules.push({
+                id: 'rule-' + Date.now().toString(36) + '-' + sequence,
+                enabled: true,
+                name: '规则 ' + sequence,
+                model_name: 'model-' + sequence,
+                required_all: '',
+                required_any: '',
+                excluded: '',
+                detector_keyword: '',
+                exclude_reasoning: false,
+                drawer_group: '',
+                title_template: '《{profile}》-{model}-{index:03d}',
+                ...(field.item_defaults || {})
+            });
+            this.setAdvancedUiFieldValue(field, rules);
+            this.selectedAdvancedRuleIndex = rules.length - 1;
+        },
+
+        selectAdvancedRule(index) {
+            this.selectedAdvancedRuleIndex = Math.max(0, Number(index) || 0);
+        },
+
+        getSelectedAdvancedRule(field) {
+            const rules = this.getRuleList(field);
+            if (!rules.length) return null;
+            const index = Math.min(Math.max(0, this.selectedAdvancedRuleIndex), rules.length - 1);
+            return rules[index] || null;
+        },
+
+        getSelectedRuleResults(field) {
+            const rule = this.getSelectedAdvancedRule(field);
+            if (!rule) return [];
+            const ruleId = String(rule.id || '').trim();
+            return this.commandResults.filter(item => String(item.rule_id || '').trim() === ruleId);
+        },
+
+        updateAdvancedRule(field, index, key, value) {
+            const rules = this.getRuleList(field).map(item => ({ ...item }));
+            if (!rules[index]) return;
+            rules[index][key] = value;
+            this.setAdvancedUiFieldValue(field, rules);
+        },
+
+        removeAdvancedRule(field, index) {
+            const rules = this.getRuleList(field).map(item => ({ ...item }));
+            rules.splice(index, 1);
+            this.setAdvancedUiFieldValue(field, rules);
+            this.selectedAdvancedRuleIndex = Math.max(0, Math.min(this.selectedAdvancedRuleIndex, rules.length - 1));
+        },
+
+        async loadCommandResults(silent = false) {
+            if (!this.editingCommand?.id || this.isNew || !this.advancedUiResultsEnabled) {
+                this.commandResultsRequestSeq += 1;
+                this.commandResults = [];
+                return;
+            }
+            if (silent && this.commandResultsLoading) return;
+            const commandId = String(this.editingCommand.id);
+            const requestSeq = (this.commandResultsRequestSeq || 0) + 1;
+            this.commandResultsRequestSeq = requestSeq;
+            if (!silent) this.commandResultsLoading = true;
+            try {
+                const data = await this.apiRequest('/api/commands/' + encodeURIComponent(commandId) + '/results');
+                if (
+                    requestSeq !== this.commandResultsRequestSeq
+                    || String(this.editingCommand?.id || '') !== commandId
+                    || !this.showEditor
+                ) {
+                    return;
+                }
+                this.commandResults = Array.isArray(data.records) ? data.records : [];
+            } catch (e) {
+                if (!silent && requestSeq === this.commandResultsRequestSeq) {
+                    this.$emit('notify', { type: 'error', message: '加载结果失败: ' + e.message });
+                }
+            } finally {
+                if (!silent && requestSeq === this.commandResultsRequestSeq) {
+                    this.commandResultsLoading = false;
+                }
+            }
+        },
+
+        async clearCommandResults() {
+            if (!this.editingCommand?.id || !window.confirm('确定清空这个命令的全部持久化结果吗？')) return;
+            const commandId = String(this.editingCommand.id);
+            try {
+                await this.apiRequest('/api/commands/' + encodeURIComponent(commandId) + '/results', { method: 'DELETE' });
+                if (String(this.editingCommand?.id || '') !== commandId || !this.showEditor) return;
+                this.commandResultsRequestSeq += 1;
+                this.commandResults = [];
+                this.$emit('notify', { type: 'success', message: '结果已清空' });
+            } catch (error) {
+                this.$emit('notify', { type: 'error', message: '清空结果失败: ' + error.message });
+            }
+        },
+
+        async clearSelectedRuleResults(field) {
+            const rule = this.getSelectedAdvancedRule(field);
+            if (!this.editingCommand?.id || !rule?.id) return;
+            if (!window.confirm('确定清空当前模板的持久化结果吗？')) return;
+            const commandId = String(this.editingCommand.id);
+            const ruleId = String(rule.id);
+            const url = '/api/commands/' + encodeURIComponent(commandId)
+                + '/results?rule_id=' + encodeURIComponent(rule.id);
+            try {
+                await this.apiRequest(url, { method: 'DELETE' });
+                if (String(this.editingCommand?.id || '') !== commandId || !this.showEditor) return;
+                this.commandResultsRequestSeq += 1;
+                this.commandResults = this.commandResults.filter(item => String(item.rule_id) !== ruleId);
+                this.$emit('notify', { type: 'success', message: '当前模板结果已清空' });
+            } catch (error) {
+                this.$emit('notify', { type: 'error', message: '清空当前模板结果失败: ' + error.message });
+            }
+        },
+
+        formatCommandResultTime(value) {
+            const date = new Date(Number(value || 0) * 1000);
+            return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+        },
+
+        getAdvancedUiDefaultText() {
+            return '此高级命令无UI';
+        },
+
+        getAdvancedUiModeLabel() {
+            return this.advancedEditorMode === 'code' ? '查看UI' : '查看代码';
+        },
+
+        toggleAdvancedEditorMode() {
+            this.advancedEditorMode = this.advancedEditorMode === 'code' ? 'ui' : 'code';
+        },
+
+        ensureTriggerDefaults(trigger) {
+            const next = { ...(trigger || {}) };
+            if (next.command_id === undefined) next.command_id = '';
+            if (!Array.isArray(next.command_ids)) {
+                if (typeof next.command_ids === 'string' && next.command_ids.trim()) {
+                    next.command_ids = next.command_ids.split(',').map(item => item.trim()).filter(Boolean);
+                } else {
+                    next.command_ids = [];
+                }
+            }
+            if (next.listen_all_commands === undefined) next.listen_all_commands = false;
+            if (next.informative_only === undefined) next.informative_only = true;
+            if (next.action_ref === undefined) next.action_ref = '';
+            if (!next.match_rule) next.match_rule = 'equals';
+            if (next.expected_value === undefined || next.expected_value === null) next.expected_value = '';
+            if (!next.match_mode) next.match_mode = 'keyword';
+            if (!next.status_codes) next.status_codes = '403,429,500,502,503,504';
+            if (next.abort_on_match === undefined) next.abort_on_match = true;
+            if (!next.fire_mode) next.fire_mode = 'edge';
+            const cooldown = Number(next.cooldown_sec);
+            next.cooldown_sec = Number.isFinite(cooldown) && cooldown >= 0 ? cooldown : 0;
+            const stableFor = Number(next.stable_for_sec);
+            next.stable_for_sec = Number.isFinite(stableFor) && stableFor >= 0 ? stableFor : 0;
+            if (next.check_while_busy_workflow === undefined) next.check_while_busy_workflow = true;
+            if (next.allow_during_workflow === undefined) next.allow_during_workflow = false;
+            if (!next.interrupt_policy) next.interrupt_policy = 'auto';
+            if (next.interrupt_message === undefined || next.interrupt_message === null) next.interrupt_message = '';
+            if (next.probe_js === undefined || next.probe_js === null) next.probe_js = '';
+            if (next.reset_latch_on_failure === undefined || next.reset_latch_on_failure === null) {
+                next.reset_latch_on_failure = true;
+            } else {
+                next.reset_latch_on_failure = !!next.reset_latch_on_failure;
+            }
+            if (next.once_per_request === undefined || next.once_per_request === null) {
+                next.once_per_request = false;
+            } else {
+                next.once_per_request = !!next.once_per_request;
+            }
+            const priority = Number(next.priority);
+            next.priority = Number.isInteger(priority) ? priority : 2;
+            if (!next.url_pattern && next.type === 'network_request_error') {
+                next.url_pattern = '';
+            }
+            if (next.periodic_enabled === undefined) next.periodic_enabled = true;
+            const periodicInterval = Number(next.periodic_interval_sec);
+            next.periodic_interval_sec = Number.isFinite(periodicInterval) && periodicInterval >= 1
+                ? periodicInterval
+                : 8;
+            const periodicJitter = Number(next.periodic_jitter_sec);
+            next.periodic_jitter_sec = Number.isFinite(periodicJitter) && periodicJitter >= 0
+                ? periodicJitter
+                : 2;
+            return next;
+        },
+
+        async fetchMeta() {
+            try {
+                this.meta = await this.apiRequest('/api/commands/meta');
+            } catch (e) {
+                console.error('加载元信息失败:', e);
+            }
+        },
+
+        async fetchBindingMeta() {
+            await Promise.all([
+                this.fetchAvailableDomains(),
+                this.fetchAvailableTabs()
+            ]);
+        },
+
+        async fetchAvailableDomains() {
+            try {
+                const data = await this.apiRequest('/api/config');
+                this.availableDomains = Object.keys(data || {}).sort();
+            } catch (e) {
+                console.error('加载域名列表失败:', e);
+                this.availableDomains = [];
+            }
+        },
+
+        async fetchAvailableTabs() {
+            try {
+                const data = await this.apiRequest('/api/tab-pool/tabs');
+                this.availableTabs = data.tabs || [];
+            } catch (e) {
+                console.error('加载标签页列表失败:', e);
+                this.availableTabs = [];
+            }
+        },
+
+        getBoundDomain(command = this.editingCommand) {
+            const trigger = command?.trigger || {};
+            if (trigger.scope === 'domain') {
+                return (trigger.domain || '').trim();
+            }
+            if (trigger.scope === 'tab') {
+                const targetTab = this.availableTabs.find(tab => tab.persistent_index === trigger.tab_index);
+                return (targetTab?.current_domain || '').trim();
+            }
+            return '';
+        },
+
+        getTabLabel(tab) {
+            if (!tab) return '';
+            const domain = tab.current_domain || '未识别域名';
+            return '#' + tab.persistent_index + ' · ' + domain;
+        },
+
+        getPresetHint() {
+            if (!this.editingCommand) return '先选择绑定域名或标签页，再选择要执行的预设。';
+            const scope = this.editingCommand.trigger?.scope;
+            if (scope === 'all') {
+                return '切换预设/执行工作流仅建议用于“指定域名”或“指定标签页”，也可以直接保持“跟随站点默认预设”。';
+            }
+            if (this.presetLoading) {
+                return '正在加载预设列表...';
+            }
+            if (this.resolvedPresetDomain) {
+                return '当前目标域名: ' + this.resolvedPresetDomain + '，也可保持“跟随站点默认预设”。';
+            }
+            if (scope === 'tab') {
+                return '所选标签页当前没有可识别域名，暂时无法列出预设，但仍可保持“跟随站点默认预设”。';
+            }
+            return '请输入已配置的域名后再选择预设，或保持“跟随站点默认预设”。';
+        },
+
+        getPresetSelectPlaceholder() {
+            if (!this.editingCommand) return '请先配置触发范围';
+            if (this.presetLoading) return '正在加载预设列表...';
+            if (!this.resolvedPresetDomain) {
+                return this.editingCommand.trigger?.scope === 'all'
+                    ? '请先切换到指定域名或指定标签页'
+                    : '请先选择有效域名';
+            }
+            if (this.availablePresets.length === 0) {
+                return '当前域名没有可用预设';
+            }
+            return '请选择预设';
+        },
+
+        getCommandTriggerPlaceholder() {
+            if (this.sourceCommandOptions.length === 0) {
+                return '没有可选命令';
+            }
+            if (this.editingCommand?.trigger?.type === 'command_result_event') {
+                return '请选择要监听的命令';
+            }
+            if (this.editingCommand?.trigger?.type === 'command_check') {
+                return '请选择检查命令';
+            }
+            return '请选择来源命令';
+        },
+
+        getTriggerTypeMeta(type) {
+            const builtins = window.CommandsTriggerTypeBuiltinMeta || {};
+            return {
+                label: (this.meta.trigger_types || {})[type] || builtins[type]?.label || type || '',
+                description: builtins[type]?.description || '用于在满足指定条件后触发动作。'
+            };
+        },
+
+        getTriggerTypeDescription(type) {
+            return this.getTriggerTypeMeta(type).description;
+        },
+
+        toggleTriggerTypePicker() {
+            if (!this.editingCommand?.trigger) return;
+            this.resetSourceCommandPicker();
+            this.triggerTypePickerOpen = !this.triggerTypePickerOpen;
+            this.triggerTypeTooltipType = this.triggerTypePickerOpen
+                ? String(this.editingCommand.trigger.type || '').trim()
+                : '';
+        },
+
+        setTriggerTypeTooltip(type) {
+            this.triggerTypeTooltipType = String(type || '').trim();
+        },
+
+        clearTriggerTypeTooltip() {
+            this.triggerTypeTooltipType = this.triggerTypePickerOpen
+                ? String(this.editingCommand?.trigger?.type || '').trim()
+                : '';
+        },
+
+        selectTriggerType(type) {
+            if (!this.editingCommand?.trigger || !type) return;
+            this.editingCommand.trigger.type = type;
+            this.triggerTypeTooltipType = String(type).trim();
+            this.triggerTypePickerOpen = false;
+            this.handleTriggerTypeChange();
+        },
+
+        getSourceCommandButtonLabel() {
+            if (this.editingCommand?.trigger?.type === 'command_result_event') {
+                const trigger = this.editingCommand.trigger || {};
+                if (trigger.listen_all_commands) {
+                    return '监听全部命令';
+                }
+                const selected = this.selectedSourceCommandOptions || [];
+                if (selected.length === 1) return selected[0].label;
+                if (selected.length > 1) return '已选择 ' + selected.length + ' 条命令';
+            }
+            const selected = this.selectedSourceCommandOption;
+            if (selected) {
+                return selected.label;
+            }
+            return this.getCommandTriggerPlaceholder();
+        },
+
+        syncSourceCommandPickerState() {
+            const next = {};
+            for (const section of (this.filteredSourceCommandSections || [])) {
+                if (section.isUngrouped) continue;
+                if (Object.prototype.hasOwnProperty.call(this.sourcePickerExpandedGroups, section.name)) {
+                    next[section.name] = !!this.sourcePickerExpandedGroups[section.name];
+                } else {
+                    next[section.name] = false;
+                }
+            }
+            this.sourcePickerExpandedGroups = next;
+        },
+
+        resetSourceCommandPicker() {
+            this.sourceCommandPickerOpen = false;
+            this.sourceCommandSearch = '';
+            this.sourcePickerShowUngrouped = false;
+            this.syncSourceCommandPickerState();
+        },
+
+        syncPageProbeExpanded() {
+            const trigger = this.editingCommand?.trigger;
+            if (!trigger || trigger.type !== 'page_check') {
+                this.pageProbeExpanded = false;
+                return;
+            }
+            this.pageProbeExpanded = !!String(trigger.probe_js || '').trim();
+        },
+
+        togglePageProbeExpanded() {
+            if (this.editingCommand?.trigger?.type !== 'page_check') return;
+            this.pageProbeExpanded = !this.pageProbeExpanded;
+        },
+
+        toggleSourceCommandPicker() {
+            if (this.sourceCommandOptions.length === 0) return;
+            this.triggerTypePickerOpen = false;
+            this.triggerTypeTooltipType = '';
+            this.sourceCommandPickerOpen = !this.sourceCommandPickerOpen;
+            if (this.sourceCommandPickerOpen) {
+                this.syncSourceCommandPickerState();
+            }
+        },
+
+        isSourceCommandSectionExpanded(section) {
+            if (!section) return false;
+            if (String(this.sourceCommandSearch || '').trim()) {
+                return true;
+            }
+            if (section.isUngrouped) {
+                return !!this.sourcePickerShowUngrouped;
+            }
+            return !!this.sourcePickerExpandedGroups[section.name];
+        },
+
+        toggleSourceCommandSection(section) {
+            if (!section) return;
+            if (section.isUngrouped) {
+                this.sourcePickerShowUngrouped = !this.sourcePickerShowUngrouped;
+                return;
+            }
+            this.sourcePickerExpandedGroups = {
+                ...this.sourcePickerExpandedGroups,
+                [section.name]: !this.isSourceCommandSectionExpanded(section)
+            };
+        },
+
+        selectSourceCommand(commandId) {
+            if (!this.editingCommand?.trigger) return;
+            if (this.editingCommand.trigger.type === 'command_result_event') {
+                const selected = new Set(this.editingCommand.trigger.command_ids || []);
+                if (selected.has(commandId)) selected.delete(commandId);
+                else selected.add(commandId);
+                this.editingCommand.trigger.command_ids = Array.from(selected);
+                this.editingCommand.trigger.listen_all_commands = false;
+                return;
+            }
+            this.editingCommand.trigger.command_id = commandId;
+            if (['command_check', 'command_result_match'].includes(this.editingCommand.trigger.type)) {
+                this.handleResultSourceChange();
+            }
+            this.sourceCommandPickerOpen = false;
+        },
+
+        toggleListenAllCommands() {
+            if (!this.editingCommand?.trigger) return;
+            const next = !this.editingCommand.trigger.listen_all_commands;
+            this.editingCommand.trigger.listen_all_commands = next;
+            if (next) {
+                this.editingCommand.trigger.command_ids = [];
+            }
+        },
+
+        isSourceCommandSelected(commandId) {
+            if (this.editingCommand?.trigger?.type === 'command_result_event') {
+                return (this.editingCommand.trigger.command_ids || []).includes(commandId);
+            }
+            return this.editingCommand?.trigger?.command_id === commandId;
+        },
+
+        getTriggerTargetLabel(trigger) {
+            const type = trigger?.type;
+            if (type === 'page_check') return '检查条件';
+            if (type === 'command_check') return '检查命令';
+            if (type === 'command_result_match') return '来源命令结果';
+            if (type === 'command_result_event') return '来源命令';
+            if (type === 'network_request_error') {
+                return trigger?.match_mode === 'regex' ? '正则表达式' : '监听 URL 规则';
+            }
+            if (type === 'command_triggered') return '来源命令';
+            return '阈值';
+        },
+
+        getCommandName(commandId) {
+            if (!commandId) return '';
+            const match = (this.commands || []).find(cmd => cmd.id === commandId);
+            return match?.name || commandId;
+        },
+
+        getCommandActionOptions(commandId) {
+            const command = (this.commands || []).find(cmd => cmd.id === commandId);
+            if (!command) return [];
+            const actions = command.actions || [];
+            return actions.map((action, idx) => {
+                const ref = action.action_id || ('step_' + (idx + 1));
+                return {
+                    value: ref,
+                    label: '#' + (idx + 1) + ' · ' + this.getActionLabel(action.type)
+                };
+            });
+        },
+
+        getActionRefLabel(commandId, actionRef) {
+            if (!actionRef) return '命令最终返回值';
+            const match = this.getCommandActionOptions(commandId).find(opt => opt.value === actionRef);
+            return match?.label || actionRef;
+        },
+
+        getMatchRuleLabel(rule) {
+            const map = { equals: '等于', contains: '包含', not_equals: '不等于' };
+            return map[rule] || rule;
+        },
+
+        getTriggerValueDisplay(trigger) {
+            if (!trigger) return '';
+            if (trigger.type === 'command_triggered') {
+                return this.getCommandName(trigger.command_id);
+            }
+            if (trigger.type === 'command_check' || trigger.type === 'command_result_match') {
+                const sourceName = this.getCommandName(trigger.command_id);
+                const actionLabel = this.getActionRefLabel(trigger.command_id, trigger.action_ref);
+                const ruleLabel = this.getMatchRuleLabel(trigger.match_rule || 'equals');
+                const expected = String(trigger.expected_value || '');
+                return sourceName + ' / ' + actionLabel + ' ' + ruleLabel + ' ' + expected;
+            }
+            if (trigger.type === 'command_result_event') {
+                if (trigger.listen_all_commands) return '全部命令';
+                const ids = Array.isArray(trigger.command_ids) ? trigger.command_ids : [];
+                const labels = ids.map(id => this.getCommandName(id)).filter(Boolean);
+                return labels.length > 0 ? labels.join('、') : '未选择命令';
+            }
+            if (trigger.type === 'network_request_error') {
+                const pattern = trigger.url_pattern || trigger.value || '';
+                const codes = trigger.status_codes || '';
+                return (pattern || '*') + ' [' + codes + ']';
+            }
+            if (trigger.type === 'page_check') {
+                const textRule = String(trigger.value || '').trim();
+                const hasProbe = String(trigger.probe_js || '').trim();
+                if (textRule && hasProbe) return textRule + ' + JS探测';
+                if (textRule) return textRule;
+                if (hasProbe) return '仅 JS 探测';
+                return '';
+            }
+            return trigger.value;
+        },
+
+        async loadPresetOptions() {
+            const domain = this.resolvedPresetDomain;
+            const commandRef = this.editingCommand;
+            const requestSeq = (this.presetOptionsRequestSeq || 0) + 1;
+            this.presetOptionsRequestSeq = requestSeq;
+            this.availablePresets = [];
+
+            if (!domain || !commandRef) return;
+            if (!commandRef.actions?.some(action => ['execute_preset', 'execute_workflow'].includes(action.type))) return;
+
+            this.presetLoading = true;
+            try {
+                const data = await this.apiRequest('/api/presets/' + encodeURIComponent(domain));
+                if (
+                    requestSeq !== this.presetOptionsRequestSeq
+                    || this.editingCommand !== commandRef
+                    || this.resolvedPresetDomain !== domain
+                ) {
+                    return;
+                }
+                this.availablePresets = data.presets || [];
+
+                for (const action of commandRef.actions) {
+                    if (!['execute_preset', 'execute_workflow'].includes(action.type)) continue;
+                    action.preset_name = this.normalizePresetActionValue(action.preset_name);
+                    if (
+                        action.preset_name !== this.getFollowDefaultPresetValue()
+                        && !this.availablePresets.includes(action.preset_name)
+                    ) {
+                        action.preset_name = this.getFollowDefaultPresetValue();
+                    }
+                }
+            } catch (e) {
+                if (
+                    requestSeq !== this.presetOptionsRequestSeq
+                    || this.editingCommand !== commandRef
+                    || this.resolvedPresetDomain !== domain
+                ) {
+                    return;
+                }
+                console.error('加载预设列表失败:', e);
+                this.availablePresets = [];
+                for (const action of commandRef.actions || []) {
+                    if (['execute_preset', 'execute_workflow'].includes(action.type)) {
+                        action.preset_name = this.getFollowDefaultPresetValue();
+                    }
+                }
+            } finally {
+                if (requestSeq === this.presetOptionsRequestSeq && this.editingCommand === commandRef) {
+                    this.presetLoading = false;
+                }
+            }
+        },
+
+        async handleTriggerScopeChange() {
+            if (!this.editingCommand) return;
+
+            if (this.editingCommand.trigger.scope !== 'domain') {
+                this.editingCommand.trigger.domain = '';
+            }
+            if (this.editingCommand.trigger.scope !== 'tab') {
+                this.editingCommand.trigger.tab_index = null;
+            }
+
+            await this.loadPresetOptions();
+        },
+
+        async handleTriggerTargetChange() {
+            await this.loadPresetOptions();
+        },
+
+        getNumericTriggerDefault(triggerType) {
+            const defaults = {
+                request_count: 10,
+                error_count: 3,
+                idle_timeout: 300
+            };
+            return defaults[triggerType] ?? 10;
+        },
+
+        handleTriggerTypeChange() {
+            if (!this.editingCommand?.trigger) return;
+
+            const trigger = this.editingCommand.trigger;
+            const currentValue = trigger.value;
+            this.triggerTypeTooltipType = String(trigger.type || '').trim();
+            this.resetSourceCommandPicker();
+
+            if (trigger.type === 'command_triggered') {
+                trigger.value = '';
+                if (!this.sourceCommandOptions.some(opt => opt.value === trigger.command_id)) {
+                    trigger.command_id = this.sourceCommandOptions[0]?.value || '';
+                }
+                trigger.action_ref = '';
+                trigger.expected_value = '';
+                this.syncPageProbeExpanded();
+                return;
+            }
+
+            if (trigger.type === 'command_check' || trigger.type === 'command_result_match') {
+                trigger.value = '';
+                if (!this.sourceCommandOptions.some(opt => opt.value === trigger.command_id)) {
+                    trigger.command_id = this.sourceCommandOptions[0]?.value || '';
+                }
+                if (!trigger.match_rule) trigger.match_rule = 'equals';
+                if (trigger.expected_value === undefined || trigger.expected_value === null) {
+                    trigger.expected_value = '';
+                }
+                if (trigger.action_ref === undefined) trigger.action_ref = '';
+                this.handleResultSourceChange();
+                this.syncPageProbeExpanded();
+                return;
+            }
+
+            if (trigger.type === 'command_result_event') {
+                trigger.value = '';
+                trigger.command_id = '';
+                trigger.action_ref = '';
+                trigger.expected_value = '';
+                trigger.command_ids = Array.isArray(trigger.command_ids) ? trigger.command_ids : [];
+                if (trigger.listen_all_commands === undefined) trigger.listen_all_commands = false;
+                if (trigger.informative_only === undefined) trigger.informative_only = true;
+                this.syncPageProbeExpanded();
+                return;
+            }
+
+            if (trigger.type === 'network_request_error') {
+                trigger.value = '';
+                trigger.command_id = '';
+                if (!trigger.match_mode) trigger.match_mode = 'keyword';
+                if (!trigger.status_codes) trigger.status_codes = '403,429,500,502,503,504';
+                if (trigger.abort_on_match === undefined) trigger.abort_on_match = true;
+                if (trigger.url_pattern === undefined || trigger.url_pattern === null) {
+                    trigger.url_pattern = '';
+                }
+                this.syncPageProbeExpanded();
+                return;
+            }
+
+            if (trigger.type === 'page_check') {
+                trigger.command_id = '';
+                if (currentValue === 10 || currentValue === '10' || typeof currentValue === 'number') {
+                    trigger.value = '';
+                }
+                this.syncPageProbeExpanded();
+                return;
+            }
+
+            trigger.command_id = '';
+
+            if (['request_count', 'error_count', 'idle_timeout'].includes(trigger.type)) {
+                const fallback = this.getNumericTriggerDefault(trigger.type);
+                const numericValue = Number(currentValue);
+                trigger.value = Number.isFinite(numericValue) && numericValue > 0 ? numericValue : fallback;
+                this.syncPageProbeExpanded();
+                return;
+            }
+
+            if (currentValue === '' || currentValue === null || currentValue === undefined) {
+                trigger.value = 10;
+            }
+            this.syncPageProbeExpanded();
+        },
+
+        handleResultSourceChange() {
+            if (!this.editingCommand?.trigger) return;
+            const trigger = this.editingCommand.trigger;
+            const options = this.getCommandActionOptions(trigger.command_id);
+            if (trigger.action_ref && !options.some(opt => opt.value === trigger.action_ref)) {
+                trigger.action_ref = '';
+            }
+        },
+
+        resetEditorViewport() {
+            const applyReset = () => {
+                const overlay = this.$refs?.editorOverlay;
+                const body = this.$refs?.editorBody;
+
+                if (overlay && typeof overlay.scrollTo === 'function') {
+                    overlay.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+                } else if (overlay) {
+                    overlay.scrollTop = 0;
+                    overlay.scrollLeft = 0;
+                }
+
+                if (body && typeof body.scrollTo === 'function') {
+                    body.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+                } else if (body) {
+                    body.scrollTop = 0;
+                    body.scrollLeft = 0;
+                }
+            };
+
+            this.$nextTick(() => {
+                applyReset();
+                requestAnimationFrame(() => {
+                    applyReset();
+                    setTimeout(applyReset, 60);
+                });
+            });
+        },
+
+        openNewCommand() {
+            this.commandResultsRequestSeq += 1;
+            this.commandResults = [];
+            this.commandResultsLoading = false;
+            this.selectedAdvancedRuleIndex = 0;
+            this.editingCommand = this.normalizeCommand({
+                name: '新命令',
+                enabled: true,
+                log_enabled: true,
+                log_level: 'GLOBAL',
+                mode: 'simple',
+                trigger: {
+                    type: 'request_count',
+                    value: 10,
+                    command_id: '',
+                    command_ids: [],
+                    listen_all_commands: false,
+                    informative_only: true,
+                    action_ref: '',
+                    match_rule: 'equals',
+                    expected_value: '',
+                    match_mode: 'keyword',
+                    status_codes: '403,429,500,502,503,504',
+                    abort_on_match: true,
+                    scope: 'all',
+                    domain: '',
+                    tab_index: null,
+                    fire_mode: 'edge',
+                    cooldown_sec: 0,
+                    allow_during_workflow: false,
+                    interrupt_policy: 'auto',
+                    interrupt_message: '',
+                    probe_js: '',
+                    periodic_enabled: true,
+                    periodic_interval_sec: 8,
+                    periodic_jitter_sec: 2
+                },
+                stop_on_error: false,
+                actions: [{ type: 'clear_cookies' }, { type: 'refresh_page' }],
+                group_name: '',
+                script: '',
+                script_lang: 'javascript',
+                advanced_ui: {
+                    kind: 'none',
+                    title: '',
+                    description: '',
+                    fields: [],
+                    values: {}
+                }
+            });
+            this.isNew = true;
+            this.showEditor = true;
+            this.advancedEditorMode = 'ui';
+            this.triggerTypePickerOpen = false;
+            this.triggerTypeTooltipType = '';
+            this.resetSourceCommandPicker();
+            this.syncPageProbeExpanded();
+            this.fetchBindingMeta().finally(() => this.resetEditorViewport());
+            this.resetEditorViewport();
+        },
+
+        openEditCommand(cmd) {
+            this.commandResultsRequestSeq += 1;
+            this.commandResults = [];
+            this.commandResultsLoading = false;
+            this.selectedAdvancedRuleIndex = 0;
+            this.editingCommand = this.normalizeCommand(cmd);
+            if (['command_check', 'command_result_match', 'command_result_event'].includes(this.editingCommand?.trigger?.type)) {
+                this.handleResultSourceChange();
+            }
+            this.isNew = false;
+            this.showEditor = true;
+            this.advancedEditorMode = 'ui';
+            this.triggerTypePickerOpen = false;
+            this.triggerTypeTooltipType = '';
+            this.resetSourceCommandPicker();
+            this.syncPageProbeExpanded();
+            this.fetchBindingMeta()
+                .then(() => this.loadPresetOptions())
+                .finally(() => this.resetEditorViewport());
+            this.resetEditorViewport();
+            this.loadCommandResults();
+        },
+
+        addAction() {
+            if (!this.editingCommand) return;
+            const nextIndex = this.editingCommand.actions.length;
+            this.editingCommand.actions.push(this.normalizeAction({ type: 'wait', seconds: 1 }, nextIndex));
+        },
+
+        // selector / timeout / raise_for_status 被多种动作类型共用，但语义完全不同：
+        // selector 在 click_element / read_element / write_element 里是 CSS·XPath 选择器，
+        // 在 switch_proxy 里却是 Clash 代理组名；timeout / raise_for_status 在
+        // send_webhook 与 send_napcat 之间默认值也不一样（8/false vs 8/true）。
+        // 由于 initXxx 用 `||` 短路保留旧值，不清理就会把 #submit-btn 当成代理组名。
+        // 这里在切换类型时无条件删掉这三个字段，让后面的 initXxx 按新类型重填默认值；
+        // 其余字段一律原样保留，维持“手工写进 commands.json 的参数不会被 UI 丢弃”的特性。
+        // 同名字段在不同动作类型下语义不同，切换类型时必须清理，否则会"串味"。
+        // selector：click/read/write_element 里是 CSS 选择器，switch_proxy 里是 Clash 代理组名。
+        // timeout / raise_for_status：send_webhook 与 send_napcat 的默认值不同。
+        // 只有在语义分组真的发生变化时才清理，避免 click_element → write_element
+        // 这类同语义切换白白丢掉用户已填的选择器。
+        actionFieldSemanticGroup(field, type) {
+            if (field === 'selector') {
+                if (['click_element', 'read_element', 'write_element'].includes(type)) return 'css';
+                if (type === 'switch_proxy') return 'proxy_group';
+                return null;
+            }
+            if (field === 'timeout' || field === 'raise_for_status') {
+                if (type === 'send_webhook') return 'webhook';
+                if (type === 'send_napcat') return 'napcat';
+                return null;
+            }
+            // fail_on_falsy 在 run_js 默认 true、run_js_file 默认 false，语义相反，不能跨类型继承
+            if (field === 'fail_on_falsy') return type === 'run_js' || type === 'run_js_file' ? type : null;
+            // timeout_sec / max_attempts 的量级在各类型间差异很大（工作流 45s vs 验证码 6s）
+            if (field === 'timeout_sec' || field === 'max_attempts') {
+                return ['http_request', 'write_element', 'read_element', 'execute_workflow',
+                    'click_captcha_challenge'].includes(type) ? type : null;
+            }
+            return null;
+        },
+
+        clearConflictingActionFields(action, previousType) {
+            if (!action) return;
+            const nextType = action.type;
+            if (!previousType || previousType === nextType) return;
+            for (const field of ['selector', 'timeout', 'raise_for_status',
+                'fail_on_falsy', 'timeout_sec', 'max_attempts']) {
+                if (!Object.prototype.hasOwnProperty.call(action, field)) continue;
+                const before = this.actionFieldSemanticGroup(field, previousType);
+                const after = this.actionFieldSemanticGroup(field, nextType);
+                // 语义分组不同（含"新类型根本不用这个字段"）就删掉，让后续 initXxx 按新类型重填默认值
+                if (before !== after) {
+                    delete action[field];
+                }
+            }
+        },
+
+        // Vue 的 v-model.number 在输入框被清空时会写入空串 ''，而后端一律用
+        // action.get(key, default) —— 键存在就不会取默认值，"留空则继承/跟随环境变量"
+        // 的界面说明会失效。保存前把这些空值字段删掉，让后端真正走默认分支。
+        stripEmptyNumericActionFields(actions) {
+            const numericFields = [
+                'timeout_sec', 'workflow_priority', 'max_attempts', 'random_radius',
+                'retry_attempts', 'retry_wait_seconds', 'timeout'
+            ];
+            for (const action of (actions || [])) {
+                if (!action || typeof action !== 'object') continue;
+                for (const field of numericFields) {
+                    if (!Object.prototype.hasOwnProperty.call(action, field)) continue;
+                    const value = action[field];
+                    if (value === '' || value === null || (typeof value === 'number' && Number.isNaN(value))) {
+                        delete action[field];
+                    }
+                }
+            }
+        },
+
+        rememberActionType(action) {
+            if (!action || !action.action_id) return;
+            if (!this.actionTypeSnapshots) this.actionTypeSnapshots = {};
+            this.actionTypeSnapshots[action.action_id] = action.type;
+        },
+
+        async handleActionTypeChange(action) {
+            // actionTypeSnapshots 只存在于组件状态里，不会被 {...action} 带进保存的 JSON
+            const previousType = (this.actionTypeSnapshots || {})[action && action.action_id];
+            this.clearConflictingActionFields(action, previousType);
+            this.rememberActionType(action);
+            this.initClickAction(action);
+            this.initProxyAction(action);
+            this.initWebhookAction(action);
+            this.initNapcatAction(action);
+            this.initCommandGroupAction(action);
+            this.initReleaseLockAction(action);
+            this.initAutomationAction(action);
+            this.initHttpRequestAction(action);
+            this.initAppendFileAction(action);
+            this.initRunJsFileAction(action);
+            // 新增：run_js / 人机验证点击 / 中止任务的参数默认值
+            this.initRunJsAction(action);
+            this.initCaptchaChallengeAction(action);
+            this.initAbortTaskAction(action);
+            if (action.type === 'execute_workflow' && action.prompt === undefined) {
+                action.prompt = '';
+            }
+            if (['execute_preset', 'execute_workflow'].includes(action.type)) {
+                await this.loadPresetOptions();
+                action.preset_name = this.normalizePresetActionValue(action.preset_name);
+            }
+        },
+
+        initClickAction(action) {
+            if (action.type === 'click_element') {
+                action.selector = String(action.selector || '').trim();
+            }
+            if (action.type === 'click_coordinates') {
+                const x = Number(action.x);
+                const y = Number(action.y);
+                action.x = Number.isFinite(x) ? x : '';
+                action.y = Number.isFinite(y) ? y : '';
+            }
+        },
+
+        initProxyAction(action) {
+            if (action.type === 'switch_proxy') {
+                action.clash_api = action.clash_api || this.proxyDefaults.clash_api;
+                action.clash_secret = action.clash_secret || '';
+                action.selector = action.selector || this.proxyDefaults.selector;
+                action.mode = action.mode || 'random';
+                action.node_name = action.node_name || '';
+                action.exclude_keywords = action.exclude_keywords || this.proxyDefaults.exclude_keywords;
+                if (action.refresh_after === undefined) {
+                    action.refresh_after = true;
+                }
+            }
+        },
+
+        initWebhookAction(action) {
+            if (action.type === 'send_webhook') {
+                action.method = action.method || this.webhookDefaults.method;
+                action.url = action.url || this.webhookDefaults.url;
+                if (action.payload === undefined) {
+                    action.payload = this.webhookDefaults.payload;
+                }
+                if (action.headers === undefined) {
+                    action.headers = this.webhookDefaults.headers;
+                }
+                if (action.timeout === undefined) {
+                    action.timeout = this.webhookDefaults.timeout;
+                }
+                if (action.raise_for_status === undefined) {
+                    action.raise_for_status = this.webhookDefaults.raise_for_status;
+                }
+            }
+        },
+
+        initNapcatAction(action) {
+            if (action.type !== 'send_napcat') return;
+            action.base_url = action.base_url || this.napcatDefaults.base_url;
+            action.target_type = action.target_type || this.napcatDefaults.target_type;
+            action.user_id = action.user_id || this.napcatDefaults.user_id;
+            action.group_id = action.group_id || this.napcatDefaults.group_id;
+            if (action.message === undefined) action.message = this.napcatDefaults.message;
+            if (action.access_token === undefined) action.access_token = this.napcatDefaults.access_token;
+            if (action.timeout === undefined) action.timeout = this.napcatDefaults.timeout;
+            if (action.raise_for_status === undefined) action.raise_for_status = this.napcatDefaults.raise_for_status;
+        },
+
+        useNapcatPreset(action, targetType) {
+            if (!action) return;
+            action.type = 'send_napcat';
+            this.initNapcatAction(action);
+            action.target_type = targetType === 'group' ? 'group' : 'private';
+        },
+
+        initCommandGroupAction(action) {
+            if (action.type !== 'execute_command_group') return;
+            if (action.include_disabled === undefined) {
+                action.include_disabled = false;
+            }
+            if (!action.acquire_policy) {
+                action.acquire_policy = 'inherit_session';
+            }
+            const current = String(action.group_name || '').trim();
+            if (current) {
+                action.group_name = current;
+                return;
+            }
+            action.group_name = this.commandGroupOptions[0]?.value || '';
+        },
+
+        initReleaseLockAction(action) {
+            if (action.type === 'release_tab_lock') {
+                if (action.reason === undefined || action.reason === null || action.reason === '') {
+                    action.reason = this.releaseLockDefaults.reason;
+                }
+                if (action.clear_page === undefined) {
+                    action.clear_page = this.releaseLockDefaults.clear_page;
+                }
+                if (action.stop_actions === undefined) {
+                    action.stop_actions = this.releaseLockDefaults.stop_actions;
+                }
+            }
+        },
+
+        initAutomationAction(action) {
+            if (action.type === 'write_element') {
+                action.selector = action.selector || this.automationWriteDefaults.selector;
+                action.write_mode = action.write_mode || this.automationWriteDefaults.write_mode;
+                if (action.clear_first === undefined) action.clear_first = this.automationWriteDefaults.clear_first;
+                action.value_source = action.value_source || this.automationWriteDefaults.value_source;
+                if (action.text === undefined) action.text = this.automationWriteDefaults.text;
+                if (action.template === undefined) action.template = this.automationWriteDefaults.template;
+                if (action.variable_name === undefined) action.variable_name = this.automationWriteDefaults.variable_name;
+                action.random_kind = action.random_kind || this.automationWriteDefaults.random_kind;
+                if (action.random_length === undefined) action.random_length = this.automationWriteDefaults.random_length;
+                if (action.prefix === undefined) action.prefix = this.automationWriteDefaults.prefix;
+                if (action.suffix === undefined) action.suffix = this.automationWriteDefaults.suffix;
+                action.preset_name = action.preset_name || this.automationWriteDefaults.preset_name;
+                action.date_format = action.date_format || this.automationWriteDefaults.date_format;
+                if (action.min_age === undefined) action.min_age = this.automationWriteDefaults.min_age;
+                if (action.max_age === undefined) action.max_age = this.automationWriteDefaults.max_age;
+                if (action.save_as === undefined) action.save_as = this.automationWriteDefaults.save_as;
+                if (action.timeout_sec === undefined) action.timeout_sec = this.automationWriteDefaults.timeout_sec;
+            }
+            if (action.type === 'read_element') {
+                action.selector = action.selector || this.automationReadDefaults.selector;
+                action.read_mode = action.read_mode || this.automationReadDefaults.read_mode;
+                if (action.attr_name === undefined) action.attr_name = this.automationReadDefaults.attr_name;
+                if (action.trim === undefined) action.trim = this.automationReadDefaults.trim;
+                if (action.save_as === undefined) action.save_as = this.automationReadDefaults.save_as;
+                if (action.timeout_sec === undefined) action.timeout_sec = this.automationReadDefaults.timeout_sec;
+            }
+        },
+
+        initHttpRequestAction(action) {
+            if (action.type !== 'http_request') return;
+            action.request_profile = action.request_profile || this.httpRequestDefaults.request_profile;
+            action.method = action.method || this.httpRequestDefaults.method;
+            action.url = action.url || this.httpRequestDefaults.url;
+            if (action.headers === undefined) action.headers = this.httpRequestDefaults.headers;
+            if (action.prompt === undefined) action.prompt = this.httpRequestDefaults.prompt;
+            if (action.body === undefined) action.body = this.httpRequestDefaults.body;
+            action.body_mode = action.body_mode || this.httpRequestDefaults.body_mode;
+            action.response_mode = action.response_mode || this.httpRequestDefaults.response_mode;
+            action.credentials = action.credentials || this.httpRequestDefaults.credentials;
+            action.model_type = action.model_type || this.httpRequestDefaults.model_type;
+            if (action.search_enabled === undefined) action.search_enabled = this.httpRequestDefaults.search_enabled;
+            if (action.thinking_enabled === undefined) action.thinking_enabled = this.httpRequestDefaults.thinking_enabled;
+            action.client_version = action.client_version || this.httpRequestDefaults.client_version;
+            action.app_version = action.app_version || this.httpRequestDefaults.app_version;
+            if (action.timeout_sec === undefined) action.timeout_sec = this.httpRequestDefaults.timeout_sec;
+            if (action.fail_on_http_error === undefined) action.fail_on_http_error = this.httpRequestDefaults.fail_on_http_error;
+            if (action.save_as === undefined) action.save_as = this.httpRequestDefaults.save_as;
+            // consume_response：后端默认 false（仅触发请求即返回），决定 save_as 能否拿到正文
+            if (action.consume_response === undefined) action.consume_response = false;
+        },
+
+        initAppendFileAction(action) {
+            if (action.type !== 'append_file') return;
+            action.file_path = action.file_path || this.appendFileDefaults.file_path;
+            if (action.content === undefined) action.content = this.appendFileDefaults.content;
+            if (action.append_newline === undefined) action.append_newline = this.appendFileDefaults.append_newline;
+            if (action.create_dirs === undefined) action.create_dirs = this.appendFileDefaults.create_dirs;
+            action.encoding = action.encoding || this.appendFileDefaults.encoding;
+        },
+
+        initRunJsFileAction(action) {
+            if (action.type !== 'run_js_file') return;
+            const defaults = this.runJsFileDefaults || {};
+            action.file_path = action.file_path || defaults.file_path || 'js/arena-stream-hard-stop.user.js';
+            action.encoding = action.encoding || defaults.encoding || 'utf-8-sig';
+            if (action.inject_on_new_document === undefined) {
+                action.inject_on_new_document = defaults.inject_on_new_document !== false;
+            }
+            if (action.apply_now === undefined) {
+                action.apply_now = defaults.apply_now !== false;
+            }
+            if (action.fail_on_falsy === undefined) {
+                action.fail_on_falsy = defaults.fail_on_falsy === true;
+            }
+            // teardown_js 是预注入脚本的卸载钩子，后端也兼容旧名 cleanup_js；
+            // 这里只做展示层回填，不删除 cleanup_js，避免动到已有配置
+            if (action.teardown_js === undefined) {
+                action.teardown_js = action.cleanup_js === undefined ? '' : action.cleanup_js;
+            }
+        },
+
+        // run_js：后端 fail_on_falsy 默认 true，必须显式初始化，
+        // 否则复选框显示成“关闭”，与真实行为相反（JS 返回 undefined 就被判失败）
+        initRunJsAction(action) {
+            if (action.type !== 'run_js') return;
+            if (action.code === undefined) action.code = '';
+            if (action.retry_on_results === undefined) action.retry_on_results = [];
+            if (action.retry_attempts === undefined) action.retry_attempts = 0;
+            if (action.retry_after_refresh === undefined) action.retry_after_refresh = false;
+            if (action.retry_wait_seconds === undefined) action.retry_wait_seconds = 0;
+            if (action.fail_on_falsy === undefined) action.fail_on_falsy = true;
+        },
+
+        // click_captcha_challenge：后端默认 timeout_sec=6 / random_radius=4，
+        // max_attempts 缺省表示超时前不限次数（保持 null 让后端走 None 分支）
+        initCaptchaChallengeAction(action) {
+            if (action.type !== 'click_captcha_challenge') return;
+            if (action.timeout_sec === undefined) action.timeout_sec = 6;
+            if (action.random_radius === undefined) action.random_radius = 4;
+            if (action.max_attempts === undefined) action.max_attempts = null;
+        },
+
+        // abort_task：后端 reason 默认 "abort_task_action"、stop_actions 默认 true（可关）
+        initAbortTaskAction(action) {
+            if (action.type !== 'abort_task') return;
+            if (action.reason === undefined || action.reason === null || action.reason === '') {
+                action.reason = 'abort_task_action';
+            }
+            if (action.stop_actions === undefined) action.stop_actions = true;
+        },
+
+        // run_js 的 retry_on_results 是数组，用换行分隔的文本框编辑
+        getRunJsRetryResultsText(action) {
+            const raw = action?.retry_on_results;
+            if (Array.isArray(raw)) return raw.join('\n');
+            // 兼容后端也接受的逗号分隔字符串写法
+            return String(raw === undefined || raw === null ? '' : raw);
+        },
+
+        // 由 @change（失焦）触发：边输入边规范化会把用户刚敲的换行吃掉
+        setRunJsRetryResultsText(action, text) {
+            if (!action) return;
+            action.retry_on_results = String(text === undefined || text === null ? '' : text)
+                .split('\n')
+                .map(item => item.trim())
+                .filter(Boolean);
+        },
+
+        isAutomationVarNameValid(value) {
+            const text = String(value || '').trim();
+            if (!text) return true;
+            return /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(text);
+        },
+
+        getAutomationPresetLabel(value) {
+            const map = {
+                name_cn: '随机中文姓名',
+                surname_cn: '随机姓氏',
+                given_name_cn: '随机名字',
+                birth_date: '随机生日',
+                birth_year: '随机出生年',
+                birth_month: '随机出生月',
+                birth_day: '随机出生日'
+            };
+            return map[value] || value || '未设置';
+        },
+
+        getAutomationWriteSummary(action) {
+            if (!action) return '';
+            const source = String(action.value_source || 'literal');
+            if (source === 'template') return '模板';
+            if (source === 'variable') return '变量 ' + (action.variable_name || '未设置');
+            if (source === 'random') return '随机 ' + (action.random_kind || 'alnum') + ' × ' + (action.random_length || 8);
+            if (source === 'prefix_random') return '前缀随机 ' + (action.random_kind || 'alnum') + ' × ' + (action.random_length || 8);
+            if (source === 'preset') return this.getAutomationPresetLabel(action.preset_name);
+            return (action.text || '').slice(0, 24) || '固定文本';
+        },
+
+        getAutomationReadSummary(action) {
+            if (!action) return '';
+            return (action.read_mode || 'auto') + (action.save_as ? (' -> ' + action.save_as) : '');
+        },
+
+        getHttpRequestSummary(action) {
+            if (!action) return '';
+            if (action.request_profile === 'deepseek_completion') {
+                return 'DeepSeek 直发 ' + ((action.prompt || '').slice(0, 24) || '未配置提示词');
+            }
+            return (action.method || 'GET') + ' ' + ((action.url || '').slice(0, 40) || '未配置 URL');
+        },
+
+        getAppendFileSummary(action) {
+            if (!action) return '';
+            return (action.file_path || '未配置文件') + (action.append_newline ? ' + 换行' : '');
+        },
+
+        getRunJsFileSummary(action) {
+            if (!action) return '';
+            const path = action.file_path || '未配置文件';
+            const modes = [];
+            if (action.apply_now !== false) modes.push('立即执行');
+            if (action.inject_on_new_document !== false) modes.push('预注入');
+            return path + ' · ' + (modes.length ? modes.join(' + ') : '仅读取');
+        },
+
+        removeAction(index) {
+            if (!this.editingCommand) return;
+            this.editingCommand.actions.splice(index, 1);
+        },
+
+        moveAction(index, direction) {
+            if (!this.editingCommand) return;
+            const arr = this.editingCommand.actions;
+            const newIndex = index + direction;
+            if (newIndex < 0 || newIndex >= arr.length) return;
+            const temp = arr[index];
+            arr[index] = arr[newIndex];
+            arr[newIndex] = temp;
+        },
+
+        async saveCommand() {
+            if (!this.editingCommand) return;
+            const trigger = this.editingCommand.trigger || {};
+            if (['request_count', 'error_count', 'idle_timeout'].includes(trigger.type)) {
+                const numericValue = Number(trigger.value);
+                if (!Number.isFinite(numericValue) || numericValue <= 0) {
+                    this.$emit('notify', { type: 'error', message: '计数/超时阈值必须是大于 0 的数字。' });
+                    return;
+                }
+                trigger.value = numericValue;
+            }
+            if (trigger.type === 'command_triggered') {
+                const sourceId = String(trigger.command_id || '').trim();
+                if (!sourceId) {
+                    this.$emit('notify', { type: 'error', message: '请先在“命令触发后执行”里选择来源命令。' });
+                    return;
+                }
+                if (this.editingCommand.id && sourceId === this.editingCommand.id) {
+                    this.$emit('notify', { type: 'error', message: '来源命令不能选择当前命令自己。' });
+                    return;
+                }
+            }
+            if (trigger.type === 'command_check' || trigger.type === 'command_result_match') {
+                const sourceId = String(trigger.command_id || '').trim();
+                if (this.editingCommand.id && sourceId === this.editingCommand.id) {
+                    this.$emit('notify', { type: 'error', message: trigger.type === 'command_check' ? '检查命令不能是当前命令自己。' : '来源命令不能是当前命令自己。' });
+                    return;
+                }
+                const expected = String(trigger.expected_value || '').trim();
+                if (sourceId && !expected) {
+                    this.$emit('notify', { type: 'error', message: '请填写“结果值”。' });
+                    return;
+                }
+            }
+            if (trigger.type === 'command_result_event') {
+                const ids = Array.isArray(trigger.command_ids)
+                    ? trigger.command_ids.map(id => String(id || '').trim()).filter(Boolean)
+                    : [];
+                trigger.command_ids = ids;
+                if (!trigger.listen_all_commands && ids.length === 0) {
+                    this.$emit('notify', { type: 'error', message: '请至少选择一个来源命令，或切换为“全部命令”。' });
+                    return;
+                }
+                if (this.editingCommand.id && ids.includes(this.editingCommand.id)) {
+                    this.$emit('notify', { type: 'error', message: '来源命令不能包含当前命令自己。' });
+                    return;
+                }
+            }
+            if (trigger.type === 'network_request_error') {
+                const urlPattern = String(trigger.url_pattern || trigger.value || '').trim();
+                if (!urlPattern) {
+                    this.$emit('notify', { type: 'error', message: '网络异常拦截需要填写 URL 监听规则。' });
+                    return;
+                }
+                const statusCodes = String(trigger.status_codes || '').trim();
+                if (!statusCodes) {
+                    this.$emit('notify', { type: 'error', message: '请填写要拦截的状态码（如 403,429,500）。' });
+                    return;
+                }
+            }
+            if (trigger.type === 'page_check') {
+                const textRule = String(trigger.value || '').trim();
+                const probeJs = String(trigger.probe_js || '').trim();
+                trigger.value = textRule;
+                trigger.probe_js = probeJs;
+                if (!textRule && !probeJs) {
+                    this.$emit('notify', { type: 'error', message: '页面检查至少要填写“检查文本”或“高级页面探测 JS”其中一项。' });
+                    return;
+                }
+            }
+            const periodicInterval = Number(trigger.periodic_interval_sec);
+            if (!Number.isFinite(periodicInterval) || periodicInterval < 1) {
+                this.$emit('notify', { type: 'error', message: '周期检测间隔必须是大于等于 1 秒的数字。' });
+                return;
+            }
+            const periodicJitter = Number(trigger.periodic_jitter_sec);
+            if (!Number.isFinite(periodicJitter) || periodicJitter < 0) {
+                this.$emit('notify', { type: 'error', message: '周期检测抖动必须是大于等于 0 的数字。' });
+                return;
+            }
+            const stableFor = Number(trigger.stable_for_sec);
+            if (!Number.isFinite(stableFor) || stableFor < 0) {
+                this.$emit('notify', { type: 'error', message: '页面稳定命中时长必须是大于等于 0 的数字。' });
+                return;
+            }
+            const priority = Number(trigger.priority);
+            if (!Number.isInteger(priority)) {
+                this.$emit('notify', { type: 'error', message: '命令优先级必须是整数。' });
+                return;
+            }
+            trigger.periodic_interval_sec = periodicInterval;
+            trigger.periodic_jitter_sec = periodicJitter;
+            trigger.stable_for_sec = stableFor;
+            trigger.periodic_enabled = !!trigger.periodic_enabled;
+            trigger.check_while_busy_workflow = !!trigger.check_while_busy_workflow;
+            trigger.priority = priority;
+            this.stripEmptyNumericActionFields(this.editingCommand.actions);
+            const presetActions = (this.editingCommand.actions || []).filter(action => ['execute_preset', 'execute_workflow'].includes(action.type));
+            for (const action of presetActions) {
+                action.preset_name = this.normalizePresetActionValue(action.preset_name);
+            }
+            const missingPreset = presetActions.some(action => !String(action.preset_name || '').trim());
+            if (missingPreset) {
+                this.$emit('notify', { type: 'error', message: '“切换预设/执行工作流”动作必须从预设列表中选择一个预设。' });
+                return;
+            }
+            const webhookActions = (this.editingCommand.actions || []).filter(action => action.type === 'send_webhook');
+            const invalidWebhook = webhookActions.find(action => !String(action.url || '').trim());
+            if (invalidWebhook) {
+                this.$emit('notify', { type: 'error', message: 'Webhook 动作必须填写请求 URL。' });
+                return;
+            }
+            const napcatActions = (this.editingCommand.actions || []).filter(action => action.type === 'send_napcat');
+            const invalidNapcat = napcatActions.find(action => {
+                const targetType = action.target_type === 'group' ? 'group' : 'private';
+                const targetId = String(targetType === 'group' ? action.group_id : action.user_id || '').trim();
+                return !String(action.base_url || '').trim() || !targetId || !String(action.message || '').trim();
+            });
+            if (invalidNapcat) {
+                this.$emit('notify', { type: 'error', message: 'NapCat 动作必须填写接口地址、目标 QQ/群号和消息内容。' });
+                return;
+            }
+            const groupActions = (this.editingCommand.actions || []).filter(action => action.type === 'execute_command_group');
+            const invalidGroupAction = groupActions.find(action => !String(action.group_name || '').trim());
+            if (invalidGroupAction) {
+                this.$emit('notify', { type: 'error', message: '“执行命令组”动作必须选择命令组。' });
+                return;
+            }
+            const clickElementAction = (this.editingCommand.actions || []).find(action =>
+                action.type === 'click_element' && !String(action.selector || '').trim()
+            );
+            if (clickElementAction) {
+                this.$emit('notify', { type: 'error', message: '“点击元素”动作必须填写元素选择器。' });
+                return;
+            }
+            const clickCoordinateAction = (this.editingCommand.actions || []).find(action => {
+                if (action.type !== 'click_coordinates') return false;
+                return !Number.isFinite(Number(action.x)) || !Number.isFinite(Number(action.y));
+            });
+            if (clickCoordinateAction) {
+                this.$emit('notify', { type: 'error', message: '“点击坐标”动作必须填写有效的 X / Y 坐标。' });
+                return;
+            }
+            const invalidWriteAction = (this.editingCommand.actions || []).find(action => {
+                if (action.type !== 'write_element') return false;
+                if (!String(action.selector || '').trim()) return true;
+                if (!Number.isFinite(Number(action.timeout_sec)) || Number(action.timeout_sec) <= 0) return true;
+                const source = String(action.value_source || 'literal');
+                if (source === 'template') return !String(action.template || '').trim();
+                if (source === 'variable') return !String(action.variable_name || '').trim();
+                if (source === 'random' || source === 'prefix_random') {
+                    if (!Number.isFinite(Number(action.random_length)) || Number(action.random_length) <= 0) return true;
+                    if (source === 'prefix_random' && !String(action.prefix || '').trim() && !String(action.suffix || '').trim()) {
+                        return false;
+                    }
+                }
+                if (source === 'preset') {
+                    const preset = String(action.preset_name || '').trim();
+                    if (!preset) return true;
+                    if (preset.startsWith('birth_')) {
+                        if (!Number.isFinite(Number(action.min_age)) || Number(action.min_age) < 0) return true;
+                        if (!Number.isFinite(Number(action.max_age)) || Number(action.max_age) < Number(action.min_age)) return true;
+                    }
+                }
+                if (!this.isAutomationVarNameValid(action.save_as)) return true;
+                if (source === 'variable' && !this.isAutomationVarNameValid(action.variable_name)) return true;
+                return false;
+            });
+            if (invalidWriteAction) {
+                this.$emit('notify', { type: 'error', message: '“写入元素”动作配置不完整，请检查选择器、数据来源、超时和变量名。变量名只能用字母、数字和下划线，且不能以数字开头。' });
+                return;
+            }
+            const invalidReadAction = (this.editingCommand.actions || []).find(action => {
+                if (action.type !== 'read_element') return false;
+                if (!String(action.selector || '').trim()) return true;
+                if (!Number.isFinite(Number(action.timeout_sec)) || Number(action.timeout_sec) <= 0) return true;
+                if (String(action.read_mode || 'auto') === 'attr' && !String(action.attr_name || '').trim()) return true;
+                if (String(action.save_as || '').trim() && !this.isAutomationVarNameValid(action.save_as)) return true;
+                return false;
+            });
+            if (invalidReadAction) {
+                this.$emit('notify', { type: 'error', message: '“读取元素”动作配置不完整，请检查选择器、读取模式、属性名和变量名。' });
+                return;
+            }
+            const invalidHttpRequestAction = (this.editingCommand.actions || []).find(action => {
+                if (action.type !== 'http_request') return false;
+                if (!String(action.url || '').trim()) return true;
+                if (!Number.isFinite(Number(action.timeout_sec)) || Number(action.timeout_sec) <= 0) return true;
+                if (String(action.save_as || '').trim() && !this.isAutomationVarNameValid(action.save_as)) return true;
+                const method = String(action.method || 'GET').toUpperCase();
+                if (method !== 'GET' && method !== 'HEAD' && String(action.body_mode || 'json') === 'json') {
+                    const bodyText = String(action.body || '').trim();
+                    if (bodyText) {
+                        try {
+                            JSON.parse(bodyText);
+                        } catch (_) {
+                            return true;
+                        }
+                    }
+                }
+                const headersText = String(action.headers || '').trim();
+                if (headersText) {
+                    try {
+                        const parsedHeaders = JSON.parse(headersText);
+                        if (!parsedHeaders || typeof parsedHeaders !== 'object' || Array.isArray(parsedHeaders)) return true;
+                    } catch (_) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (invalidHttpRequestAction) {
+                this.$emit('notify', { type: 'error', message: '“页面内请求”动作配置不完整，请检查 URL、超时、Headers JSON、Body JSON 和变量名。' });
+                return;
+            }
+            const invalidAppendFileAction = (this.editingCommand.actions || []).find(action => {
+                if (action.type !== 'append_file') return false;
+                if (!String(action.file_path || '').trim()) return true;
+                if (action.content === undefined || action.content === null) return true;
+                const encoding = String(action.encoding || '').trim().toLowerCase();
+                if (!encoding) return true;
+                return false;
+            });
+            if (invalidAppendFileAction) {
+                this.$emit('notify', { type: 'error', message: '“追加到文件”动作必须填写文件路径、追加内容和编码。' });
+                return;
+            }
+            const invalidRunJsFileAction = (this.editingCommand.actions || []).find(action => {
+                if (action.type !== 'run_js_file') return false;
+                if (!String(action.file_path || '').trim()) return true;
+                if (!String(action.encoding || '').trim()) return true;
+                return false;
+            });
+            if (invalidRunJsFileAction) {
+                this.$emit('notify', { type: 'error', message: '“执行 JS 文件”动作必须填写文件路径和编码。' });
+                return;
+            }
+            if (trigger.type === 'network_request_error') {
+                trigger.value = trigger.url_pattern || '';
+            } else if (trigger.type === 'command_check' || trigger.type === 'command_result_match') {
+                trigger.value = '';
+            } else if (trigger.type === 'command_result_event') {
+                trigger.value = '';
+            }
+            this.editingCommand.log_enabled = !!this.editingCommand.log_enabled;
+            this.editingCommand.log_level = this.normalizeCommandLogLevel(this.editingCommand.log_level);
+            this.editingCommand.group_name = String(this.editingCommand.group_name || '').trim();
+            this.editingCommand.actions = (this.editingCommand.actions || [])
+                .map((action, index) => this.normalizeAction(action, index));
+            this.editingCommand.advanced_ui = this.normalizeAdvancedUi(this.editingCommand.advanced_ui);
+            try {
+                if (this.isNew) {
+                    await this.apiRequest('/api/commands', {
+                        method: 'POST',
+                        body: JSON.stringify(this.editingCommand)
+                    });
+                    this.$emit('notify', { type: 'success', message: '命令已创建' });
+                } else {
+                    // 命令 id 允许手写（commands.json 里已有自定义 id），统一转义后再拼进 URL
+                    await this.apiRequest('/api/commands/' + encodeURIComponent(this.editingCommand.id), {
+                        method: 'PUT',
+                        body: JSON.stringify(this.editingCommand)
+                    });
+                    this.$emit('notify', { type: 'success', message: '命令已更新' });
+                }
+                this.showEditor = false;
+                await this.fetchCommands();
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: '保存失败: ' + e.message });
+            }
+        },
+
+        async deleteCommand(cmd) {
+            if (!confirm('确定删除命令「' + cmd.name + '」吗？')) return;
+            try {
+                // 同上：命令 id 统一转义
+                await this.apiRequest('/api/commands/' + encodeURIComponent(cmd.id), { method: 'DELETE' });
+                this.$emit('notify', { type: 'success', message: '命令已删除' });
+                await this.fetchCommands();
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: '删除失败: ' + e.message });
+            }
+        },
+
+        async toggleCommand(cmd) {
+            try {
+                // 同上：命令 id 统一转义
+                await this.apiRequest('/api/commands/' + encodeURIComponent(cmd.id), {
+                    method: 'PUT',
+                    body: JSON.stringify({ enabled: !cmd.enabled })
+                });
+                await this.fetchCommands();
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: '切换失败: ' + e.message });
+            }
+        },
+
+        async testCommand(cmd) {
+            try {
+                // 同上：命令 id 统一转义
+                const result = await this.apiRequest('/api/commands/' + encodeURIComponent(cmd.id) + '/test', { method: 'POST' });
+                this.$emit('notify', { type: 'success', message: result.message || '命令已执行' });
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: '执行失败: ' + e.message });
+            }
+        },
+
+        syncGroupCollapseState() {
+            const next = {};
+            for (const group of (this.commandGroups || [])) {
+                if (Object.prototype.hasOwnProperty.call(this.collapsedGroups, group.name)) {
+                    next[group.name] = !!this.collapsedGroups[group.name];
+                } else {
+                    next[group.name] = true;
+                }
+            }
+            this.collapsedGroups = next;
+        },
+
+        isGroupCollapsed(groupName) {
+            const key = String(groupName || '').trim();
+            if (!key) return false;
+            if (!Object.prototype.hasOwnProperty.call(this.collapsedGroups, key)) {
+                return true;
+            }
+            return !!this.collapsedGroups[key];
+        },
+
+        toggleGroupCollapse(groupName) {
+            const key = String(groupName || '').trim();
+            if (!key) return;
+            this.collapsedGroups = {
+                ...this.collapsedGroups,
+                [key]: !this.isGroupCollapsed(key)
+            };
+            this.closeBulkActionMenu();
+            this.closeGroupActionMenu();
+        },
+
+        isBulkActionMenuOpen() {
+            return !!this.bulkActionMenuOpen;
+        },
+
+        toggleBulkActionMenu() {
+            const next = !this.bulkActionMenuOpen;
+            this.bulkActionMenuOpen = next;
+            if (next) {
+                this.closeGroupActionMenu();
+                this.closeCommandActionMenu();
+            }
+        },
+
+        async duplicateCommand(cmd) {
+            if (!cmd?.id || this.duplicatingCommandId) return;
+            this.duplicatingCommandId = cmd.id;
+            try {
+                const result = await this.apiRequest('/api/commands/' + encodeURIComponent(cmd.id) + '/duplicate', {
+                    method: 'POST'
+                });
+                const duplicatedName = result.command?.name || '命令副本';
+                this.$emit('notify', { type: 'success', message: '已复制命令：' + duplicatedName });
+                await this.fetchCommands();
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: '复制命令失败: ' + e.message });
+            } finally {
+                this.duplicatingCommandId = '';
+            }
+        },
+
+        closeBulkActionMenu() {
+            this.bulkActionMenuOpen = false;
+        },
+
+        toggleCommandActionMenu(commandId) {
+            const id = String(commandId || '').trim();
+            const next = this.commandActionMenuOpen === id ? '' : id;
+            this.commandActionMenuOpen = next;
+            if (next) {
+                this.closeBulkActionMenu();
+                this.closeGroupActionMenu();
+            }
+        },
+
+        closeCommandActionMenu() {
+            this.commandActionMenuOpen = '';
+        },
+
+        isCommandActionMenuOpen(commandId) {
+            return this.commandActionMenuOpen === String(commandId || '').trim();
+        },
+
+        isGroupActionMenuOpen(groupName) {
+            return String(this.groupActionMenuOpen || '').trim() === String(groupName || '').trim();
+        },
+
+        toggleGroupActionMenu(groupName) {
+            const key = String(groupName || '').trim();
+            if (!key) return;
+            this.closeBulkActionMenu();
+            this.closeCommandActionMenu();
+            this.groupActionMenuOpen = this.isGroupActionMenuOpen(key) ? '' : key;
+        },
+
+        closeGroupActionMenu() {
+            this.groupActionMenuOpen = '';
+        },
+
+        isCommandSelected(commandId) {
+            return (this.selectedCommandIds || []).includes(commandId);
+        },
+
+        getSelectedCount(items) {
+            const ids = Array.isArray(items)
+                ? items.map(item => typeof item === 'object' ? item?.id : item).filter(Boolean)
+                : [];
+            if (ids.length === 0) return 0;
+            const selectedSet = new Set(this.selectedCommandIds || []);
+            return ids.filter(id => selectedSet.has(id)).length;
+        },
+
+        isGroupFullySelected(commands) {
+            const ids = Array.isArray(commands)
+                ? commands.map(cmd => cmd?.id).filter(Boolean)
+                : [];
+            if (ids.length === 0) return false;
+            const selectedSet = new Set(this.selectedCommandIds || []);
+            return ids.every(id => selectedSet.has(id));
+        },
+
+        getGroupSelectionActionLabel(commands) {
+            return this.isGroupFullySelected(commands) ? '取消整组选中' : '整组选中';
+        },
+
+        toggleGroupSelection(commands) {
+            const ids = Array.isArray(commands)
+                ? commands.map(cmd => cmd?.id).filter(Boolean)
+                : [];
+            if (ids.length === 0) return;
+            const selectedSet = new Set(this.selectedCommandIds || []);
+            const allSelected = ids.every(id => selectedSet.has(id));
+            if (allSelected) {
+                ids.forEach(id => selectedSet.delete(id));
+            } else {
+                ids.forEach(id => selectedSet.add(id));
+            }
+            this.selectedCommandIds = Array.from(selectedSet);
+            this.showGroupTools = true;
+            this.closeGroupActionMenu();
+        },
+
+        toggleCommandSelection(commandId) {
+            const selectedSet = new Set(this.selectedCommandIds || []);
+            if (selectedSet.has(commandId)) {
+                selectedSet.delete(commandId);
+            } else {
+                selectedSet.add(commandId);
+            }
+            this.selectedCommandIds = Array.from(selectedSet);
+            this.showGroupTools = true;
+        },
+
+        toggleCurrentPageSelection() {
+            const pageIds = this.visiblePageCommandIds || [];
+            if (pageIds.length === 0) return;
+            const selectedSet = new Set(this.selectedCommandIds || []);
+            const allSelected = pageIds.every(id => selectedSet.has(id));
+            if (allSelected) {
+                pageIds.forEach(id => selectedSet.delete(id));
+            } else {
+                pageIds.forEach(id => selectedSet.add(id));
+            }
+            this.selectedCommandIds = Array.from(selectedSet);
+            this.showGroupTools = true;
+        },
+
+        clearSelection() {
+            this.selectedCommandIds = [];
+        },
+
+        getNextDefaultGroupName() {
+            const existing = new Set(this.commandGroups.map(group => group.name));
+            let idx = 1;
+            while (existing.has('命令组' + idx)) {
+                idx += 1;
+            }
+            return '命令组' + idx;
+        },
+
+        clearGroupDragState() {
+            this.draggingCommandId = '';
+            this.dragOverGroupName = '';
+            this.dragOverCommandId = '';
+            this.dragOverCommandPosition = '';
+        },
+
+        beginGroupDrag(commandId, event) {
+            if (this.groupWorking || this.reordering) return;
+            this.draggingCommandId = String(commandId || '').trim();
+            this.dragOverGroupName = '';
+            this.dragOverCommandId = '';
+            this.dragOverCommandPosition = '';
+            if (this.draggingCommandId) {
+                this.showGroupTools = true;
+            }
+            if (event?.dataTransfer && this.draggingCommandId) {
+                event.dataTransfer.setData('text/plain', this.draggingCommandId);
+                event.dataTransfer.effectAllowed = 'move';
+            }
+        },
+
+        getCommandGroupKey(cmd) {
+            return String(cmd?.group_name || '').trim();
+        },
+
+        getCommandGroupPeers(cmd) {
+            const groupKey = this.getCommandGroupKey(cmd);
+            return (this.commands || []).filter(item => this.getCommandGroupKey(item) === groupKey);
+        },
+
+        canMoveCommand(cmd, direction) {
+            const peers = this.getCommandGroupPeers(cmd);
+            const index = peers.findIndex(item => item.id === cmd?.id);
+            const targetIndex = index + Number(direction || 0);
+            return index >= 0 && targetIndex >= 0 && targetIndex < peers.length;
+        },
+
+        isCommandDropTarget(commandId, position = '') {
+            if (this.dragOverCommandId !== String(commandId || '').trim()) return false;
+            return !position || this.dragOverCommandPosition === position;
+        },
+
+        getCommandDropPosition(event) {
+            const target = event?.currentTarget;
+            if (!target?.getBoundingClientRect) return 'before';
+            const rect = target.getBoundingClientRect();
+            return event.clientY < rect.top + (rect.height / 2) ? 'before' : 'after';
+        },
+
+        onCommandDragOver(commandId, event) {
+            if (this.groupWorking || this.reordering) return;
+            const sourceId = String(this.draggingCommandId || '').trim();
+            const targetId = String(commandId || '').trim();
+            if (!sourceId || !targetId || sourceId === targetId) {
+                this.dragOverCommandId = '';
+                this.dragOverCommandPosition = '';
+                return;
+            }
+
+            const source = (this.commands || []).find(item => item.id === sourceId);
+            const target = (this.commands || []).find(item => item.id === targetId);
+            if (!source || !target) {
+                this.dragOverCommandId = '';
+                this.dragOverCommandPosition = '';
+                if (event?.dataTransfer) event.dataTransfer.dropEffect = 'none';
+                return;
+            }
+
+            const sourceGroup = this.getCommandGroupKey(source);
+            const targetGroup = this.getCommandGroupKey(target);
+            if (sourceGroup !== targetGroup) {
+                this.dragOverCommandId = '';
+                this.dragOverCommandPosition = '';
+                this.dragOverGroupName = targetGroup;
+                if (event?.dataTransfer) event.dataTransfer.dropEffect = targetGroup ? 'move' : 'none';
+                return;
+            }
+
+            this.dragOverGroupName = '';
+            this.dragOverCommandId = targetId;
+            this.dragOverCommandPosition = this.getCommandDropPosition(event);
+            if (event?.dataTransfer) event.dataTransfer.dropEffect = 'move';
+        },
+
+        onCommandDragLeave(commandId, event) {
+            if (event?.currentTarget?.contains(event.relatedTarget)) return;
+            if (this.dragOverCommandId === String(commandId || '').trim()) {
+                this.dragOverCommandId = '';
+                this.dragOverCommandPosition = '';
+            }
+        },
+
+        buildCommandGroupOrder(sourceId, targetId, position) {
+            const source = (this.commands || []).find(item => item.id === sourceId);
+            const target = (this.commands || []).find(item => item.id === targetId);
+            if (!source || !target || source.id === target.id) return null;
+            if (this.getCommandGroupKey(source) !== this.getCommandGroupKey(target)) return null;
+
+            const groupKey = this.getCommandGroupKey(source);
+            const groupIndexes = [];
+            const groupCommands = [];
+            (this.commands || []).forEach((item, index) => {
+                if (this.getCommandGroupKey(item) === groupKey) {
+                    groupIndexes.push(index);
+                    groupCommands.push(item);
+                }
+            });
+
+            const sourceIndex = groupCommands.findIndex(item => item.id === sourceId);
+            if (sourceIndex < 0) return null;
+            const reorderedGroup = groupCommands.slice();
+            const [moved] = reorderedGroup.splice(sourceIndex, 1);
+            const targetIndex = reorderedGroup.findIndex(item => item.id === targetId);
+            if (targetIndex < 0) return null;
+            reorderedGroup.splice(position === 'after' ? targetIndex + 1 : targetIndex, 0, moved);
+
+            if (reorderedGroup.every((item, index) => item.id === groupCommands[index].id)) return null;
+            const next = (this.commands || []).slice();
+            groupIndexes.forEach((commandIndex, index) => {
+                next[commandIndex] = reorderedGroup[index];
+            });
+            return next;
+        },
+
+        async onCommandDrop(commandId, event) {
+            const sourceId = String(this.draggingCommandId || event?.dataTransfer?.getData('text/plain') || '').trim();
+            const targetId = String(commandId || '').trim();
+            const source = (this.commands || []).find(item => item.id === sourceId);
+            const target = (this.commands || []).find(item => item.id === targetId);
+            const sourceGroup = this.getCommandGroupKey(source);
+            const targetGroup = this.getCommandGroupKey(target);
+            if (source && target && sourceGroup !== targetGroup && targetGroup) {
+                await this.onGroupDrop(targetGroup);
+                return;
+            }
+            const position = this.dragOverCommandId === targetId
+                ? this.dragOverCommandPosition
+                : this.getCommandDropPosition(event);
+            this.clearGroupDragState();
+            if (!sourceId || !targetId || this.groupWorking || this.reordering) return;
+            const next = this.buildCommandGroupOrder(sourceId, targetId, position);
+            if (next) await this.persistCommandOrder(next);
+        },
+
+        isGroupDropTarget(groupName) {
+            const name = String(groupName || '').trim();
+            return !!name && name === String(this.dragOverGroupName || '').trim();
+        },
+
+        onGroupDragOver(groupName, event) {
+            if (this.groupWorking) return;
+            if (!String(this.draggingCommandId || '').trim()) return;
+            const name = String(groupName || '').trim();
+            if (!name) return;
+            this.dragOverGroupName = name;
+            if (event?.dataTransfer) {
+                event.dataTransfer.dropEffect = 'move';
+            }
+        },
+
+        onGroupDragLeave(groupName, event) {
+            if (event?.currentTarget?.contains(event.relatedTarget)) return;
+            const name = String(groupName || '').trim();
+            if (!name) return;
+            if (this.dragOverGroupName === name) {
+                this.dragOverGroupName = '';
+            }
+        },
+
+        async assignCommandsToGroup(commandIds, groupName, successPrefix = '命令分组已更新') {
+            const ids = Array.isArray(commandIds)
+                ? commandIds.map(id => String(id || '').trim()).filter(Boolean)
+                : [];
+            const normalizedGroup = String(groupName || '').trim();
+            if (ids.length === 0) {
+                this.$emit('notify', { type: 'error', message: '没有可更新的命令。' });
+                return 0;
+            }
+
+            this.groupWorking = true;
+            try {
+                const result = await this.apiRequest('/api/command-groups', {
+                    method: 'PUT',
+                    body: JSON.stringify({
+                        command_ids: ids,
+                        group_name: normalizedGroup
+                    })
+                });
+                const updated = Number(result.updated || 0);
+                this.$emit('notify', {
+                    type: updated > 0 ? 'success' : 'error',
+                    message: successPrefix + '（' + updated + ' 条）'
+                });
+                if (normalizedGroup) {
+                    this.pendingGroupName = normalizedGroup;
+                    this.selectedExistingGroupName = normalizedGroup;
+                }
+                await this.fetchCommands();
+                return updated;
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: '分组更新失败: ' + e.message });
+                return 0;
+            } finally {
+                this.groupWorking = false;
+                this.clearGroupDragState();
+            }
+        },
+
+        async onGroupDrop(groupName) {
+            const targetGroup = String(groupName || '').trim();
+            const commandId = String(this.draggingCommandId || '').trim();
+            this.clearGroupDragState();
+            if (!targetGroup || !commandId || this.groupWorking) return;
+            const command = (this.commands || []).find(item => item.id === commandId);
+            if (!command) return;
+
+            const currentGroup = String(command.group_name || '').trim();
+            if (currentGroup === targetGroup) {
+                this.$emit('notify', { type: 'success', message: '该命令已经在命令组：' + targetGroup });
+                return;
+            }
+
+            await this.assignCommandsToGroup(
+                [commandId],
+                targetGroup,
+                '已拖动加入命令组：' + targetGroup
+            );
+        },
+
+        async assignSelectedToGroup() {
+            if (!this.hasSelection) {
+                this.$emit('notify', { type: 'error', message: '请先勾选命令。' });
+                return;
+            }
+            const groupName = String(this.pendingGroupName || '').trim() || this.getNextDefaultGroupName();
+            await this.assignCommandsToGroup(
+                this.selectedCommandIds,
+                groupName,
+                '已收纳到命令组：' + groupName
+            );
+        },
+
+        async assignSelectedToExistingGroup() {
+            if (!this.hasSelection) {
+                this.$emit('notify', { type: 'error', message: '请先勾选命令。' });
+                return;
+            }
+            const groupName = String(this.selectedExistingGroupName || '').trim();
+            if (!groupName) {
+                this.$emit('notify', { type: 'error', message: '请先选择已有命令组。' });
+                return;
+            }
+            await this.assignCommandsToGroup(
+                this.selectedCommandIds,
+                groupName,
+                '已加入已有命令组：' + groupName
+            );
+        },
+
+        async renameSelectedGroup() {
+            const sourceName = String(this.selectedExistingGroupName || '').trim();
+            const targetName = String(this.pendingGroupName || '').trim();
+            if (!sourceName) {
+                this.$emit('notify', { type: 'error', message: '请先选择要重命名的命令组。' });
+                return;
+            }
+            if (!targetName) {
+                this.$emit('notify', { type: 'error', message: '请输入新的命令组名称。' });
+                return;
+            }
+            if (sourceName === targetName) {
+                this.$emit('notify', { type: 'warning', message: '新旧命令组名称相同，无需重命名。' });
+                return;
+            }
+            if ((this.commandGroups || []).some(group => group.name === targetName)) {
+                this.$emit('notify', { type: 'error', message: '目标命令组名称已存在。' });
+                return;
+            }
+
+            const sourceGroup = (this.commandGroups || []).find(group => group.name === sourceName);
+            const commandIds = Array.isArray(sourceGroup?.commandIds) ? sourceGroup.commandIds : [];
+            if (commandIds.length === 0) {
+                this.$emit('notify', { type: 'error', message: '未找到要重命名的命令组内容。' });
+                return;
+            }
+
+            const updated = await this.assignCommandsToGroup(
+                commandIds,
+                targetName,
+                '命令组已重命名：' + sourceName + ' -> ' + targetName
+            );
+            if (updated > 0) {
+                this.selectedExistingGroupName = targetName;
+                this.pendingGroupName = targetName;
+            }
+        },
+
+        async ungroupSelectedCommands() {
+            if (!this.hasSelection) {
+                this.$emit('notify', { type: 'error', message: '请先勾选命令。' });
+                return;
+            }
+            await this.assignCommandsToGroup(
+                this.selectedCommandIds,
+                '',
+                '已解散选中命令的分组'
+            );
+        },
+
+        async setCommandsEnabled(commandIds, enabled, successPrefix, errorPrefix = '批量更新命令状态失败') {
+            const ids = Array.isArray(commandIds)
+                ? commandIds.map(id => String(id || '').trim()).filter(Boolean)
+                : [];
+            if (ids.length === 0) {
+                this.$emit('notify', { type: 'error', message: '没有可更新的命令。' });
+                return 0;
+            }
+
+            this.groupWorking = true;
+            try {
+                const result = await this.apiRequest('/api/commands/enabled', {
+                    method: 'PUT',
+                    body: JSON.stringify({
+                        command_ids: ids,
+                        enabled: !!enabled
+                    })
+                });
+                const updated = Number(result.updated || 0);
+                this.$emit('notify', {
+                    type: updated > 0 ? 'success' : 'warning',
+                    message: successPrefix + '（' + updated + ' 条）'
+                });
+                await this.fetchCommands();
+                return updated;
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: errorPrefix + ': ' + e.message });
+                return 0;
+            } finally {
+                this.groupWorking = false;
+            }
+        },
+
+        async disableAllCommands() {
+            const commandIds = (this.commands || [])
+                .map(cmd => cmd?.id)
+                .filter(Boolean);
+            if (commandIds.length === 0) {
+                this.$emit('notify', { type: 'warning', message: '当前没有可禁用命令。' });
+                return;
+            }
+            if (!confirm('确定全部禁用当前所有命令吗？')) return;
+            this.closeBulkActionMenu();
+            await this.setCommandsEnabled(
+                commandIds,
+                false,
+                '已全部禁用命令',
+                '全部禁用失败'
+            );
+        },
+
+        async enableAllDisabledCommands() {
+            const disabledIds = (this.commands || [])
+                .filter(cmd => cmd && cmd.enabled === false)
+                .map(cmd => cmd.id)
+                .filter(Boolean);
+            if (disabledIds.length === 0) {
+                this.$emit('notify', { type: 'warning', message: '当前没有禁用命令。' });
+                return;
+            }
+            if (!confirm('确定全部解禁当前所有禁用命令吗？')) return;
+            this.closeBulkActionMenu();
+            await this.setCommandsEnabled(
+                disabledIds,
+                true,
+                '已全部解禁命令',
+                '全部解禁失败'
+            );
+        },
+
+        async setGroupEnabled(groupName, enabled) {
+            const name = String(groupName || '').trim();
+            if (!name) return 0;
+            const actionText = enabled ? '启用' : '禁用';
+            if (!confirm('确定' + actionText + '命令组「' + name + '」吗？')) return 0;
+
+            this.groupWorking = true;
+            try {
+                const result = await this.apiRequest('/api/command-groups/' + encodeURIComponent(name) + '/enabled', {
+                    method: 'PUT',
+                    body: JSON.stringify({
+                        enabled: !!enabled
+                    })
+                });
+                const updated = Number(result.updated || 0);
+                this.$emit('notify', {
+                    type: updated > 0 ? 'success' : 'warning',
+                    message: '命令组已' + actionText + '：' + name + '（' + updated + ' 条）'
+                });
+                await this.fetchCommands();
+                return updated;
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: actionText + '命令组失败: ' + e.message });
+                return 0;
+            } finally {
+                this.groupWorking = false;
+            }
+        },
+
+        async disableGroup(groupName) {
+            this.closeGroupActionMenu();
+            await this.setGroupEnabled(groupName, false);
+        },
+
+        async enableGroup(groupName) {
+            this.closeGroupActionMenu();
+            await this.setGroupEnabled(groupName, true);
+        },
+
+        async disbandGroup(groupName) {
+            const name = String(groupName || '').trim();
+            if (!name) return;
+            this.closeGroupActionMenu();
+            if (!confirm('确定解散命令组「' + name + '」吗？')) return;
+            this.groupWorking = true;
+            try {
+                const result = await this.apiRequest('/api/command-groups/' + encodeURIComponent(name), {
+                    method: 'DELETE'
+                });
+                this.$emit('notify', {
+                    type: 'success',
+                    message: '命令组已解散：' + name + '（' + (result.updated || 0) + ' 条）'
+                });
+                await this.fetchCommands();
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: '解散命令组失败: ' + e.message });
+            } finally {
+                this.groupWorking = false;
+            }
+        },
+
+        async runGroup(groupName) {
+            const name = String(groupName || '').trim();
+            if (!name) return;
+            this.closeGroupActionMenu();
+            this.groupWorking = true;
+            try {
+                const result = await this.apiRequest('/api/command-groups/' + encodeURIComponent(name) + '/execute', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        include_disabled: !!this.includeDisabledWhenRunGroup,
+                        acquire_policy: this.runGroupAcquirePolicy || 'inherit_session'
+                    })
+                });
+                const executed = result.executed || 0;
+                const total = result.total || 0;
+                const failures = result.failures || 0;
+                this.$emit('notify', {
+                    type: result.ok ? 'success' : (result.partial_ok ? 'warning' : 'error'),
+                    message: result.ok
+                        ? ('命令组已执行：' + name + '（成功 ' + executed + ' / ' + total + '）')
+                        : (result.partial_ok
+                            ? ('命令组部分成功：' + name + '（成功 ' + executed + ' / ' + total + '，失败 ' + failures + '）')
+                            : ('命令组执行失败：' + name + '（成功 ' + executed + ' / ' + total + '，失败 ' + failures + '）'))
+                });
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: '执行命令组失败: ' + e.message });
+            } finally {
+                this.groupWorking = false;
+            }
+        },
+
+        ensureValidPage() {
+            if (this.currentPage > this.totalPages) {
+                this.currentPage = this.totalPages;
+            }
+            if (this.currentPage < 1) {
+                this.currentPage = 1;
+            }
+        },
+
+        async duplicateGroup(groupName) {
+            const name = String(groupName || '').trim();
+            if (!name || this.groupWorking) return;
+            this.groupWorking = true;
+            this.groupActionMenuOpen = '';
+            try {
+                const result = await this.apiRequest('/api/command-groups/' + encodeURIComponent(name) + '/duplicate', {
+                    method: 'POST'
+                });
+                const duplicatedName = result.group_name || '命令组副本';
+                this.selectedExistingGroupName = duplicatedName;
+                this.pendingGroupName = duplicatedName;
+                this.$emit('notify', {
+                    type: 'success',
+                    message: '已复制命令组：' + duplicatedName + '（' + Number(result.count || 0) + ' 条）'
+                });
+                await this.fetchCommands();
+            } catch (e) {
+                this.$emit('notify', { type: 'error', message: '复制命令组失败: ' + e.message });
+            } finally {
+                this.groupWorking = false;
+            }
+        },
+
+        applyPageSize() {
+            const value = Number(this.pageSize);
+            if (!Number.isFinite(value) || value <= 0) {
+                this.pageSize = 16;
+            } else {
+                this.pageSize = Math.min(500, Math.floor(value));
+            }
+            this.changePage(1);
+        },
+
+        changePage(page) {
+            const nextPage = Math.min(this.totalPages, Math.max(1, page));
+            this.currentPage = nextPage;
+        },
+
+        getCommandOrder(commandId) {
+            return this.commands.findIndex(cmd => cmd.id === commandId) + 1;
+        },
+
+        toggleHelp() {
+            this.showHelpTip = !this.showHelpTip;
+        },
+
+        async moveCommand(cmd, direction) {
+            if (this.reordering) return;
+            const peers = this.getCommandGroupPeers(cmd);
+            const index = peers.findIndex(item => item.id === cmd?.id);
+            const target = peers[index + direction];
+            if (!target) return;
+            const next = this.buildCommandGroupOrder(
+                cmd.id,
+                target.id,
+                direction < 0 ? 'before' : 'after'
+            );
+            if (next) await this.persistCommandOrder(next);
+        },
+
+        async persistCommandOrder(next) {
+            if (this.reordering || !Array.isArray(next)) return;
+            const previous = this.commands.slice();
+            this.commands = next;
+            this.reordering = true;
+
+            try {
+                await this.apiRequest('/api/commands/reorder', {
+                    method: 'PUT',
+                    body: JSON.stringify({ command_ids: next.map(item => item.id) })
+                });
+                this.ensureValidPage();
+            } catch (e) {
+                this.commands = previous;
+                this.$emit('notify', { type: 'error', message: '排序更新失败: ' + e.message });
+            } finally {
+                this.reordering = false;
+            }
+        },
+
+        getTriggerLabel(type) {
+            return this.getTriggerTypeMeta(type).label;
+        },
+
+        getActionLabel(type) {
+            return (this.meta.action_types || {})[type] || type;
+        },
+
+        getScopeLabel(scope) {
+            const map = { all: '所有标签页', domain: '指定域名', tab: '指定标签页' };
+            return map[scope] || scope;
+        },
+
+        formatTime(ts) {
+            if (!ts) return '从未';
+            return new Date(ts * 1000).toLocaleString();
+        }
+};
