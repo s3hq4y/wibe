@@ -71,3 +71,7 @@ resources/uwa-sidecar/download_images/
 extensions/incontrol/out/
 extensions/incontrol/gui/dist/
 extensions/incontrol/**/node_modules/
+
+# uwa sidecar python bytecode
+resources/uwa-sidecar/**/__pycache__/
+resources/uwa-sidecar/**/*.pyc
