@@ -74,7 +74,7 @@ if (Test-Path (Join-Path $ptyBin "conpty.node")) {
   }
   Write-Host "      conpty.node deployed"
   # 文件放到 .unpacked 还不够：Electron 只对 asar 头部登记过的条目做重定向。
-  $reg = Join-Path $Src "build\register-pty-in-asar.js"
+  $reg = Join-Path $Src "build\register-pty-in-asar.cjs"
   $asar = Join-Path $Prod "resources\app\node_modules.asar"
   if ((Test-Path $reg) -and (Test-Path $asar)) {
     $env:ASAR = $asar
@@ -93,4 +93,5 @@ foreach($m in @("sqlite3","web-tree-sitter","win-ca")){
 }
 Pop-Location
 Write-Host "post-build done."
+
 
