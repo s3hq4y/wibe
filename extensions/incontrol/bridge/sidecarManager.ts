@@ -75,7 +75,7 @@ export class SidecarManager {
 	 * 选解释器：sidecar 自带的 venv 优先（start.py 若跑过会生成），
 	 * 否则回退到系统 Python 探测。
 	 */
-	private resolvePython(): string {
+	private resolvePython(): string | undefined {
 		const venvPy = process.platform === 'win32'
 			? path.join(this.opts.sidecarRoot, 'venv', 'Scripts', 'python.exe')
 			: path.join(this.opts.sidecarRoot, 'venv', 'bin', 'python');
@@ -140,6 +140,18 @@ export class SidecarManager {
 
 		this.proc.stdout?.on('data', d => this.log(String(d).trimEnd()));
 		this.proc.stderr?.on('data', d => this.log(String(d).trimEnd()));
+		// 没有这个监听，spawn 失败（最常见是 ENOENT：解释器路径不存在）
+		// 会被完全吞掉，只表现为后续 60s 健康探测超时，极难定位。
+		this.proc.on('error', err => {
+			const e = err as NodeJS.ErrnoException;
+			if (e.code === 'ENOENT') {
+				this.log(`PYTHON_NOT_FOUND: cannot execute "${python}" — set incontrol.sidecar.pythonPath`);
+			} else {
+				this.log(`spawn error: ${e.code ?? ''} ${e.message}`);
+			}
+			this.proc = undefined;
+		});
+
 		this.proc.on('exit', (code, signal) => {
 			this.log(`exited code=${code} signal=${signal}`);
 			this.proc = undefined;
@@ -155,13 +167,49 @@ export class SidecarManager {
 		return this.checkHealth(this.port);
 	}
 
-	private detectPython(): string {
-		// 优先使用随产品分发的 embeddable Python
-		const bundled = path.join(this.opts.sidecarRoot, '..', 'python', 'python.exe');
+	/**
+	 * 逐个候选探测可用的 Python，全部校验存在性后才返回。
+	 *
+	 * 之前这里无条件返回随产品分发的 embeddable Python 路径，但该文件在
+	 * 当前构建中并不存在 —— spawn 立刻 ENOENT，而错误被静默吞掉，
+	 * 表象是「startup timeout (60s)」，完全指错了方向。
+	 */
+	private detectPython(): string | undefined {
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const fsMod = require('fs');
+		const candidates: string[] = [];
+
+		// 1) 随产品分发的 embeddable Python（若将来提供）
+		candidates.push(path.join(this.opts.sidecarRoot, '..', 'python', 'python.exe'));
+		// 2) sidecar 自建 venv（start.py 跑过后会有）
 		if (process.platform === 'win32') {
-			return bundled;
+			candidates.push(path.join(this.opts.sidecarRoot, 'venv', 'Scripts', 'python.exe'));
+		} else {
+			candidates.push(path.join(this.opts.sidecarRoot, 'venv', 'bin', 'python'));
 		}
-		return 'python3';
+		// 3) 本机已安装的解释器（依赖已装在这里）
+		if (process.platform === 'win32') {
+			for (const root of [process.env.LOCALAPPDATA, process.env.ProgramFiles, 'E:\\System\\environment']) {
+				if (!root) { continue; }
+				for (const v of ['python-3.14.4', 'Python314', 'Python313', 'Python312', 'Python311', 'Programs\\Python\\Python313', 'Programs\\Python\\Python312']) {
+					candidates.push(path.join(root, v, 'python.exe'));
+				}
+			}
+		}
+
+		for (const c of candidates) {
+			try {
+				if (fsMod.existsSync(c)) {
+					this.log(`python: ${c}`);
+					return c;
+				}
+			} catch { /* ignore */ }
+		}
+
+		// 4) 回落到 PATH，交给 spawn 解析（失败会被 on('error') 捕获）
+		const fallback = process.platform === 'win32' ? 'python.exe' : 'python3';
+		this.log(`python: no explicit interpreter found, falling back to "${fallback}" on PATH`);
+		return fallback;
 	}
 
 	private async waitReady(timeoutMs: number): Promise<boolean> {

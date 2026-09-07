@@ -101,8 +101,17 @@ export class BrowserLauncher {
 	async ensure(): Promise<string | undefined> {
 		const existing = await probeDevTools(this.opts.port);
 		if (existing) {
-			this.opts.log(`reusing browser on :${this.opts.port} (${existing})`);
-			return existing;
+			// /json/version 有响应还不够：僵死的 Chrome 仍会应答版本号，
+			// 但已无法接管。uwa 用的 DrissionPage 是同步库，接管失败会在
+			// asyncio 事件循环里反复阻塞重连，导致整个 HTTP 服务不响应
+			// —— 表象是 sidecar「启动超时」，极难定位。这里必须确认
+			// 浏览器真能列出 target 才复用。
+			if (await this.canCreateTarget()) {
+				this.opts.log(`reusing browser on :${this.opts.port} (${existing})`);
+				return existing;
+			}
+			this.opts.log(`browser on :${this.opts.port} is unresponsive; relaunching`);
+			await this.killStale();
 		}
 
 		const exe = detectBrowser(this.opts.executablePath);
@@ -144,6 +153,50 @@ export class BrowserLauncher {
 		}
 		this.opts.log('browser did not expose DevTools within 20s');
 		return undefined;
+	}
+
+
+	/** 列举 target 以确认浏览器真的可接管，而不只是端口有回应 */
+	private canCreateTarget(): Promise<boolean> {
+		return new Promise(resolve => {
+			const req = http.get(
+				{ host: '127.0.0.1', port: this.opts.port, path: '/json/list', timeout: 4000 },
+				res => {
+					let body = '';
+					res.on('data', c => (body += c));
+					res.on('end', () => {
+						try {
+							resolve(Array.isArray(JSON.parse(body)));
+						} catch {
+							resolve(false);
+						}
+					});
+				},
+			);
+			req.on('error', () => resolve(false));
+			req.on('timeout', () => { req.destroy(); resolve(false); });
+		});
+	}
+
+	/** 清掉占着调试端口但已失能的 Chrome，避免新实例无法绑定 */
+	private async killStale(): Promise<void> {
+		if (process.platform !== 'win32') { return; }
+		try {
+			const { execSync } = require('child_process');
+			const out = execSync(`netstat -ano -p TCP | findstr :${this.opts.port}`, {
+				encoding: 'utf8', windowsHide: true,
+			});
+			const pids = new Set<string>();
+			for (const line of String(out).split(/\r?\n/)) {
+				const m = line.trim().match(/LISTENING\s+(\d+)/);
+				if (m) { pids.add(m[1]); }
+			}
+			for (const pid of pids) {
+				this.opts.log(`killing stale browser pid=${pid}`);
+				execSync(`taskkill /pid ${pid} /T /F`, { windowsHide: true, stdio: 'ignore' });
+			}
+			await new Promise(r => setTimeout(r, 1500));
+		} catch { /* 没有残留或已退出 */ }
 	}
 
 	/** 只关闭我们自己启动的实例 */
