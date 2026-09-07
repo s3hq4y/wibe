@@ -51,6 +51,25 @@ if(Test-Path $distSrc){
 }
 if(-not (Test-Path (Join-Path $distDst "extension.js"))){ throw "dist/extension.js missing in product" }
 
+# package.json 也要同步，否则新增命令不会注册。但必须 rewrite main：
+# 源码树写的是 ./out/extension.js，而 VS Code 打包约定产品内为 ./dist/extension.js，
+# 直接整份拷贝会把 main 覆盖回 out/，导致扩展加载旧文件、新命令全部 not found。
+$pkgSrc = Join-Path $extSrc  "package.json"
+$pkgDst = Join-Path $extProd "package.json"
+if (Test-Path $pkgSrc) {
+  # 用 .NET 写入而非 Set-Content -Encoding utf8：后者会写出 UTF-8 BOM，
+  # 而 Node 对 package.json 的 BOM 零容忍 —— 报 ERR_INVALID_PACKAGE_CONFIG，
+  # 导致扩展本身及其 node_modules 依赖全部无法解析。
+  $txt = [System.IO.File]::ReadAllText($pkgSrc)
+  $txt = $txt -replace '"main"\s*:\s*"\./out/extension\.js"', '"main": "./dist/extension.js"'
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($pkgDst, $txt, $utf8NoBom)
+  $bytes = [System.IO.File]::ReadAllBytes($pkgDst)
+  if ($bytes[0] -eq 239 -and $bytes[1] -eq 187) { throw "package.json written with BOM" }
+  if ($txt -notmatch 'dist/extension\.js') { throw "main rewrite failed" }
+  Write-Host "      package.json synced (main -> dist, no BOM)"
+}
+
 Write-Host "[4/4] node-pty native module -> product"
 # node-pty 的 .node 不随 npm install 落地（prebuild 脚本对 electron ABI 无预编译产物），
 # 必须用 node-gyp 按 .npmrc 里的 runtime=electron/target 手工编译一次：
