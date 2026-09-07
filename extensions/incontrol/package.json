@@ -138,6 +138,36 @@
           "type": "number",
           "default": 60,
           "description": "%configuration.incontrol.remoteConfigSyncPeriod%"
+        },
+        "incontrol.sidecar.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "扩展激活时自动启动 uwa sidecar（Python 服务 + 浏览器自动化）"
+        },
+        "incontrol.sidecar.port": {
+          "type": "number",
+          "default": 8199,
+          "description": "uwa sidecar 监听端口。被占用时会自动向后顺延。"
+        },
+        "incontrol.sidecar.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python 解释器路径。留空则使用随产品分发的 embeddable Python。"
+        },
+        "incontrol.bridge.modelRoutes": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "模型名 -> uwa 路由映射。切换模型常意味着换站点，需显式映射。\n\n示例：\n```json\n{\n  \"gemini-2.5-pro\": { \"routeDomain\": \"gemini.google.com\" },\n  \"deepseek-chat\": { \"routeDomain\": \"chat.deepseek.com\", \"presetName\": \"expert\" }\n}\n```"
+        },
+        "incontrol.bridge.autoMigrateOnCompaction": {
+          "type": "boolean",
+          "default": true,
+          "description": "对话压缩完成后，自动把系统提示词+摘要迁移到新的网页对话"
+        },
+        "incontrol.bridge.autoMigrateOnModelSwitch": {
+          "type": "boolean",
+          "default": true,
+          "description": "切换模型时，自动把打包的历史迁移到新的网页对话"
         }
       }
     },
@@ -342,6 +372,31 @@
         "category": "incontrol",
         "title": "%command.incontrol.openInNewWindow%",
         "group": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.showConversation",
+        "title": "uwa: 查看当前网页对话",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.compactAndMigrate",
+        "title": "uwa: 压缩并迁移到新对话",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.migrateOnModelSwitch",
+        "title": "uwa: 切换模型并迁移上下文",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.restartSidecar",
+        "title": "uwa: 重启 sidecar",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.showLogs",
+        "title": "uwa: 查看 sidecar 日志",
+        "category": "incontrol"
       }
     ],
     "keybindings": [

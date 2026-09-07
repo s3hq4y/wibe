@@ -1,6 +1,7 @@
 import { ChatHistoryItem, ILLM, ToolResultChatMessage } from "..";
 import { HistoryManager } from "./history";
 import { stripImages } from "./messageContent";
+import { onCompactionCompleted } from "./compactionEvents";
 
 export interface CompactionParams {
   sessionId: string;
@@ -109,4 +110,16 @@ export async function compactConversation({
   };
 
   historyManager.save(updatedSession);
+
+  // 通知桥接层：压缩完成，可把系统提示词 + 摘要迁移到新的网页对话。
+  // 事件总线是解耦的，无订阅者时（非 VS Code 宿主）这里是 no-op。
+  const summaryText = stripImages(response.content);
+  void onCompactionCompleted.emit({
+    sessionId,
+    index,
+    summary: summaryText,
+    systemPrompt: messages.find((m) => m.role === "system")
+      ? stripImages(messages.find((m) => m.role === "system")!.content)
+      : undefined,
+  });
 }

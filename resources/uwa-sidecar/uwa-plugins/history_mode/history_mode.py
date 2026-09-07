@@ -21,7 +21,7 @@ def normalize_history_mode(mode: Any, default: str = "auto") -> str:
     """归一化 history_mode 参数，支持 auto, full, last (大小写不敏感)"""
     if isinstance(mode, str):
         cleaned = mode.strip().lower()
-        if cleaned in {"auto", "full", "last"}:
+        if cleaned in {"auto", "full", "ide", "last"}:
             return cleaned
     return default
 

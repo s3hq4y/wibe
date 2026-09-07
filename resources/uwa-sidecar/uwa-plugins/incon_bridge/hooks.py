@@ -128,4 +128,17 @@ def on_workflow_end(session, tab, resolution, messages, prompt_text,
 def register(host) -> None:
     host.register("resolve_history", resolve_history)
     host.register("on_workflow_end", on_workflow_end)
+
+    # 安装 API 层接线（请求字段解析 + 响应 x_uwa 回传）。
+    # 失败只降级不报错：uwa 仍可作为普通 OpenAI 网关使用。
+    try:
+        from .api_patch import install
+
+        if install():
+            logger.info("[incon_bridge] API 接线已安装")
+        else:
+            logger.warning("[incon_bridge] API 接线未完全安装，x_uwa 可能缺失")
+    except Exception as exc:
+        logger.warning("[incon_bridge] API 接线失败: %s", exc)
+
     logger.info("[incon_bridge] 已注册 2 个钩子 (ide 模式)")
