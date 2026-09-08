@@ -25,7 +25,11 @@ import {
   toChatBody,
   toResponsesInput,
 } from "../openaiTypeConverters.js";
-import { consumeUwaFields } from "../../util/uwaRequestContext.js";
+import { consumeUwaFields, getUwaConversationState, setUwaConversationState } from "../../util/uwaRequestContext.js";
+import {
+  ensureConversationPage,
+  prepareUwaTargetUrl,
+} from "../../util/uwaConversationSync.js";
 
 const NON_CHAT_MODELS = [
   "text-davinci-002",
@@ -541,9 +545,36 @@ class OpenAI extends BaseLLM {
     const body = this._convertArgs(options, messages);
     // 合并 uwa 桥接字段：让 sidecar 知道这是 ide 模式的续聊，
     // 否则它会按默认逻辑在同一会话里反复开新对话。
-    Object.assign(body as any, consumeUwaFields() ?? {});
+    const uwaFields = consumeUwaFields() ?? {};
+    Object.assign(body as any, uwaFields);
 
-    const response = await this.fetch(this._getEndpoint("chat/completions"), {
+    // 需求「切回旧会话 → 网页切回原对话」：续聊（非强制开新）且本会话
+    // 已绑定网页对话 URL 时，发送前把请求对准绑定会话页：
+    //   1. 优先走 /tab-url/<token> 确定性路由（多标签池下按 URL 锁定标签页，
+    //      避免轮询把续聊分到别的会话页）；
+    //   2. 页面不在池中时先让受控浏览器导航回绑定 URL 再重试；
+    //   3. 都失败则降级回默认端点（消息照发，日志可追踪，不阻断）。
+    let uwaTargetUrl: URL | undefined;
+    try {
+      const mode = String((uwaFields as any).history_mode ?? "").toLowerCase();
+      const forceNew = Boolean((uwaFields as any).force_new_conversation);
+      if (mode === "ide" && !forceNew && this.apiBase) {
+        const st = getUwaConversationState();
+        if (st?.conversationUrl) {
+          const origin = new URL(this.apiBase).origin;
+          const target = await prepareUwaTargetUrl(origin, st.conversationUrl);
+          if (target) {
+            uwaTargetUrl = new URL(target);
+          }
+        }
+      }
+    } catch {
+      /* 降级：继续发送 */
+    }
+
+    const response = await this.fetch(
+      uwaTargetUrl ?? this._getEndpoint("chat/completions"),
+      {
       method: "POST",
       headers: this._getHeaders(),
       body: JSON.stringify({
@@ -559,16 +590,40 @@ class OpenAI extends BaseLLM {
         return; // Aborted by user
       }
       const data = await response.json();
+      this.recordUwaExt((data as any)?.x_uwa);
       yield data.choices[0].message;
       return;
     }
 
     for await (const value of streamSse(response)) {
+      const raw = value as any;
+      const xu = raw?.x_uwa;
+      if (xu && !Array.isArray(raw?.choices)) {
+        // sidecar 在流末尾追加的会话信息帧（无 choices）
+        this.recordUwaExt(xu);
+        continue;
+      }
       const chunk = fromChatCompletionChunk(value);
       if (chunk) {
         yield chunk;
       }
     }
+  }
+
+  /** 从 x_uwa 响应扩展里记录网页对话绑定（需求：会话 ↔ 网页对话一致） */
+  private recordUwaExt(xu: any): void {
+    const url = xu?.conversation_url;
+    if (!url || typeof url !== "string") {
+      return;
+    }
+    setUwaConversationState({
+      conversationUrl: url,
+      conversationId:
+        typeof xu.conversation_id === "string" ? xu.conversation_id : "",
+      tabIndex: Number.isFinite(xu.tab_index) ? Number(xu.tab_index) : -1,
+      turn: Number.isFinite(xu.turn) ? Number(xu.turn) : 0,
+      updatedAt: Date.now(),
+    });
   }
 
   // Minimal draft: Responses API support for select models
