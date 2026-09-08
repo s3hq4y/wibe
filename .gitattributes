@@ -10,4 +10,4 @@ ThirdPartyNotices.txt eol=crlf
 *.rtf -text
 **/*.json linguist-language=jsonc
 
-.portal/*
+

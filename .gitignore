@@ -88,3 +88,17 @@ extensions/incontrol/dist/
 
 resources/uwa-sidecar/chrome_profile/
 resources/uwa-sidecar/_s.*
+
+.portal/
+
+# uwa e2e browser profiles: browsing/chat history, caches, local state
+resources/uwa-sidecar/chrome_profile*/
+# backup snapshots taken before bridge fixes (keep local)
+*.bak-20260909-g2fix
+# local-only helper scripts
+/uwa_git2.ps1
+/uwa_push.ps1
+# stale root-level mirrors of extensions/incontrol source (older snapshots; superseded by tracked copies)
+/bridge/
+/core/
+/gui/
