@@ -44,6 +44,14 @@ export function resolveModelRoute(modelName: string): ModelRoute {
 	return prefixKey ? table[prefixKey] : {};
 }
 
+/** 需求 2 迁移的可选上下文：压缩发生在哪个 IDE 会话、迁移前 URL。
+ *  传入后 compactAndMigrate 会把新对话 URL 回写到该会话自己的绑定槽，
+ *  保证后续消息续聊在新对话上，且 A/B 会话并行时互不串扰。 */
+export interface CompactionMigrateOptions {
+	sessionId?: string;
+	prevConversationUrl?: string;
+}
+
 /**
  * 需求 2：压缩完成后调用。
  *
@@ -53,6 +61,7 @@ export function resolveModelRoute(modelName: string): ModelRoute {
 export async function onCompactionComplete(
 	systemPrompt: string,
 	summary: string,
+	opts: CompactionMigrateOptions = {},
 ): Promise<void> {
 	if (!summary?.trim()) {
 		return;
@@ -60,6 +69,8 @@ export async function onCompactionComplete(
 	await vscode.commands.executeCommand('incontrol.bridge.compactAndMigrate', {
 		systemPrompt,
 		summary,
+		sessionId: opts.sessionId,
+		prevConversationUrl: opts.prevConversationUrl,
 	});
 }
 

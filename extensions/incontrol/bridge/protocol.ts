@@ -112,6 +112,7 @@ export interface MigrationResult {
 	conversationUrl?: string;
 	conversationId?: string;
 	tabIndex?: number;
+	turn?: number;
 	estimatedTokens?: number;
 	error?: string;
 }

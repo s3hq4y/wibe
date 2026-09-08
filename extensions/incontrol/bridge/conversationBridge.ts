@@ -109,7 +109,7 @@ export class ConversationBridge {
 	}
 
 	/** 构造带桥接字段的请求体扩展 */
-	buildRequestExtension(forceNew: boolean, reason?: MigrationRequest['reason']): UwaRequestExtension {
+	buildRequestExtension(forceNew: boolean, reason?: MigrationRequest['reason'], prevConversationUrl?: string): UwaRequestExtension {
 		return {
 			history_mode: 'ide',
 			force_new_conversation: forceNew,
@@ -118,7 +118,7 @@ export class ConversationBridge {
 				? {
 					conversation_hint: {
 						reason: reason ?? 'manual',
-						prev_conversation_url: this.binding.conversationUrl,
+						prev_conversation_url: prevConversationUrl,
 					},
 				}
 				: {}),
@@ -158,7 +158,7 @@ export class ConversationBridge {
 					model: 'default',
 					messages,
 					stream: false,
-					...this.buildRequestExtension(true, req.reason),
+					...this.buildRequestExtension(true, req.reason, req.prevConversationUrl),
 				}),
 			});
 
@@ -190,6 +190,7 @@ export class ConversationBridge {
 				conversationUrl: ext.conversation_url,
 				conversationId: ext.conversation_id,
 				tabIndex: ext.tab_index,
+				turn: ext.turn || 1,
 				estimatedTokens: tokens,
 			};
 		} catch (e: any) {
@@ -201,13 +202,13 @@ export class ConversationBridge {
 		}
 	}
 
-	/** 需求 2：压缩完成后调用 */
-	async migrateAfterCompaction(systemPrompt: string, summary: string): Promise<MigrationResult> {
+	/** 需求 2：压缩完成后调用。prevConversationUrl 若省略则回退全局 binding */
+	async migrateAfterCompaction(systemPrompt: string, summary: string, prevConversationUrl?: string): Promise<MigrationResult> {
 		return this.migrate({
 			reason: 'compaction',
 			systemPrompt,
 			payload: summary,
-			prevConversationUrl: this.binding.conversationUrl,
+			prevConversationUrl: prevConversationUrl ?? this.binding.conversationUrl,
 		});
 	}
 

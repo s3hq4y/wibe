@@ -16,11 +16,14 @@ import { onCompactionComplete, onModelSwitch } from './bridgeTriggers';
 import { MigrationResult, SessionBinding } from './protocol';
 import { SidecarManager } from './sidecarManager';
 import {
+	getUwaConversationStateForSession,
 	markNextRequest,
 	onUwaConversationChanged,
 	setUwaBridgeEnabled,
+	setUwaConversationStateForSession,
 	setUwaSidecarBaseUrl,
 	setUwaTrace,
+	uwaTrace,
 } from '../core/util/uwaRequestContext.js';
 import {
 	clearUwaSyncedModels,
@@ -522,10 +525,17 @@ export async function activateBridge(
 			}
 		}),
 
-		/** 需求 2：压缩当前对话并迁移到新的网页对话 */
+		/** 需求 2：压缩当前对话并迁移到新的网页对话。
+		 *  可带 sessionId/prevConversationUrl：成功后把新对话 URL 回写到该
+		 *  IDE 会话自己的绑定槽，使后续消息直接续聊在新对话上（而非再开一个）。 */
 		vscode.commands.registerCommand(
 			'incontrol.bridge.compactAndMigrate',
-			async (args?: { systemPrompt?: string; summary?: string }) => {
+			async (args?: {
+				systemPrompt?: string;
+				summary?: string;
+				sessionId?: string;
+				prevConversationUrl?: string;
+			}) => {
 				if (!bridge) { return; }
 				const summary = args?.summary;
 				if (!summary) {
@@ -534,12 +544,47 @@ export async function activateBridge(
 					);
 					return;
 				}
+				// 迁移需要 sidecar；未就绪时先拉起一次（失败则如实提示）。
+				if (sidecar) {
+					const health = await sidecar.checkHealth();
+					if (!health.alive) {
+						const started = await sidecar.start();
+						if (!started.alive) {
+							const seeLog = '查看日志';
+							const picked = await vscode.window.showErrorMessage(
+								`uwa sidecar 未就绪，无法迁移到新的网页对话。${started.error ?? ''}`,
+								seeLog,
+							);
+							if (picked === seeLog) { output?.show(); }
+							return;
+						}
+						syncSidecarBaseUrl();
+					}
+				}
 				renderStatus({ ...bridge.getBinding(), state: 'MIGRATING' });
 				const res = await vscode.window.withProgress(
 					{ location: vscode.ProgressLocation.Notification, title: '压缩后迁移到新对话…' },
-					() => bridge!.migrateAfterCompaction(args?.systemPrompt ?? '', summary),
+					() =>
+						bridge!.migrateAfterCompaction(
+							args?.systemPrompt ?? '',
+							summary,
+							args?.prevConversationUrl,
+						),
 				);
 				await reportMigration(res, '压缩迁移');
+				// 成功后：把新 URL 写回「压缩所在 IDE 会话」的绑定槽。
+				if (res.ok && res.conversationUrl && args?.sessionId) {
+					setUwaConversationStateForSession(args.sessionId, {
+						conversationUrl: res.conversationUrl,
+						conversationId: res.conversationId ?? '',
+						tabIndex: res.tabIndex ?? -1,
+						turn: res.turn ?? 1,
+						updatedAt: Date.now(),
+					});
+					uwaTrace(
+						`compaction migrated session=${args.sessionId} -> ${res.conversationUrl}`,
+					);
+				}
 			},
 		),
 
@@ -634,24 +679,32 @@ export async function activateBridge(
 			if (!enabled) {
 				return;
 			}
-			// 仅当存在网页会话绑定时自动迁移：未绑定的纯 IDE 流擅自打开新的
-			// 网页对话不符合预期（可用 compactAndMigrate 命令手动触发）。
-			const binding = bridge?.getBinding();
-			if (!binding || binding.state === 'IDLE') {
-				log('skip auto compaction migration: no bound web conversation');
+			// 迁移按「本次压缩所在 IDE 会话自己的绑定槽」判定，而非 bridge 全局
+			// binding：A/B 多会话并行时压缩 A 只动 A 的网页对话，绝不串到 B。
+			const prevUrl = e.sessionId
+				? getUwaConversationStateForSession(e.sessionId)?.conversationUrl
+				: undefined;
+			if (!prevUrl) {
+				// 该会话尚未绑定网页对话：只复制摘要，不擅自开新对话。
+				log(
+					`skip compaction migration for session=${e.sessionId ?? '?'}: no bound web conversation`,
+				);
+				vscode.window.setStatusBarMessage(
+					'$(info) 压缩完成，摘要已复制；该会话尚未绑定 uwa 网页对话，未迁移',
+					5000,
+				);
 				return;
 			}
-			// 需求 2：压缩后下一条消息必须落到新对话，并重新注入系统提示词。
-			markNextRequest({
-				force_new_conversation: true,
-				system_prompt_mode: 'always',
-				conversation_hint: {
-					reason: 'compaction',
-					prev_conversation_url: bridge?.getBinding()?.conversationUrl,
-				},
+			log(
+				`compaction completed for session=${e.sessionId ?? '?'} idx=${e.index} prev=${prevUrl}`,
+			);
+			// 压缩迁移：直接把摘要+系统提示词发到全新网页对话（compactAndMigrate）。
+			// 成功后 compactAndMigrate 会把这个会话的绑定槽更新为新 URL，后续
+			// 续聊自动落在新对话上 —— 不再用 markNextRequest 强制再开一个对话。
+			await onCompactionComplete(e.systemPrompt ?? '', e.summary, {
+				sessionId: e.sessionId,
+				prevConversationUrl: prevUrl,
 			});
-			log(`compaction completed for session=${e.sessionId} idx=${e.index}`);
-			await onCompactionComplete(e.systemPrompt ?? '', e.summary);
 		}),
 	});
 

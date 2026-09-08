@@ -107,13 +107,26 @@ export function consumeUwaFields(): UwaRequestFields | undefined {
  * messages 第一条 user 文本（跳过 system/工具）的 sha1 摘要——该路径要求不同
  * 会话首条 user 不同，否则会共槽（已知限制）。
  */
+/** 会话绑定槽键（以 IDE 会话 id 直接作键）：同一会话任意轮次不变；
+ *  不同会话即使首条 user 文本相同也不共槽。供 bridge 在压缩迁移等
+ *  场景按会话 id 精确读写绑定。 */
+export function uwaSessionFingerprint(
+	sessionId?: string | null,
+): string | undefined {
+	const sid = String(sessionId ?? '').trim();
+	if (!sid) {
+		return undefined;
+	}
+	return createHash('sha1').update(`sid:${sid}`).digest('hex').slice(0, 20);
+}
+
 export function uwaConversationFingerprint(
 	messages: { role?: string; content?: unknown }[],
 	sessionKey?: string | null,
 ): string | undefined {
-	const sid = String(sessionKey ?? '').trim();
-	if (sid) {
-		return createHash('sha1').update(`sid:${sid}`).digest('hex').slice(0, 20);
+	const fp = uwaSessionFingerprint(sessionKey);
+	if (fp) {
+		return fp;
 	}
 	for (const m of messages || []) {
 		if (m && String(m.role ?? '').toLowerCase() === 'user') {
@@ -173,6 +186,28 @@ export function getUwaConversationState(
 		return slots.get(fp);
 	}
 	return conversation;
+}
+
+/** 需求 2：按 IDE 会话 id 读/写该会话自己的网页对话绑定槽。
+ *  语义与 fp 版一致：查不到返回 undefined，绝不回退到其它会话的绑定
+ *  （否则 A/B 多会话并行时压缩 A 可能把迁移目标/续聊串到 B）。 */
+export function getUwaConversationStateForSession(
+	sessionId?: string | null,
+): UwaConversationState | undefined {
+	const fp = uwaSessionFingerprint(sessionId);
+	return fp ? getUwaConversationState(fp) : undefined;
+}
+
+export function setUwaConversationStateForSession(
+	sessionId: string | null | undefined,
+	state: UwaConversationState,
+): boolean {
+	const fp = uwaSessionFingerprint(sessionId);
+	if (!fp) {
+		return false;
+	}
+	setUwaConversationState(state, fp);
+	return true;
 }
 
 /** 订阅绑定状态变化（bridge 层用于刷新状态栏 / binding） */

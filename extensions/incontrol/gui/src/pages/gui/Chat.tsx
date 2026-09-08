@@ -21,6 +21,7 @@ import TimelineItem from "../../components/gui/TimelineItem";
 import { NewSessionButton } from "../../components/mainInput/belowMainInput/NewSessionButton";
 import ThinkingBlockPeek from "../../components/mainInput/belowMainInput/ThinkingBlockPeek";
 import IncontrolInputBox from "../../components/mainInput/IncontrolInputBox";
+import CompactConversationButton from "../../components/mainInput/CompactConversationButton";
 import StepContainer from "../../components/StepContainer";
 import { TabBar } from "../../components/TabBar/TabBar";
 import { IdeMessengerContext } from "../../context/IdeMessenger";
@@ -428,6 +429,10 @@ export function Chat() {
                   <span className="text-xs">{t("Last Session")}</span>
                 </NewSessionButton>
               )}
+            </div>
+            {/* 需求 2：手动压缩会话（生成摘要并复制 → 迁移到新的网页对话 → 更新会话 URL） */}
+            <div className="flex shrink-0 items-center justify-end gap-1">
+              {history.length > 0 && !isInEdit && <CompactConversationButton />}
             </div>
           </div>
           <FatalErrorIndicator />
