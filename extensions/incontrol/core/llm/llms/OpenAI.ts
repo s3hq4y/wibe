@@ -30,6 +30,7 @@ import {
   getUwaConversationState,
   setUwaConversationState,
   uwaConversationFingerprint,
+  uwaTrace,
 } from "../../util/uwaRequestContext.js";
 import {
   ensureConversationPage,
@@ -569,6 +570,11 @@ class OpenAI extends BaseLLM {
     try {
       const mode = String((uwaFields as any).history_mode ?? "").toLowerCase();
       const forceNew = Boolean((uwaFields as any).force_new_conversation);
+      uwaTrace(
+        `direct mode=${mode} forceNew=${forceNew} fp=${uwaFp ?? "-"} key=${
+          String((options as any)?.uwaSessionKey ?? "").slice(0, 10) || "-"
+        }`,
+      );
       if (mode === "ide" && !forceNew && this.apiBase) {
         // 只对「续聊形态」请求做定向：含 assistant 回复或 ≥2 条 user 才算
         // 续聊；新会话首轮应交给 sidecar 开新对话（旧槽指向的旧页不该被
@@ -582,9 +588,18 @@ class OpenAI extends BaseLLM {
         const isContinuation = hasAssistant || userCount >= 2;
         if (isContinuation) {
           const st = getUwaConversationState(uwaFp);
+          uwaTrace(
+            `direct slot ${
+              st ? `url=${st.conversationUrl} turn=${st.turn}` : "MISS"
+            }`,
+          );
           if (st?.conversationUrl) {
             const origin = new URL(this.apiBase).origin;
-            const target = await prepareUwaTargetUrl(origin, st.conversationUrl);
+            const target = await prepareUwaTargetUrl(
+              origin,
+              st.conversationUrl,
+            );
+            uwaTrace(`direct target=${target ?? "null"}`);
             if (target) {
               uwaTargetUrl = new URL(target);
             }

@@ -182,3 +182,16 @@ export function onUwaConversationChanged(
 	listeners.add(listener);
 	return () => listeners.delete(listener);
 }
+
+/** uwa 决策链路诊断日志（bridge 层注入到 "uwa Sidecar" 输出通道；无人注入时静默） */
+let traceFn: ((line: string) => void) | undefined;
+export function setUwaTrace(fn?: (line: string) => void): void {
+	traceFn = fn;
+}
+export function uwaTrace(line: string): void {
+	try {
+		traceFn?.(`[uwa-route] ${line}`);
+	} catch {
+		/* ignore */
+	}
+}

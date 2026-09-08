@@ -183,6 +183,19 @@
           "type": "boolean",
           "default": true,
           "description": "在状态栏显示 uwa sidecar 状态（点击可启动/停止）"
+
+        },
+        "incontrol.bridge.pagePollIntervalSec": {
+          "type": "number",
+          "default": 15,
+          "minimum": 5,
+          "maximum": 600,
+          "markdownDescription": "uwa 网页状态轮询间隔（秒）。sidecar 存活时状态栏会显示当前 uwa 网页。"
+        },
+        "incontrol.bridge.showPageStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "在状态栏显示当前 uwa 网页（点击打开网页菜单）。"
         }
       }
     },
@@ -426,6 +439,21 @@
       {
         "command": "incontrol.bridge.status",
         "title": "uwa: 显示状态",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.pageMenu",
+        "title": "uwa: 网页菜单（状态/同步）",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.syncUwaModels",
+        "title": "uwa: 同步网页模型到模型列表",
+        "category": "incontrol"
+      },
+      {
+        "command": "incontrol.bridge.clearSyncedModels",
+        "title": "uwa: 清除同步的网页模型",
         "category": "incontrol"
       }
     ],

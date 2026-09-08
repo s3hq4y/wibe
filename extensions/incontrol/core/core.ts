@@ -20,8 +20,11 @@ import { createNewPromptFileV2 } from "./promptFiles/createNewPromptFile";
 import { callTool } from "./tools/callTool";
 import { ChatDescriber } from "./util/chatDescriber";
 import { compactConversation } from "./util/conversationCompaction";
+import { onModelSwitched } from "./util/compactionEvents";
+import { onUwaSyncedModelsChanged } from "./util/uwaModelOverlay";
 import { GlobalContext } from "./util/GlobalContext";
 import historyManager from "./util/history";
+import { packSessionForMigration } from "./util/historyPacker";
 import { editConfigFile, migrateV1DevDataFiles } from "./util/paths";
 
 import {
@@ -176,6 +179,12 @@ export class Core {
             });
           }
         })();
+      });
+
+      // 需求 4：网页模型覆盖层变化后重载配置，并通过 configUpdate 事件
+      // 推送最新序列化配置给 GUI（模型下拉列表随之更新）。
+      onUwaSyncedModelsChanged(() => {
+        void this.configHandler.reloadConfig("uwa web models synced");
       });
 
       // Dev Data Logger
@@ -479,6 +488,10 @@ export class Core {
     });
 
     on("config/updateSelectedModel", async (msg) => {
+      const previousConfig = (await this.configHandler.loadConfig()).config;
+      const previousTitle =
+        previousConfig?.selectedModelByRole?.[msg.data.role]?.title ?? null;
+
       const newSelectedModels = this.globalContext.updateSelectedModel(
         msg.data.profileId,
         msg.data.role,
@@ -487,6 +500,28 @@ export class Core {
       await this.configHandler.reloadConfig(
         "Selected model update (config/updateSelectedModel message)",
       );
+
+      // 需求 3：chat 角色模型真正变化（且带会话 id）时，把该会话历史打包
+      // 并通知桥接层 —— 桥接层会先询问用户，确认后再迁移到新的网页对话。
+      if (
+        msg.data.role === "chat" &&
+        previousTitle &&
+        msg.data.title &&
+        previousTitle !== msg.data.title &&
+        msg.data.sessionId
+      ) {
+        const session = historyManager.load(msg.data.sessionId);
+        const packed = packSessionForMigration(session);
+        if (packed.turnCount > 0) {
+          void onModelSwitched.emit({
+            previousModel: previousTitle,
+            newModel: msg.data.title,
+            packedHistory: packed.packedHistory,
+            systemPrompt: packed.systemPrompt || undefined,
+          });
+        }
+      }
+
       return newSelectedModels;
     });
 

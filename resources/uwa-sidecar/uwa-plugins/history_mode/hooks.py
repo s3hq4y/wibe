@@ -55,15 +55,7 @@ def resolve_history(session, messages, history_mode, live_url,
 # ---------------------------------------------------------------- 钩子 3
 def step_should_skip(step, action_upper, target_key, is_continuation,
                      session=None, history_mode="full"):
-    """决定是否跳过某工作流步骤（两套标记语义）：
-
-    - skip_when_not_full：非 full 模式下永不执行该步骤。用于「会遗忘先前信息」的
-      破坏性步骤，如 Gemini 的“临时对话按钮”——点了就开一个不保存历史的临时对话，
-      auto/last 模式必须永远不点（包括第一轮）。
-    - skip_on_continuation：仅在续聊复用当前对话（is_continuation=True）时跳过。
-      续聊时页面停留在原对话，这些按钮/快捷键不再渲染或不应再触发，
-      如模型选择下拉、DeepSeek 专家模式切换、Gemini 的 Ctrl+Shift+O 新对话快捷键。
-    """
+    """决定是否跳过某工作流步骤（两套标记语义）。"""
     s = step or {}
     mode = str(history_mode or "full").strip().lower()
     if s.get("skip_when_not_full") and mode != "full":

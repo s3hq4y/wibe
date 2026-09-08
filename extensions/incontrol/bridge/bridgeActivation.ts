@@ -20,6 +20,7 @@ import {
 	onUwaConversationChanged,
 	setUwaBridgeEnabled,
 	setUwaSidecarBaseUrl,
+	setUwaTrace,
 } from '../core/util/uwaRequestContext.js';
 import {
 	clearUwaSyncedModels,
@@ -382,6 +383,7 @@ export async function activateBridge(
 	context.subscriptions.push(output);
 
 	const log = (line: string) => output?.appendLine(line);
+	setUwaTrace(log);
 
 	// resources/uwa-sidecar 相对扩展目录的位置：
 	// 开发态 extensions/incontrol -> ../../resources/uwa-sidecar

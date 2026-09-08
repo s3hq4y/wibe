@@ -1,3 +1,6 @@
+import { createHash } from "crypto";
+import { uwaTrace } from "./uwaRequestContext.js";
+
 /*---------------------------------------------------------------------------------------------
  * uwa 网页会话同步（发送前导航回记录中的对话）
  *
@@ -43,6 +46,12 @@ export async function listUwaTabs(baseUrl: string): Promise<UwaTabInfo[]> {
 	try {
 		const data = await getJson(baseUrl, "/api/tab-pool/tabs");
 		const raw: any[] = Array.isArray(data?.tabs) ? data.tabs : [];
+		uwaTrace(
+			`listTabs n=${raw.length} ${raw
+				.slice(0, 6)
+				.map((t: any) => String(t?.url ?? ""))
+				.join(" | ")}`,
+		);
 		return raw
 			.filter(
 				(t: any) =>
@@ -92,6 +101,42 @@ export function tabMatchesConversation(tabUrl: string, targetUrl: string): boole
 }
 
 /**
+ * URL 规范化 + 路由 token 的本地复刻。
+ *
+ * sidecar 的 /tab-url/{token} 路由按标签页当前 URL 现场比对：
+ *   token = sha1(normalize_exact_tab_url(url))[:12]
+ * （见 app/utils/site_url.py 与 app/core/tab_pool_parts/manager.py），
+ * 因此 token 不需要 /api/tab-pool/tabs 条目预置（该端点条目的
+ * url_route_token 字段并不总是存在）——由会话 URL 本地编码即可得到
+ * 与 sidecar 一致的确定性路由键。
+ */
+export function encodeTabUrlRouteToken(value: string): string {
+	const raw = String(value ?? "").trim();
+	if (!raw) {
+		return "";
+	}
+	let u: URL;
+	try {
+		u = new URL(raw);
+	} catch {
+		return "";
+	}
+	const scheme = u.protocol.replace(/:$/, "").toLowerCase();
+	const hostname = u.hostname.toLowerCase().replace(/\.$/, "");
+	if (!scheme || !hostname) {
+		return "";
+	}
+	const defaultPort = scheme === "http" ? 80 : scheme === "https" ? 443 : undefined;
+	let host = hostname.includes(":") ? `[${hostname}]` : hostname;
+	if (u.port && u.port !== String(defaultPort ?? "")) {
+		host = `${host}:${u.port}`;
+	}
+	const path = u.pathname || "/";
+	const normalized = `${scheme}://${host}${path}${u.search}${u.hash}`;
+	return createHash("sha1").update(normalized).digest("hex").slice(0, 12);
+}
+
+/**
  * 为目标会话页准备“确定性路由”的发送地址。
  *
  * sidecar 的多标签路由默认按标签池轮询/亲和挑选空闲页；当受控浏览器
@@ -112,27 +157,45 @@ export async function prepareUwaTargetUrl(
 	targetUrl: string,
 	timeoutMs = 16_000,
 ): Promise<string | null> {
+	uwaTrace(`prepare base=${baseUrl} target=${targetUrl}`);
 	if (!targetUrl?.startsWith("http")) {
+		uwaTrace(`prepare -> null (target not http)`);
 		return null;
 	}
-	const tokenOf = async (): Promise<string | undefined> => {
+
+	// /tab-url/{token} 的 token 是目标 URL 的确定性哈希（sha1(normalize(url))[:12]），
+	// 由本地直接编码即可，不再依赖 /api/tab-pool/tabs 条目里可能缺失的
+	// url_route_token 字段——该字段缺失是此前“定向从未生效、消息静默走默认
+	// 端点、续聊/工具回灌落到最新活动标签页”的原因。
+	const token = encodeTabUrlRouteToken(targetUrl);
+	if (!token) {
+		uwaTrace(`prepare -> null (token empty)`);
+		return null;
+	}
+	const routeUrl = `${baseUrl.replace(/\/$/, "")}/tab-url/${token}/v1/chat/completions`;
+
+	// 就绪判定用“严格 token 相等”（与 sidecar _get_tabs_by_url_route_token 的
+	// encode(actual_url) 比对一致），避免 tab 停靠 URL 与目标 URL 存在非规范
+	// 差异时发出 /tab-url 请求被 sidecar 以 404 拒绝；不中就降级默认端点。
+	const isReady = async (): Promise<boolean> => {
 		const tabs = await listUwaTabs(baseUrl);
-		const tab = tabs.find((t) => tabMatchesConversation(t.url, targetUrl));
-		return tab?.urlRouteToken;
+		return tabs.some((t) => encodeTabUrlRouteToken(t.url) === token);
 	};
 
-	// 1) 页面已在池中且带路由令牌 → 直接可用
-	const have = await tokenOf();
-	if (have) {
-		return `${baseUrl.replace(/\/$/, "")}/tab-url/${have}/v1/chat/completions`;
+	// 1) 页面已在池中（严格 token 匹配）→ 直接用本地编码的 token 路由
+	if (await isReady()) {
+		uwaTrace(`prepare -> ${routeUrl} (page ready)`);
+		return routeUrl;
 	}
 
 	// 2) 页面不在：先导航回 targetUrl（新标签并激活），SPA 收录后重查
-	await ensureConversationPage(baseUrl, targetUrl, timeoutMs);
-	const after = await tokenOf();
-	if (after) {
-		return `${baseUrl.replace(/\/$/, "")}/tab-url/${after}/v1/chat/completions`;
+	const ensured = await ensureConversationPage(baseUrl, targetUrl, timeoutMs);
+	uwaTrace(`ensure=${ensured}`);
+	if (await isReady()) {
+		uwaTrace(`prepare -> ${routeUrl} (after ensure)`);
+		return routeUrl;
 	}
+	uwaTrace(`prepare -> null (fallback default endpoint)`);
 	return null;
 }
 
@@ -186,9 +249,12 @@ export async function ensureConversationPage(
 			clearTimeout(timer);
 		}
 		if (!res.ok) {
+			uwaTrace(`open-profile-url HTTP ${res.status}`);
 			return false;
 		}
-	} catch {
+		uwaTrace(`open-profile-url ok url=${targetUrl}`);
+	} catch (e) {
+		uwaTrace(`open-profile-url ERR ${String(e)}`);
 		return false;
 	}
 

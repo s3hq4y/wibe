@@ -114,12 +114,27 @@ export async function compactConversation({
   // 通知桥接层：压缩完成，可把系统提示词 + 摘要迁移到新的网页对话。
   // 事件总线是解耦的，无订阅者时（非 VS Code 宿主）这里是 no-op。
   const summaryText = stripImages(response.content);
+
+  // 系统提示词一般不在「过滤后的历史片段」里（IDE 请求时才组装），
+  // 因此从完整会话历史里取最后一次 system 消息，确保迁移到新网页对话时
+  // 能带上可用的系统提示词（没有则保持 undefined）。
+  let systemPrompt: string | undefined;
+  for (let i = updatedSession.history.length - 1; i >= 0; i--) {
+    const anyMsg: any = updatedSession.history[i]?.message;
+    if (
+      anyMsg &&
+      typeof anyMsg.role === "string" &&
+      anyMsg.role.toLowerCase() === "system"
+    ) {
+      systemPrompt = stripImages(anyMsg.content);
+      break;
+    }
+  }
+
   void onCompactionCompleted.emit({
     sessionId,
     index,
     summary: summaryText,
-    systemPrompt: messages.find((m) => m.role === "system")
-      ? stripImages(messages.find((m) => m.role === "system")!.content)
-      : undefined,
+    systemPrompt,
   });
 }

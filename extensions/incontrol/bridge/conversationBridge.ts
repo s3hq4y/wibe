@@ -74,6 +74,28 @@ export class ConversationBridge {
 		this.log(`bound url=${ext.conversation_url} turn=${ext.turn}`);
 	}
 
+	/** 由 core 侧响应解析（x_uwa）推送的会话状态更新绑定 */
+	noteWebConversation(state: {
+		conversationUrl: string;
+		conversationId?: string;
+		tabIndex?: number;
+		turn?: number;
+	}): void {
+		if (!state?.conversationUrl) {
+			return;
+		}
+		this.binding = {
+			state: 'BOUND',
+			conversationUrl: state.conversationUrl,
+			conversationId: state.conversationId ?? '',
+			tabIndex: state.tabIndex ?? -1,
+			turn: state.turn ?? this.binding.turn,
+			estimatedTokens: this.binding.estimatedTokens,
+			lastUpdatedAt: Date.now(),
+		};
+		this.log(`bound url=${state.conversationUrl} turn=${state.turn ?? this.binding.turn}`);
+	}
+
 	/** 从任意响应体里提取 x_uwa 字段 */
 	static extractExtension(body: any): UwaResponseExtension | undefined {
 		const raw = body?.x_uwa;

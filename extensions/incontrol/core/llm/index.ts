@@ -43,6 +43,7 @@ import {
   isUwaModelApiBase,
   setUwaConversationState,
   uwaConversationFingerprint,
+  uwaTrace,
 } from "../util/uwaRequestContext.js";
 import { prepareUwaTargetUrl } from "../util/uwaConversationSync.js";
 
@@ -1061,6 +1062,102 @@ export abstract class BaseLLM implements ILLM {
     }
   }
 
+  /** uwa 定向直发（流式）：/tab-url/<token> 请求不经 OpenAI SDK——SDK 固定使用
+   * 构造时的 apiBase，会忽略请求体上的 uwaTargetUrl，导致请求永远落默认端点。 */
+  /** 兼容两种响应体：Web ReadableStream（getReader）与 Node 流（async iterable） */
+  private async *_iterBodyChunks(body: any): AsyncGenerator<Uint8Array> {
+    if (body && typeof body.getReader === "function") {
+      const reader = body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value) {
+          yield value as Uint8Array;
+        }
+      }
+      return;
+    }
+    if (body && typeof body[Symbol.asyncIterator] === "function") {
+      for await (const value of body) {
+        yield value instanceof Uint8Array
+          ? (value as Uint8Array)
+          : new TextEncoder().encode(String(value));
+      }
+      return;
+    }
+    throw new Error("uwa direct route: unsupported response body type");
+  }
+
+  private async *_uwaDirectChatStream(
+    payload: any,
+    signal: AbortSignal,
+    url: string,
+  ): AsyncGenerator<any> {
+    const response = await fetchwithRequestOptions(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify(payload),
+      signal,
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(
+        `uwa direct route HTTP ${response.status}: ${text.slice(0, 300)}`,
+      );
+    }
+    if (!response.body) {
+      throw new Error("uwa direct route: empty response body");
+    }
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    for await (const value of this._iterBodyChunks(response.body)) {
+      buf += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, "");
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) {
+          continue;
+        }
+        const data = line.slice(5).trim();
+        if (!data || data === "[DONE]") {
+          continue;
+        }
+        try {
+          yield JSON.parse(data);
+        } catch {
+          /* 忽略非 JSON 帧 */
+        }
+      }
+    }
+  }
+
+  /** uwa 定向直发（非流）：同上，一次性 JSON 响应 */
+  private async _uwaDirectChatNonStream(
+    payload: any,
+    signal: AbortSignal,
+    url: string,
+  ): Promise<any> {
+    const response = await fetchwithRequestOptions(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(
+        `uwa direct route HTTP ${response.status}: ${text.slice(0, 300)}`,
+      );
+    }
+    return response.json();
+  }
+
   private async *openAIAdapterStream(
     body: ChatCompletionCreateParams,
     signal: AbortSignal,
@@ -1072,7 +1169,9 @@ export abstract class BaseLLM implements ILLM {
     if (uwaTargetUrl) {
       this.attachUwaTarget(payload, uwaTargetUrl);
     }
-    const stream = this.openaiAdapter!.chatCompletionStream(payload, signal);
+    const stream = uwaTargetUrl
+      ? this._uwaDirectChatStream(payload, signal, uwaTargetUrl)
+      : this.openaiAdapter!.chatCompletionStream(payload, signal);
     for await (const chunk of stream) {
       if (!this.lastRequestId && typeof (chunk as any).id === "string") {
         this.lastRequestId = (chunk as any).id;
@@ -1107,10 +1206,13 @@ export abstract class BaseLLM implements ILLM {
     if (uwaTargetUrl) {
       this.attachUwaTarget(payload, uwaTargetUrl);
     }
-    const response = await this.openaiAdapter!.chatCompletionNonStream(
-      payload,
-      signal,
-    );
+    const response = uwaTargetUrl
+      ? ((await this._uwaDirectChatNonStream(
+          payload,
+          signal,
+          uwaTargetUrl,
+        )) as any)
+      : await this.openaiAdapter!.chatCompletionNonStream(payload, signal);
     this.lastRequestId = response.id ?? this.lastRequestId;
     this.recordUwaResponseExt((response as any)?.x_uwa, uwaFp);
     const messages = fromChatResponse(response as any);
@@ -1179,6 +1281,23 @@ export abstract class BaseLLM implements ILLM {
     let status: InteractionStatus = "in_progress";
 
     completionOptions = this._modifyCompletionOptions(completionOptions);
+
+    // uwa：GUI llm/streamChat 把 IDE 会话 id 以非枚举 uwaSessionKey 挂在入参
+    // options 上；optionsWithOverrides 的展开拷贝会丢掉非枚举属性，这里补挂
+    // 到 completionOptions，保证子类 _streamChat / adapter 层取到同一会话键。
+    const _uwaKey = (options as any)?.uwaSessionKey;
+    if (_uwaKey && !(completionOptions as any)?.uwaSessionKey) {
+      try {
+        Object.defineProperty(completionOptions, "uwaSessionKey", {
+          value: _uwaKey,
+          enumerable: false,
+          configurable: true,
+          writable: true,
+        });
+      } catch {
+        /* ignore */
+      }
+    }
 
     let messages = _messages;
 
@@ -1292,6 +1411,9 @@ export abstract class BaseLLM implements ILLM {
                 const forceNew = Boolean(
                   (body as any).force_new_conversation,
                 );
+                uwaTrace(
+                  `adapter mode=${mode} forceNew=${forceNew} fp=${uwaFp ?? "-"}`,
+                );
                 if (mode === "ide" && !forceNew && uwaFp && this.apiBase) {
                   const hasAssistant = messages.some(
                     (m) =>
@@ -1304,12 +1426,20 @@ export abstract class BaseLLM implements ILLM {
                   ).length;
                   if (hasAssistant || userCount >= 2) {
                     const st = getUwaConversationState(uwaFp);
+                    uwaTrace(
+                      `adapter slot ${
+                        st
+                          ? `url=${st.conversationUrl} turn=${st.turn}`
+                          : "MISS"
+                      }`,
+                    );
                     if (st?.conversationUrl) {
                       const origin = new URL(this.apiBase).origin;
                       const target = await prepareUwaTargetUrl(
                         origin,
                         st.conversationUrl,
                       );
+                      uwaTrace(`adapter target=${target ?? "null"}`);
                       if (target) {
                         uwaTargetUrl = target;
                       }

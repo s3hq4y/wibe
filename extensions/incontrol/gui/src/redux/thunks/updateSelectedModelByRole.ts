@@ -10,12 +10,14 @@ export const updateSelectedModelByRole = createAsyncThunk<
     role: ModelRole;
     modelTitle: string;
     selectedProfile: ProfileDescription | null;
+    /** 当前会话 id：切换发生在哪个会话里（需求3迁移需要打包该会话历史） */
+    sessionId?: string;
   },
   ThunkApiType
 >(
   "config/updateSelectedModel",
   async (
-    { role, modelTitle, selectedProfile },
+    { role, modelTitle, selectedProfile, sessionId },
     { dispatch, extra, getState },
   ) => {
     if (!selectedProfile) {
@@ -53,6 +55,7 @@ export const updateSelectedModelByRole = createAsyncThunk<
       role,
       profileId: selectedProfile.id,
       title: modelTitle,
+      sessionId: sessionId ?? getState().session.id,
     });
   },
 );

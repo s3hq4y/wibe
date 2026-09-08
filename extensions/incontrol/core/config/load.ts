@@ -67,6 +67,7 @@ import { resolveRelativePathInDir } from "../util/ideUtils";
 import { getWorkspaceRcConfigs } from "./json/loadRcConfigs";
 import { loadConfigContextProviders } from "./loadContextProviders";
 import { modifyAnyConfigWithSharedConfig } from "./sharedConfig";
+import { applyUwaModelsToSerialized } from "../util/uwaModelOverlay.js";
 import {
   getModelByRole,
   serializePromptTemplates,
@@ -801,6 +802,11 @@ async function loadIncontrolConfigFromJson(
   // TODO: override several of these values with user/org shared config
   const sharedConfig = new GlobalContext().getSharedConfig();
   const withShared = modifyAnyConfigWithSharedConfig(serialized, sharedConfig);
+
+  // uwa 网页模型覆盖（需求4）：把「同步网页模型」得到的模型并入序列化配置。
+  // 只影响本次进程内的配置装配，不落盘、不改写用户 config.yaml；
+  // 模型同步后 core 会 reloadConfig 并通过 configUpdate 事件推送给 GUI。
+  applyUwaModelsToSerialized(withShared);
 
   // Convert serialized to intermediate config
   let intermediate = await serializedToIntermediateConfig(withShared, ide);
