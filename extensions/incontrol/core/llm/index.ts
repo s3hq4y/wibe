@@ -1274,7 +1274,11 @@ export abstract class BaseLLM implements ILLM {
             // sidecar 时，把 ide 会话字段并入请求体；对「续聊形态」请求再按
             // 本会话指纹槽取网页对话 URL，走 /tab-url/<token> 确定性路由，
             // 保证切回旧会话续聊时落在该会话自己的网页对话页。
-            const uwaFp = uwaConversationFingerprint(messages);
+            const uwaFp = uwaConversationFingerprint(
+              messages,
+              (options as any)?.uwaSessionKey ??
+                (completionOptions as any)?.uwaSessionKey,
+            );
             let uwaTargetUrl: string | undefined;
             if (isUwaModelApiBase(this.apiBase)) {
               const uwaFields = consumeUwaFields();

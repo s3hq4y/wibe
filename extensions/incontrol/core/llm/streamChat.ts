@@ -28,6 +28,7 @@ export async function* llmStreamChat(
     completionOptions,
     messages,
     messageOptions,
+    sessionId,
   } = msg.data;
 
   const model = config.selectedModelByRole.chat;
@@ -49,6 +50,21 @@ export async function* llmStreamChat(
   };
 
   try {
+    // uwa：GUI 载荷携带的 IDE 会话 id（llm/streamChat.sessionId）以非枚举属性挂到
+    // completionOptions，模型层据此生成会话绑定槽键；不进入序列化与 sidecar 请求体
+    // （slash 直发分支共用同一 completionOptions 引用，同样生效）。
+    if (sessionId) {
+      try {
+        Object.defineProperty(completionOptions, "uwaSessionKey", {
+          value: sessionId,
+          enumerable: false,
+          configurable: true,
+          writable: true,
+        });
+      } catch {
+        /* 只读/冻结对象等场景忽略 */
+      }
+    }
     if (legacySlashCommandData) {
       const { command, contextItems, historyIndex, input, selectedCode } =
         legacySlashCommandData;

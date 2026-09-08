@@ -223,6 +223,7 @@ export const streamNormalInput = createAsyncThunk<
           messages: compiledChatMessages,
           legacySlashCommandData,
           messageOptions: { precompiled: true },
+          sessionId: state.session.id,
         },
         streamAborter.signal
       );

@@ -554,7 +554,10 @@ class OpenAI extends BaseLLM {
     Object.assign(body as any, uwaFields);
     // 本请求所属 IDE 会话的指纹（首条 user 文本摘要）：绑定按会话分槽，
     // 多会话切回时不把 A 的消息定向到 B 的网页对话。
-    const uwaFp = uwaConversationFingerprint(messages);
+    const uwaFp = uwaConversationFingerprint(
+      messages,
+      (options as any)?.uwaSessionKey,
+    );
 
     // 需求「切回旧会话 → 网页切回原对话」：续聊（非强制开新）且本会话
     // 已绑定网页对话 URL 时，发送前把请求对准绑定会话页：

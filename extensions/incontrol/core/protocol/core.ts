@@ -124,6 +124,8 @@ export type ToCoreFromIdeOrWebviewProtocol = {
       profileId: string;
       role: ModelRole;
       title: string | null;
+      /** gui 触发本次切换时的当前会话 id；供「切换模型迁移」打包该会话历史 */
+      sessionId?: string;
     },
     GlobalContextModelSelections,
   ];
@@ -228,6 +230,8 @@ export type ToCoreFromIdeOrWebviewProtocol = {
       completionOptions: LLMFullCompletionOptions;
       title: string;
       messageOptions?: MessageOption;
+      /** GUI 发送时所在 IDE 会话 id：uwa 网页对话绑定按会话分槽，同首条文本的多会话不再共槽串台 */
+      sessionId?: string;
       legacySlashCommandData?: {
         command: SlashCommandDescWithSource;
         input: string;

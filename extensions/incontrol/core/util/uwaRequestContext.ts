@@ -51,8 +51,8 @@ let oneShot: UwaRequestFields | undefined;
  * 为什么需要分槽：扩展可同时打开多个 IDE 会话（会话 A/B 各绑定一个网页
  * 对话）。旧实现是单一全局 state——切回会话 A 续聊时，发送前断言读到的
  * 仍是会话 B 的绑定 URL，消息被定向/导航到 B 的网页对话（串台）。
- * 每个 IDE 会话的首条 user 消息文本通常各不相同，用它做指纹即可把绑定
- * 归位到各自会话：发送前按本次 messages 的指纹取回本会话的 URL。
+ * 会话槽键优先用 GUI 聊天请求携带的 IDE 会话 id（llm/streamChat.sessionId，
+ * 见 uwaConversationFingerprint）；无会话键的调用方才回退首条 user 文本指纹。
  *
  * 槽表带 LRU 上限；另外保留「最近一次」引用供不携带指纹的调用方
  * （bridge 迁移直发等）与状态栏展示使用。
@@ -101,11 +101,20 @@ export function consumeUwaFields(): UwaRequestFields | undefined {
 }
 
 /**
- * 会话指纹：取 messages 里第一条 user 文本（跳过 system/工具），
- * sha1 摘要。同一 IDE 会话的任意续聊轮次都得到同一指纹，不同会话
- * （首条 user 不同）互不冲突。
+ * 会话绑定槽键：优先使用 IDE 会话 id（llm/streamChat.sessionId 载荷）直接作键——
+ * 同一会话任意轮次不变；不同会话即使首条 user 文本相同（如都从同一条手动系统
+ * 提示词起步）也不共槽。拿不到会话 id 的调用方（slash/工具直发等）才回退
+ * messages 第一条 user 文本（跳过 system/工具）的 sha1 摘要——该路径要求不同
+ * 会话首条 user 不同，否则会共槽（已知限制）。
  */
-export function uwaConversationFingerprint(messages: { role?: string; content?: unknown }[]): string | undefined {
+export function uwaConversationFingerprint(
+	messages: { role?: string; content?: unknown }[],
+	sessionKey?: string | null,
+): string | undefined {
+	const sid = String(sessionKey ?? '').trim();
+	if (sid) {
+		return createHash('sha1').update(`sid:${sid}`).digest('hex').slice(0, 20);
+	}
 	for (const m of messages || []) {
 		if (m && String(m.role ?? '').toLowerCase() === 'user') {
 			const text = Array.isArray(m.content)
