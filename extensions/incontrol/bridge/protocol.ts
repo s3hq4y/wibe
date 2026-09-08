@@ -5,7 +5,7 @@
  *  修改任一侧都必须同步另一侧，并同时更新 PROTOCOL_VERSION。
  *--------------------------------------------------------------------------------------------*/
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** sidecar 默认监听端口；被占用时由扩展改写并通过 --port 传入 */
 export const DEFAULT_SIDECAR_PORT = 8199;
@@ -42,6 +42,12 @@ export interface UwaRequestExtension {
 		/** 迁移前的对话 URL，用于日志追踪与失败回滚 */
 		prev_conversation_url?: string;
 	};
+	/**
+	 * 绑定续聊：本请求属于该 URL 网页对话的续聊。由 llm/index.ts 在会话槽
+	 * 命中（mode=ide 且 !forceNew）时注入。压缩迁移后的首条消息只有
+	 * system+1 条 user，sidecar 插件据此继续该对话，避免误开新对话。
+	 */
+	resume_conversation_url?: string;
 }
 
 /** 响应里回传的会话状态（挂在响应根节点 `x_uwa`） */

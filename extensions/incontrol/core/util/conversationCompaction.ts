@@ -2,6 +2,7 @@ import { ChatHistoryItem, ILLM, ToolResultChatMessage } from "..";
 import { HistoryManager } from "./history";
 import { stripImages } from "./messageContent";
 import { onCompactionCompleted } from "./compactionEvents";
+import { getUwaSystemPrompt } from "./uwaRequestContext";
 
 export interface CompactionParams {
   sessionId: string;
@@ -115,19 +116,25 @@ export async function compactConversation({
   // 事件总线是解耦的，无订阅者时（非 VS Code 宿主）这里是 no-op。
   const summaryText = stripImages(response.content);
 
-  // 系统提示词一般不在「过滤后的历史片段」里（IDE 请求时才组装），
-  // 因此从完整会话历史里取最后一次 system 消息，确保迁移到新网页对话时
-  // 能带上可用的系统提示词（没有则保持 undefined）。
+  // 系统提示词一般不在「过滤后的历史片段」里（IDE 每次请求时才组装），
+  // 因此优先取 llm/streamChat 记录在本会话槽的「最近一次实际发出的 system」
+  // （与网页对话真正见到的一致）；没有（非 uwa 会话 / 从未发过带 system 的
+  // 请求）再回退从完整会话历史里取最后一次 system 消息。
   let systemPrompt: string | undefined;
-  for (let i = updatedSession.history.length - 1; i >= 0; i--) {
-    const anyMsg: any = updatedSession.history[i]?.message;
-    if (
-      anyMsg &&
-      typeof anyMsg.role === "string" &&
-      anyMsg.role.toLowerCase() === "system"
-    ) {
-      systemPrompt = stripImages(anyMsg.content);
-      break;
+  const cachedSystem = getUwaSystemPrompt(sessionId);
+  if (cachedSystem && cachedSystem.trim()) {
+    systemPrompt = cachedSystem;
+  } else {
+    for (let i = updatedSession.history.length - 1; i >= 0; i--) {
+      const anyMsg: any = updatedSession.history[i]?.message;
+      if (
+        anyMsg &&
+        typeof anyMsg.role === "string" &&
+        anyMsg.role.toLowerCase() === "system"
+      ) {
+        systemPrompt = stripImages(anyMsg.content);
+        break;
+      }
     }
   }
 

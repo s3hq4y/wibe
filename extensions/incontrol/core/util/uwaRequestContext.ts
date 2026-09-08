@@ -210,6 +210,46 @@ export function setUwaConversationStateForSession(
 	return true;
 }
 
+/**
+ * 会话「最近一次实际发出的 system」暂存（压缩迁移用）。
+ *
+ * 背景：GUI 的 system 是每次请求时按规则现组装（constructMessages →
+ * getSystemMessageWithRules），只进请求体、不写会话历史。conversationCompaction
+ * 压缩完成后要迁移到新网页对话，需要这份 system —— 若从历史里扫，通常为空
+ * （丢系统提示词的根因）。因此 llm/streamChat 发送前把带 uwaSessionKey 的请求
+ * 里 system 内容记到本会话槽（键同绑定槽：sha1("sid:"+sessionId)），压缩完成时
+ * 按 sessionId 取用；取不到再回退历史扫描。
+ */
+const MAX_SYSTEM_PROMPTS = 32;
+const systemPrompts = new Map<string, string>();
+
+export function rememberUwaSystemPrompt(
+	sessionKey?: string | null,
+	systemText?: string | null,
+): void {
+	if (!enabled || !systemText || !systemText.trim()) {
+		return;
+	}
+	const fp = uwaSessionFingerprint(sessionKey);
+	if (!fp) {
+		return;
+	}
+	systemPrompts.delete(fp);
+	systemPrompts.set(fp, systemText);
+	while (systemPrompts.size > MAX_SYSTEM_PROMPTS) {
+		const oldest = systemPrompts.keys().next().value;
+		if (oldest === undefined) { break; }
+		systemPrompts.delete(oldest);
+	}
+}
+
+export function getUwaSystemPrompt(
+	sessionId?: string | null,
+): string | undefined {
+	const fp = uwaSessionFingerprint(sessionId);
+	return fp ? systemPrompts.get(fp) : undefined;
+}
+
 /** 订阅绑定状态变化（bridge 层用于刷新状态栏 / binding） */
 export function onUwaConversationChanged(
 	listener: (state: UwaConversationState | undefined) => void,

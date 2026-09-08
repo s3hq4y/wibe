@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Optional
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 DEFAULT_SIDECAR_PORT = 8199
 
@@ -58,6 +58,10 @@ class UwaRequestExtension:
     force_new_conversation: bool = False
     system_prompt_mode: SystemPromptMode = "inject_once"
     conversation_hint: Optional[ConversationHint] = None
+    #: IDE 侧会话槽已绑定某网页对话时，续聊请求携带该对话 URL。插件据此
+    #: 把「只有 system+1 条 user（如压缩迁移后的首条消息）」的请求判为续聊
+    #: 而非新会话首轮，避免迁移后误点新建。
+    resume_conversation_url: str = ""
 
     @classmethod
     def from_payload(cls, payload: Dict[str, Any]) -> "UwaRequestExtension":
@@ -80,6 +84,9 @@ class UwaRequestExtension:
             conversation_hint=ConversationHint.from_dict(
                 payload.get("conversation_hint")
             ),
+            resume_conversation_url=str(
+                payload.get("resume_conversation_url", "") or ""
+            ).strip(),
         )
 
 

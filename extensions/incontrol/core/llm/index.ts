@@ -41,6 +41,7 @@ import {
   consumeUwaFields,
   getUwaConversationState,
   isUwaModelApiBase,
+  rememberUwaSystemPrompt,
   setUwaConversationState,
   uwaConversationFingerprint,
   uwaTrace,
@@ -1315,6 +1316,33 @@ export abstract class BaseLLM implements ILLM {
       messages = compiledChatMessages;
     }
 
+    // uwa 压缩迁移：GUI 的 system 是每次请求时按规则现组装、不入会话历史，
+    // 因此记下本会话最近一次实际随请求发出的 system；压缩完成迁移到新网页
+    // 对话时按 sessionId 取用（conversationCompaction），避免丢系统提示词。
+    // 只记 uwa 会话（带 uwaSessionKey），非 uwa 请求零开销。
+    const _uwaSysKey = (completionOptions as any)?.uwaSessionKey as
+      | string
+      | undefined;
+    if (_uwaSysKey) {
+      for (const m of messages ?? []) {
+        if (String((m as any)?.role ?? "").toLowerCase() === "system") {
+          const c = (m as any)?.content;
+          const text = Array.isArray(c)
+            ? (c as any[])
+                .filter((p: any) => p && typeof p.text === "string")
+                .map((p: any) => p.text)
+                .join("\n")
+            : typeof c === "string"
+              ? c
+              : "";
+          if (text && text.trim()) {
+            rememberUwaSystemPrompt(_uwaSysKey, text);
+          }
+          break;
+        }
+      }
+    }
+
     const messagesCopy = [...messages]; // templateMessages may modify messages.
 
     const prompt = this.templateMessages
@@ -1415,35 +1443,32 @@ export abstract class BaseLLM implements ILLM {
                   `adapter mode=${mode} forceNew=${forceNew} fp=${uwaFp ?? "-"}`,
                 );
                 if (mode === "ide" && !forceNew && uwaFp && this.apiBase) {
-                  const hasAssistant = messages.some(
-                    (m) =>
-                      String((m as any).role ?? "").toLowerCase() ===
-                      "assistant",
+                  // 压缩迁移后的首条续聊只有 system+1 条 user（无 assistant、
+                  // userCount=1），按消息形状判定会误成新会话首轮再点新建
+                  // （实测 bug）。会话槽存在即代表“本会话绑定到某个网页对话”，
+                  // 直接按槽定向 + 带绑定续聊标记；槽 MISS（新会话）才走默认
+                  // 端点，由 sidecar 插件按形状开新对话。
+                  const st = getUwaConversationState(uwaFp);
+                  uwaTrace(
+                    `adapter slot ${
+                      st
+                        ? `url=${st.conversationUrl} turn=${st.turn}`
+                        : "MISS"
+                    }`,
                   );
-                  const userCount = messages.filter(
-                    (m) =>
-                      String((m as any).role ?? "").toLowerCase() === "user",
-                  ).length;
-                  if (hasAssistant || userCount >= 2) {
-                    const st = getUwaConversationState(uwaFp);
-                    uwaTrace(
-                      `adapter slot ${
-                        st
-                          ? `url=${st.conversationUrl} turn=${st.turn}`
-                          : "MISS"
-                      }`,
+                  if (st?.conversationUrl) {
+                    const origin = new URL(this.apiBase).origin;
+                    const target = await prepareUwaTargetUrl(
+                      origin,
+                      st.conversationUrl,
                     );
-                    if (st?.conversationUrl) {
-                      const origin = new URL(this.apiBase).origin;
-                      const target = await prepareUwaTargetUrl(
-                        origin,
-                        st.conversationUrl,
-                      );
-                      uwaTrace(`adapter target=${target ?? "null"}`);
-                      if (target) {
-                        uwaTargetUrl = target;
-                      }
+                    uwaTrace(`adapter target=${target ?? "null"}`);
+                    if (target) {
+                      uwaTargetUrl = target;
                     }
+                    // 绑定续聊标记：告诉 sidecar 插件本请求属于该绑定对话的
+                    // 续聊，不再凭消息形状重判（/tab-url 定向同样会走插件）。
+                    (body as any).resume_conversation_url = st.conversationUrl;
                   }
                 }
               } catch {

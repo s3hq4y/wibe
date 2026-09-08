@@ -14,12 +14,16 @@ IDE 需要**主动命令** uwa 开一个新对话，把系统提示词 + 压缩�
 ide 模式把这个决定权交还给调用方::
 
     force_new_conversation=True  -> 必定开新对话（忽略历史推断）
-    force_new_conversation=False -> 由本次请求自行判断续聊：请求自带
-                                    assistant 回复或 ≥2 轮 user 才算续聊；
-                                    否则视为新 IDE 会话的首轮、开新对话。
-                                    不能沿用标签页上累积的 session.turns——
-                                    同一标签页跨多个 IDE 会话复用，旧会话的
-                                    计数会把“新会话第一条消息”误判成续聊。
+    force_new_conversation=False -> 由本次请求自行判断续聊：
+                                    - 请求自带 resume_conversation_url 且与当前
+                                      网页会话/页面一致 → 绑定续聊（覆盖压缩
+                                      迁移后首条只有 system+1 条 user、无
+                                      assistant 的形状误判，防止再点新建）；
+                                    - 否则：请求含 assistant 回复或 ≥2 轮 user
+                                      才算续聊；不然视为新 IDE 会话首轮、开新
+                                      对话。不能沿用标签页累积的 session.turns——
+                                      同一标签页跨多个 IDE 会话复用，旧会话的
+                                      计数会把“新会话第一条消息”误判成续聊。
 
 系统提示词处理
 --------------
@@ -97,6 +101,7 @@ def resolve_ide_mode(
     *,
     force_new_conversation: bool = False,
     system_prompt_mode: str = "inject_once",
+    resume_conversation_url: Optional[str] = None,
     extract_text_fn: Optional[Callable[[Any], str]] = None,
     build_prompt_fn: Optional[Callable[[List[Dict[str, Any]]], str]] = None,
 ):
@@ -104,6 +109,28 @@ def resolve_ide_mode(
 
     复用 history_mode 插件的既有工具函数，避免重复实现轮次指纹逻辑。
     """
+
+    def _same_conversation_url(a: str, b: str) -> bool:
+        """与扩展 uwaConversationSync.tabMatchesConversation 同规则：
+        同源且 path 互为包含（/a/chat/<uuid> 等）才算同一对话页；首页/根路径
+        这类短 path 不算（否则空路径会匹配一切）。
+        """
+        try:
+            from urllib.parse import urlsplit
+
+            sa, sb = urlsplit(str(a)), urlsplit(str(b))
+            if (sa.scheme.lower(), (sa.hostname or "").lower()) != (
+                sb.scheme.lower(),
+                (sb.hostname or "").lower(),
+            ):
+                return False
+            pa = sa.path or "/"
+            pb = sb.path or "/"
+            if len(pa) <= 1 or len(pb) <= 1:
+                return False
+            return pa == pb or pa.startswith(pb) or pb.startswith(pa)
+        except Exception:
+            return False
     hm = _load_history_mode()
 
     extract_fn = extract_text_fn or hm._extract_message_text_with_attachments
@@ -147,8 +174,40 @@ def resolve_ide_mode(
             and str(m.get("role", "") or "").strip().lower() == "assistant"
             for m in messages
         )
-        is_cont = has_assistant or user_turn_count >= 2
-        reason = "ide_mode_continuation" if is_cont else "ide_mode_first_turn"
+        shape_cont = has_assistant or user_turn_count >= 2
+        # 绑定续聊：IDE 显式声明本请求续聊其绑定的网页对话 URL。压缩迁移后的
+        # 首条消息只有 system+1 条 user（无 assistant、userCount=1），按形状会
+        # 误判成新会话首轮再点新建；resume 标记正是为覆盖这种「有绑定槽但形状
+        # 不足」的续聊。仅当声明与当前网页会话/页面一致时才采信，陈旧标记不打
+        # 到别的页。
+        resume_url = str(resume_conversation_url or "").strip()
+        resume_cont = False
+        if resume_url:
+            try:
+                cur_session_url = str(
+                    getattr(session, "conversation_url", "") or ""
+                ).strip()
+                if cur_session_url and _same_conversation_url(
+                    cur_session_url, resume_url
+                ):
+                    resume_cont = True
+            except Exception:
+                resume_cont = False
+            if not resume_cont:
+                try:
+                    tab_url = str(
+                        getattr(getattr(session, "tab", None), "url", "") or ""
+                    ).strip()
+                    if tab_url and _same_conversation_url(tab_url, resume_url):
+                        resume_cont = True
+                except Exception:
+                    resume_cont = False
+        is_cont = shape_cont or resume_cont
+        reason = (
+            "ide_mode_resume"
+            if resume_cont
+            else ("ide_mode_continuation" if shape_cont else "ide_mode_first_turn")
+        )
 
     if not turns:
         # 没有有效轮次，退化为全量

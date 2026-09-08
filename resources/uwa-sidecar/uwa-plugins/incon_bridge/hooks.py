@@ -9,6 +9,7 @@ update_preserve.py 上游同步机制，改核心会导致升级冲突。
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Optional
 
@@ -27,27 +28,24 @@ def get_last_xuwa() -> Optional[dict]:
 from .ide_mode import resolve_ide_mode
 
 #: 由 API 层在处理请求时写入，供钩子读取本轮的桥接参数。
-#: 使用 contextvars 以支持并发请求隔离。
-try:
-    from contextvars import ContextVar
-
-    _current_ext: "ContextVar[Optional[Any]]" = ContextVar(
-        "incon_bridge_request_ext", default=None
-    )
-except Exception:  # pragma: no cover
-    _current_ext = None  # type: ignore
+#: 注意不能用 contextvars：workflow/浏览器执行在独立 async 任务或线程里，
+#: contextvar 只在设置它的任务内可见，跨任务/线程读到的永远是 default(None)，
+#: 实测 force_new/resume/conversation_hint 全被吞掉。与下方 _LAST_XUWA 同理，
+#: 用模块级变量 + 锁；ide 场景单请求串行，可接受。
+_EXT_LOCK = threading.Lock()
+_current_ext: Optional[Any] = None
 
 
 def set_request_extension(ext: Any) -> None:
-    """由 API 层调用，登记本次请求的桥接扩展字段。"""
-    if _current_ext is not None:
-        _current_ext.set(ext)
+    """由 API 层调用，登记本次请求的桥接扩展字段（模块级，跨任务/线程可见）。"""
+    global _current_ext
+    with _EXT_LOCK:
+        _current_ext = ext
 
 
 def get_request_extension() -> Optional[Any]:
-    if _current_ext is not None:
-        return _current_ext.get()
-    return None
+    with _EXT_LOCK:
+        return _current_ext
 
 
 def _delegate_to_history_mode(session, messages, history_mode, live_url,
@@ -94,25 +92,29 @@ def resolve_history(session, messages, history_mode, live_url,
     ext = get_request_extension()
     force_new = bool(getattr(ext, "force_new_conversation", False))
     spm = str(getattr(ext, "system_prompt_mode", "inject_once") or "inject_once")
+    resume_url = str(getattr(ext, "resume_conversation_url", "") or "").strip() or None
 
     resolution = resolve_ide_mode(
         session=session,
         messages=messages,
         force_new_conversation=force_new,
         system_prompt_mode=spm,
+        resume_conversation_url=resume_url,
         extract_text_fn=extract_text_fn,
         build_prompt_fn=build_prompt_fn,
     )
 
     hint = getattr(ext, "conversation_hint", None)
     logger.info(
-        "[incon_bridge] ide mode: turn=%s cont=%s typed=%s/%s reason=%s%s",
+        "[incon_bridge] ide mode: turn=%s cont=%s typed=%s/%s reason=%s%s%s hookfile=%s",
         resolution.turn,
         resolution.is_continuation,
         resolution.typed_chars,
         resolution.full_chars,
         resolution.reason,
         f" trigger={hint.reason}" if hint is not None else "",
+        f" resume={resume_url}" if resume_url else " resume=-",
+        __file__,
     )
     return resolution
 
