@@ -37,6 +37,14 @@ import mergeJson from "../util/merge.js";
 import { renderChatMessage } from "../util/messageContent.js";
 import { isOllamaInstalled } from "../util/ollamaHelper.js";
 import { withExponentialBackoff } from "../util/withExponentialBackoff.js";
+import {
+  consumeUwaFields,
+  getUwaConversationState,
+  isUwaModelApiBase,
+  setUwaConversationState,
+  uwaConversationFingerprint,
+} from "../util/uwaRequestContext.js";
+import { prepareUwaTargetUrl } from "../util/uwaConversationSync.js";
 
 import {
   autodetectPromptTemplates,
@@ -1020,18 +1028,64 @@ export abstract class BaseLLM implements ILLM {
     );
   }
 
+  /** 从 sidecar 响应的 x_uwa（流末帧或 JSON 根字段）记录网页对话绑定到会话指纹槽 */
+  private recordUwaResponseExt(xu: any, fp?: string | undefined): void {
+    const url = xu?.conversation_url;
+    if (!url || typeof url !== "string") {
+      return;
+    }
+    setUwaConversationState(
+      {
+        conversationUrl: url,
+        conversationId:
+          typeof xu.conversation_id === "string" ? xu.conversation_id : "",
+        tabIndex: Number.isFinite(xu.tab_index) ? Number(xu.tab_index) : -1,
+        turn: Number.isFinite(xu.turn) ? Number(xu.turn) : 0,
+        updatedAt: Date.now(),
+      },
+      fp,
+    );
+  }
+
+  /** 给请求体附加 uwa 每请求目标端点（非枚举属性：不进序列化 JSON，adapter 端读取） */
+  private attachUwaTarget(body: any, uwaTargetUrl: string): void {
+    try {
+      Object.defineProperty(body, "uwaTargetUrl", {
+        value: uwaTargetUrl,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
   private async *openAIAdapterStream(
     body: ChatCompletionCreateParams,
     signal: AbortSignal,
     onCitations: (c: string[]) => void,
+    uwaTargetUrl?: string,
+    uwaFp?: string,
   ): AsyncGenerator<ChatMessage> {
-    const stream = this.openaiAdapter!.chatCompletionStream(
-      { ...body, stream: true },
-      signal,
-    );
+    const payload: any = { ...body, stream: true };
+    if (uwaTargetUrl) {
+      this.attachUwaTarget(payload, uwaTargetUrl);
+    }
+    const stream = this.openaiAdapter!.chatCompletionStream(payload, signal);
     for await (const chunk of stream) {
       if (!this.lastRequestId && typeof (chunk as any).id === "string") {
         this.lastRequestId = (chunk as any).id;
+      }
+      const xu = (chunk as any)?.x_uwa;
+      if (
+        xu &&
+        typeof xu === "object" &&
+        !Array.isArray((chunk as any)?.choices)
+      ) {
+        // sidecar 在流末尾追加的会话状态帧（无 choices）：记录后跳过
+        this.recordUwaResponseExt(xu, uwaFp);
+        continue;
       }
       const chatChunk = fromChatCompletionChunk(chunk as any);
       if (chatChunk) {
@@ -1046,12 +1100,19 @@ export abstract class BaseLLM implements ILLM {
   private async *openAIAdapterNonStream(
     body: ChatCompletionCreateParams,
     signal: AbortSignal,
+    uwaTargetUrl?: string,
+    uwaFp?: string,
   ): AsyncGenerator<ChatMessage> {
+    const payload: any = { ...body, stream: false };
+    if (uwaTargetUrl) {
+      this.attachUwaTarget(payload, uwaTargetUrl);
+    }
     const response = await this.openaiAdapter!.chatCompletionNonStream(
-      { ...body, stream: false },
+      payload,
       signal,
     );
     this.lastRequestId = response.id ?? this.lastRequestId;
+    this.recordUwaResponseExt((response as any)?.x_uwa, uwaFp);
     const messages = fromChatResponse(response as any);
     for (const msg of messages) {
       yield msg;
@@ -1209,13 +1270,70 @@ export abstract class BaseLLM implements ILLM {
               ? this.responsesStream(messages, signal, completionOptions)
               : this.responsesNonStream(messages, signal, completionOptions);
           } else {
-            iterable = useStream
-              ? this.openAIAdapterStream(body, signal, (c) => {
-                  if (!citations) {
-                    citations = c;
+            // uwa 桥接（需求 0/1 + 会话↔网页对话一致）：本模型指向受控
+            // sidecar 时，把 ide 会话字段并入请求体；对「续聊形态」请求再按
+            // 本会话指纹槽取网页对话 URL，走 /tab-url/<token> 确定性路由，
+            // 保证切回旧会话续聊时落在该会话自己的网页对话页。
+            const uwaFp = uwaConversationFingerprint(messages);
+            let uwaTargetUrl: string | undefined;
+            if (isUwaModelApiBase(this.apiBase)) {
+              const uwaFields = consumeUwaFields();
+              if (uwaFields) {
+                Object.assign(body as any, uwaFields);
+              }
+              try {
+                const mode = String(
+                  (body as any).history_mode ?? "",
+                ).toLowerCase();
+                const forceNew = Boolean(
+                  (body as any).force_new_conversation,
+                );
+                if (mode === "ide" && !forceNew && uwaFp && this.apiBase) {
+                  const hasAssistant = messages.some(
+                    (m) =>
+                      String((m as any).role ?? "").toLowerCase() ===
+                      "assistant",
+                  );
+                  const userCount = messages.filter(
+                    (m) =>
+                      String((m as any).role ?? "").toLowerCase() === "user",
+                  ).length;
+                  if (hasAssistant || userCount >= 2) {
+                    const st = getUwaConversationState(uwaFp);
+                    if (st?.conversationUrl) {
+                      const origin = new URL(this.apiBase).origin;
+                      const target = await prepareUwaTargetUrl(
+                        origin,
+                        st.conversationUrl,
+                      );
+                      if (target) {
+                        uwaTargetUrl = target;
+                      }
+                    }
                   }
-                })
-              : this.openAIAdapterNonStream(body, signal);
+                }
+              } catch {
+                /* 降级：字段照带；定向失败则走默认端点，不阻断发送 */
+              }
+            }
+            iterable = useStream
+              ? this.openAIAdapterStream(
+                  body,
+                  signal,
+                  (c) => {
+                    if (!citations) {
+                      citations = c;
+                    }
+                  },
+                  uwaTargetUrl,
+                  uwaFp,
+                )
+              : this.openAIAdapterNonStream(
+                  body,
+                  signal,
+                  uwaTargetUrl,
+                  uwaFp,
+                );
           }
 
           for await (const chunk of iterable) {

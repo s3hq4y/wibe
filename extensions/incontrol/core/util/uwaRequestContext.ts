@@ -40,6 +40,7 @@ export interface UwaConversationState {
 }
 
 let enabled = false;
+let sidecarBaseUrl = '';
 let base: UwaRequestFields = {};
 /** 一次性标记：只作用于下一个请求，用完即清 */
 let oneShot: UwaRequestFields | undefined;
@@ -70,6 +71,18 @@ export function setUwaBridgeEnabled(on: boolean, defaults?: UwaRequestFields): v
 export function isUwaBridgeEnabled(): boolean {
 	return enabled;
 }
+
+	/** 登记受控 sidecar 的 API 根（如 http://127.0.0.1:8199）；桥接激活后写入 */
+	export function setUwaSidecarBaseUrl(base: string): void {
+		sidecarBaseUrl = String(base ?? '').trim().replace(/\/+$/, '');
+	}
+
+	/** 该模型的 apiBase 是否指向受控 sidecar；用于把 uwa 字段/定向只作用到 sidecar 模型 */
+	export function isUwaModelApiBase(apiBase?: string): boolean {
+		if (!enabled || !sidecarBaseUrl) { return false; }
+		const base = String(apiBase ?? '').trim().replace(/\/+$/, '');
+		return base.startsWith(sidecarBaseUrl + '/');
+	}
 
 /**
  * 标记下一次请求需要开新对话（压缩迁移 / 模型切换）。

@@ -15,12 +15,30 @@ import { ConversationBridge } from './conversationBridge';
 import { onCompactionComplete, onModelSwitch } from './bridgeTriggers';
 import { MigrationResult, SessionBinding } from './protocol';
 import { SidecarManager } from './sidecarManager';
-import { markNextRequest, setUwaBridgeEnabled } from '../core/util/uwaRequestContext.js';
+import {
+	markNextRequest,
+	onUwaConversationChanged,
+	setUwaBridgeEnabled,
+	setUwaSidecarBaseUrl,
+} from '../core/util/uwaRequestContext.js';
+import {
+	clearUwaSyncedModels,
+	hasUwaSyncedModels,
+	setUwaSyncedModels,
+} from '../core/util/uwaModelOverlay';
+import { fetchUwaTabs, fetchUwaTabModels, UwaPageTab } from './uwaPages';
 
 let sidecar: SidecarManager | undefined;
 let bridge: ConversationBridge | undefined;
 let statusItem: vscode.StatusBarItem | undefined;
 let output: vscode.OutputChannel | undefined;
+
+// ---------------------------------------------------------------------
+// 需求 4：当前 uwa 网页状态（模块级，便于状态栏与命令共用）
+// ---------------------------------------------------------------------
+let pageStatusItem: vscode.StatusBarItem | undefined;
+let pagePollTimer: NodeJS.Timeout | undefined;
+let knownPage: { tab?: UwaPageTab; modelCount: number } = { modelCount: 0 };
 
 /** 供 core/ 侧调用，拿到当前桥接实例 */
 export function getBridge(): ConversationBridge | undefined {
@@ -29,6 +47,14 @@ export function getBridge(): ConversationBridge | undefined {
 
 export function getSidecarBaseUrl(): string | undefined {
 	return sidecar?.getBaseUrl();
+}
+
+/** 启动成功后把实际 base URL 同步给 core 侧（端口可能被改写） */
+function syncSidecarBaseUrl(): void {
+	const b = sidecar?.getBaseUrl();
+	if (b) {
+		setUwaSidecarBaseUrl(b);
+	}
 }
 
 function renderStatus(b: SessionBinding | undefined): void {
@@ -101,6 +127,250 @@ function renderSidecarStatus(alive: boolean): void {
 	statusItem.show();
 }
 
+function logLine(m: string): void {
+	output?.appendLine(`[uwa-page] ${m}`);
+}
+
+function uwaHostLabel(tab?: UwaPageTab): string {
+	if (!tab) {
+		return '';
+	}
+	if (tab.url) {
+		try {
+			return new URL(tab.url).hostname.replace(/^www\./, '');
+		} catch {
+			/* not a parseable url */
+		}
+	}
+	return tab.domain || `tab#${tab.persistentIndex}`;
+}
+
+function renderPageItem(): void {
+	if (!pageStatusItem) {
+		return;
+	}
+	const t = knownPage.tab;
+	if (!t || !t.url) {
+		pageStatusItem.hide();
+		return;
+	}
+	const preset = t.effectivePresetName ?? t.presetName;
+	pageStatusItem.text = `$(browser) ${uwaHostLabel(t)}`;
+	pageStatusItem.tooltip = [
+		'uwa 网页状态',
+		`URL: ${t.url}`,
+		preset ? `预设: ${preset}` : undefined,
+		t.modelName ? `模型: ${t.modelName}` : undefined,
+		'点击打开网页菜单',
+	]
+		.filter((l): l is string => !!l)
+		.join('\n');
+	pageStatusItem.show();
+}
+
+async function refreshPageSnapshot(): Promise<void> {
+	const alive = sidecar ? (await sidecar.checkHealth()).alive : false;
+	if (!alive || !bridge) {
+		knownPage = { modelCount: 0 };
+		renderPageItem();
+		return;
+	}
+	try {
+		const tabs = await fetchUwaTabs(sidecar!.getBaseUrl());
+		const bound = bridge?.getBinding();
+		const usable = tabs.filter((t) => t.url.startsWith('http'));
+		const tab =
+			usable.find(
+				(t) => bound?.tabIndex !== undefined && t.persistentIndex === bound.tabIndex,
+			) ??
+			usable[0] ??
+			undefined;
+		knownPage = { tab, modelCount: 0 };
+	} catch (err) {
+		logLine(`page poll failed: ${err}`);
+		knownPage = { modelCount: 0 };
+	}
+	renderPageItem();
+}
+
+function startPagePolling(seconds: number): void {
+	stopPagePolling();
+	void refreshPageSnapshot();
+	pagePollTimer = setInterval(() => {
+		void refreshPageSnapshot();
+	}, Math.max(5, seconds) * 1000);
+}
+
+function stopPagePolling(): void {
+	if (pagePollTimer) {
+		clearInterval(pagePollTimer);
+		pagePollTimer = undefined;
+	}
+}
+
+async function pickSyncTab(): Promise<UwaPageTab | undefined> {
+	if (!sidecar) {
+		return undefined;
+	}
+	const tabs = await fetchUwaTabs(sidecar!.getBaseUrl());
+	const usable = tabs.filter((t) => t.url.startsWith('http'));
+	if (usable.length === 0) {
+		return undefined;
+	}
+	const bound = bridge?.getBinding();
+	const boundTab = usable.find(
+		(t) => bound?.tabIndex !== undefined && t.persistentIndex === bound.tabIndex,
+	);
+	if (boundTab) {
+		return boundTab;
+	}
+	if (usable.length === 1) {
+		return usable[0];
+	}
+	const items = usable.map((t) => ({
+		label: uwaHostLabel(t),
+		description:
+			`#${t.persistentIndex}` +
+			(t.effectivePresetName ? ` · ${t.effectivePresetName}` : '') +
+			(t.modelName ? ` · ${t.modelName}` : ''),
+		tab: t,
+	}));
+	const picked = await vscode.window.showQuickPick(items, {
+		title: '选择要同步的 uwa 网页标签页',
+		matchOnDescription: true,
+	});
+	return picked?.tab;
+}
+
+/** 需求 4：把当前网页的可用模型同步成可选项（只进内存，不落盘 config） */
+async function syncUwaModelsCommand(): Promise<void> {
+	if (!sidecar) {
+		return;
+	}
+	const health = await sidecar.checkHealth();
+	if (!health.alive) {
+		const act = '启动 sidecar';
+		const pick = await vscode.window.showWarningMessage(
+			'uwa sidecar 未运行，无法同步网页模型。',
+			act,
+		);
+		if (pick === act) {
+			await vscode.commands.executeCommand('incontrol.bridge.startSidecar');
+		}
+		return;
+	}
+
+	const tab = await pickSyncTab();
+	if (!tab) {
+		vscode.window.showInformationMessage(
+			'uwa 没有可用的网页标签页。请先在受控浏览器里打开目标站点。',
+		);
+		return;
+	}
+
+	const models = await fetchUwaTabModels(sidecar!.getBaseUrl(), tab);
+	if (models.length === 0) {
+		vscode.window.showInformationMessage(
+			`当前网页（${uwaHostLabel(tab)}）暂无可枚举的模型列表，无法同步。`,
+		);
+		return;
+	}
+
+	const apiBase = `${sidecar!.getBaseUrl()}/v1`;
+	setUwaSyncedModels(
+		models.map((m) => ({ title: m.displayName, model: m.id, apiBase })),
+	);
+	knownPage = { tab, modelCount: models.length };
+	renderPageItem();
+	vscode.window.setStatusBarMessage(
+		`$(check) 已同步 ${models.length} 个网页模型（${uwaHostLabel(tab)}），可在模型选择器中选用`,
+		6000,
+	);
+	logLine(`synced ${models.length} models from tab#${tab.persistentIndex} (${uwaHostLabel(tab)})`);
+}
+
+/** 需求 4：清除同步进来的网页模型 */
+async function clearSyncedModelsCommand(): Promise<void> {
+	if (!hasUwaSyncedModels()) {
+		vscode.window.showInformationMessage('当前没有已同步的网页模型。');
+		return;
+	}
+	clearUwaSyncedModels();
+	knownPage = { ...knownPage, modelCount: 0 };
+	vscode.window.setStatusBarMessage('$(check) 已清除网页同步模型', 4000);
+	logLine('cleared synced uwa models');
+}
+
+/** 需求 4：状态栏「当前 uwa 网页」点击菜单 */
+async function pageMenuCommand(): Promise<void> {
+	const alive = sidecar ? (await sidecar.checkHealth()).alive : false;
+	const tab = alive ? knownPage.tab : undefined;
+	const items: (vscode.QuickPickItem & { act: string })[] = [];
+	if (!alive) {
+		items.push(
+			{ label: '$(play) 启动 sidecar', act: 'start' },
+			{ label: '$(output) 查看日志', act: 'logs' },
+		);
+	} else {
+		if (tab) {
+			items.push(
+				{ label: '$(sync) 同步网页模型到模型列表', description: uwaHostLabel(tab), act: 'sync' },
+				{ label: '$(link-external) 在浏览器打开当前网页', act: 'open' },
+				{ label: '$(copy) 复制网页地址', act: 'copy' },
+			);
+		} else {
+			items.push({ label: '$(sync) 同步网页模型到模型列表', act: 'sync' });
+		}
+		items.push(
+			{ label: '$(trash) 清除已同步的网页模型', act: 'clear' },
+			{ label: '$(debug-disconnect) 停止 sidecar', act: 'stop' },
+			{ label: '$(output) 查看日志', act: 'logs' },
+		);
+	}
+	const placeholder = tab
+		? `${uwaHostLabel(tab)}${tab.effectivePresetName ? ' · ' + tab.effectivePresetName : ''}`
+		: alive
+			? 'uwa sidecar 运行中'
+			: 'uwa sidecar 未运行';
+	const picked = await vscode.window.showQuickPick(items, {
+		title: 'uwa 网页',
+		placeHolder: placeholder,
+	});
+	if (!picked) {
+		return;
+	}
+	switch (picked.act) {
+		case 'start':
+			await vscode.commands.executeCommand('incontrol.bridge.startSidecar');
+			break;
+		case 'stop':
+			await vscode.commands.executeCommand('incontrol.bridge.stopSidecar');
+			break;
+		case 'logs':
+			await vscode.commands.executeCommand('incontrol.bridge.showLogs');
+			break;
+		case 'sync':
+			await syncUwaModelsCommand();
+			break;
+		case 'clear':
+			await clearSyncedModelsCommand();
+			break;
+		case 'open':
+			if (tab?.url) {
+				await vscode.env.openExternal(vscode.Uri.parse(tab.url));
+			}
+			break;
+		case 'copy':
+			if (tab?.url) {
+				await vscode.env.clipboard.writeText(tab.url);
+				vscode.window.setStatusBarMessage('$(check) 网页地址已复制', 3000);
+			}
+			break;
+		default:
+			break;
+	}
+}
+
 export interface BridgeHandle {
 	dispose(): Promise<void>;
 }
@@ -139,9 +409,18 @@ export async function activateBridge(
 	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
 	statusItem.command = 'incontrol.bridge.status';
 	context.subscriptions.push(statusItem);
+
+	// 需求 4：状态栏显示当前 uwa 网页（点击打开网页菜单）
+	pageStatusItem = vscode.window.createStatusBarItem(
+		vscode.StatusBarAlignment.Right,
+		98,
+	);
+	pageStatusItem.command = 'incontrol.bridge.pageMenu';
+	context.subscriptions.push(pageStatusItem);
 	// 开启后，core 侧每个 chat/completions 都会带上 history_mode='ide'。
 	// 这是需求 0/1 的关键：没有它，uwa 会在同一会话里反复开新对话。
 	setUwaBridgeEnabled(true, { history_mode: 'ide', system_prompt_mode: 'inject_once' });
+	syncSidecarBaseUrl(); // 端口占位即默认值；实际启动成功后再次同步
 	renderStatus(bridge.getBinding());
 	renderSidecarStatus(false);
 
@@ -156,6 +435,7 @@ export async function activateBridge(
 			);
 			renderSidecarStatus(health.alive);
 			if (health.alive) {
+				syncSidecarBaseUrl();
 				vscode.window.showInformationMessage(`uwa sidecar 已就绪：${sidecar!.getBaseUrl()}`);
 			} else {
 				const seeLog = '查看日志';
@@ -293,6 +573,7 @@ export async function activateBridge(
 					await sidecar?.stop();
 					const h = await sidecar?.start();
 					if (h?.alive) {
+						syncSidecarBaseUrl();
 						vscode.window.setStatusBarMessage(`$(check) sidecar 已就绪 :${h.port}`, 4000);
 					} else {
 						vscode.window.showErrorMessage(`sidecar 启动失败：${h?.error ?? 'unknown'}`);
@@ -304,16 +585,58 @@ export async function activateBridge(
 
 		/** 运维：查看 sidecar 日志 */
 		vscode.commands.registerCommand('incontrol.bridge.showLogs', () => output?.show()),
+			/** 需求 4：状态栏「当前 uwa 网页」菜单 */
+		vscode.commands.registerCommand('incontrol.bridge.pageMenu', () =>
+			pageMenuCommand(),
+		),
+		/** 需求 4：手动把当前网页模型同步成可选模型 */
+		vscode.commands.registerCommand('incontrol.bridge.syncUwaModels', () =>
+			syncUwaModelsCommand(),
+		),
+		/** 需求 4：清除网页同步模型 */
+		vscode.commands.registerCommand('incontrol.bridge.clearSyncedModels', () =>
+			clearSyncedModelsCommand(),
+		),
 	);
 
 	// ------------------------------------------------------------ 事件订阅
+	// 需求「会话 ↔ 网页对话一致」：core 侧 OpenAI 客户端从每次响应解析
+	// x_uwa 后推送绑定状态，这里同步到 bridge binding 与状态栏。
+	context.subscriptions.push({
+		dispose: onUwaConversationChanged((st) => {
+			if (st?.conversationUrl) {
+				bridge?.noteWebConversation(st);
+				renderStatus(bridge?.getBinding());
+			}
+		}),
+	});
+
 	// 需求 2：压缩完成 -> 自动迁移
 	context.subscriptions.push({
 		dispose: onCompactionCompleted.on(async (e) => {
 			const enabled = vscode.workspace
 				.getConfiguration('incontrol.bridge')
 				.get<boolean>('autoMigrateOnCompaction') !== false;
-			if (!enabled || !e.summary?.trim()) {
+			if (!e.summary?.trim()) {
+				return;
+			}
+			// 需求 2：压缩完成后主动把摘要复制到剪贴板（不阻断迁移流程）。
+			void vscode.env.clipboard.writeText(e.summary).then(
+				() =>
+					vscode.window.setStatusBarMessage(
+						'$(check) 压缩摘要已复制到剪贴板',
+						3000,
+					),
+				(err) => log(`clipboard copy failed: ${String(err)}`),
+			);
+			if (!enabled) {
+				return;
+			}
+			// 仅当存在网页会话绑定时自动迁移：未绑定的纯 IDE 流擅自打开新的
+			// 网页对话不符合预期（可用 compactAndMigrate 命令手动触发）。
+			const binding = bridge?.getBinding();
+			if (!binding || binding.state === 'IDLE') {
+				log('skip auto compaction migration: no bound web conversation');
 				return;
 			}
 			// 需求 2：压缩后下一条消息必须落到新对话，并重新注入系统提示词。
@@ -339,6 +662,22 @@ export async function activateBridge(
 			if (!enabled || !e.packedHistory?.trim()) {
 				return;
 			}
+			// 需求 3：先征询用户，确认后再把打包历史 + 系统提示词迁到新网页对话。
+			const migrate = '迁移到新网页对话';
+			const pick = await vscode.window.showInformationMessage(
+				`聊天模型已切换：${e.previousModel ?? '（未知）'} → ${e.newModel}。` +
+					`是否把当前会话历史（约 ${e.packedHistory.length} 字符）` +
+					'与系统提示词迁移到新的网页对话？',
+				{ modal: false },
+				migrate,
+				'暂不迁移',
+			);
+			if (pick !== migrate) {
+				log(
+					`model switch migration declined: ${e.previousModel ?? '?'} -> ${e.newModel}`,
+				);
+				return;
+			}
 			// 需求 3：切换模型后开新窗口，带上打包历史与系统提示词。
 			markNextRequest({
 				force_new_conversation: true,
@@ -353,12 +692,18 @@ export async function activateBridge(
 		}),
 	});
 
+	// ------------------------------------------------------------ 需求 4：网页轮询
+	if (cfg.get<boolean>('showPageStatusBar') !== false) {
+		startPagePolling(cfg.get<number>('pagePollIntervalSec') ?? 15);
+	}
+
 	// ------------------------------------------------------------ 启动 sidecar
 	if (cfg.get<boolean>('autoStart') !== false) {
 		void (async () => {
 			const health = await sidecar!.start();
 			renderSidecarStatus(health.alive);
 			if (health.alive) {
+				syncSidecarBaseUrl();
 				log(`sidecar ready on :${health.port}`);
 			} else {
 				log(`sidecar failed: ${health.error}`);
@@ -374,6 +719,7 @@ export async function activateBridge(
 
 	return {
 		async dispose() {
+			stopPagePolling();
 			// 级联关闭：不做这一步会在用户机器上堆积孤儿 Chrome 进程，
 			// 并导致下次启动时 chrome_profile 被占用
 			await sidecar?.stop();

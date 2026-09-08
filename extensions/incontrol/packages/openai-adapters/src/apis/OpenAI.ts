@@ -48,6 +48,23 @@ export class OpenAIApi implements BaseLlmApi {
       timeout: config?.requestOptions?.timeout || undefined,
     });
   }
+  /** core 侧以非枚举属性附加的 uwa 每请求目标端点（如 /tab-url/<token>/v1/chat/completions） */
+  private static uwaTargetOf(body: object): string | undefined {
+    const v = (body as { uwaTargetUrl?: unknown }).uwaTargetUrl;
+    return typeof v === "string" && v.startsWith("http") ? v : undefined;
+  }
+
+  /** 为一次性目标端点构造客户端（baseURL 截去 /chat/completions 后缀） */
+  private clientForTarget(targetUrl: string): OpenAI {
+    const baseURL = targetUrl.replace(/\/chat\/completions\/?$/, "");
+    return new OpenAI({
+      apiKey: this.config.apiKey ?? "",
+      baseURL,
+      fetch: customFetch(this.config.requestOptions),
+      timeout: this.config?.requestOptions?.timeout || undefined,
+    });
+  }
+
   modifyChatBody<T extends ChatCompletionCreateParams>(body: T): T {
     // Add stream_options to include usage in streaming responses
     if (body.stream) {
@@ -134,7 +151,9 @@ export class OpenAIApi implements BaseLlmApi {
       const response = await this.responsesNonStream(body, signal);
       return responseToChatCompletion(response);
     }
-    const response = await this.openai.chat.completions.create(
+    const target = OpenAIApi.uwaTargetOf(body);
+    const client = target ? this.clientForTarget(target) : this.openai;
+    const response = await client.chat.completions.create(
       this.modifyChatBody(body),
       {
         signal,
@@ -153,7 +172,9 @@ export class OpenAIApi implements BaseLlmApi {
       }
       return;
     }
-    const response = await this.openai.chat.completions.create(
+    const target = OpenAIApi.uwaTargetOf(body);
+    const client = target ? this.clientForTarget(target) : this.openai;
+    const response = await client.chat.completions.create(
       this.modifyChatBody(body),
       {
         signal,
