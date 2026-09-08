@@ -7,7 +7,15 @@
  * new_chat_btn 开新对话，需求 0/1 完全失效。
  *
  * core/ 内禁止 import vscode，因此这里只维护纯数据，由扩展侧写入。
+ *
+ * 除请求字段外，本模块还持有「当前绑定的网页对话 URL」：
+ *   - 发送前：OpenAI 客户端读取它，若受控浏览器不在该对话页则先导航回去
+ *     （需求：切回历史会话时网页对话保持一致）；
+ *   - 响应后：从 x_uwa 解析到新 URL 时写回（setUwaConversationState），
+ *     并通知订阅者（bridge 层借此刷新状态栏与迁移用的 binding）。
  */
+
+import { createHash } from 'crypto';
 
 export type UwaHistoryMode = 'auto' | 'full' | 'last' | 'ide';
 export type UwaSystemPromptMode = 'inject_once' | 'always' | 'never';
@@ -22,10 +30,36 @@ export interface UwaRequestFields {
 	};
 }
 
+/** 会话绑定快照：只含跨 core/bridge 共享的最小信息 */
+export interface UwaConversationState {
+	conversationUrl: string;
+	conversationId: string;
+	tabIndex: number;
+	turn: number;
+	updatedAt: number;
+}
+
 let enabled = false;
 let base: UwaRequestFields = {};
 /** 一次性标记：只作用于下一个请求，用完即清 */
 let oneShot: UwaRequestFields | undefined;
+
+/**
+ * 网页对话绑定按「IDE 会话指纹」分槽保存。
+ *
+ * 为什么需要分槽：扩展可同时打开多个 IDE 会话（会话 A/B 各绑定一个网页
+ * 对话）。旧实现是单一全局 state——切回会话 A 续聊时，发送前断言读到的
+ * 仍是会话 B 的绑定 URL，消息被定向/导航到 B 的网页对话（串台）。
+ * 每个 IDE 会话的首条 user 消息文本通常各不相同，用它做指纹即可把绑定
+ * 归位到各自会话：发送前按本次 messages 的指纹取回本会话的 URL。
+ *
+ * 槽表带 LRU 上限；另外保留「最近一次」引用供不携带指纹的调用方
+ * （bridge 迁移直发等）与状态栏展示使用。
+ */
+const MAX_SLOTS = 64;
+const slots = new Map<string, UwaConversationState>();
+let conversation: UwaConversationState | undefined;
+const listeners = new Set<(state: UwaConversationState | undefined) => void>();
 
 /** 扩展激活时开启；未开启则完全不影响非 uwa 用户 */
 export function setUwaBridgeEnabled(on: boolean, defaults?: UwaRequestFields): void {
@@ -51,4 +85,78 @@ export function consumeUwaFields(): UwaRequestFields | undefined {
 	const merged: UwaRequestFields = { ...base, ...(oneShot ?? {}) };
 	oneShot = undefined;
 	return merged;
+}
+
+/**
+ * 会话指纹：取 messages 里第一条 user 文本（跳过 system/工具），
+ * sha1 摘要。同一 IDE 会话的任意续聊轮次都得到同一指纹，不同会话
+ * （首条 user 不同）互不冲突。
+ */
+export function uwaConversationFingerprint(messages: { role?: string; content?: unknown }[]): string | undefined {
+	for (const m of messages || []) {
+		if (m && String(m.role ?? '').toLowerCase() === 'user') {
+			const text = Array.isArray(m.content)
+				? JSON.stringify(m.content)
+				: String(m.content ?? '');
+			if (text && text.trim()) {
+				return createHash('sha1').update(`user:${text}`).digest('hex').slice(0, 20);
+			}
+		}
+	}
+	return undefined;
+}
+
+/** 响应确认网页对话后写回绑定状态；URL/轮次变化时通知订阅者。
+ *  fp 有值时写入该会话槽，同时刷新「最近一次」引用。 */
+export function setUwaConversationState(
+	state: UwaConversationState,
+	fp?: string | undefined,
+): void {
+	const { conversationUrl, turn } = state;
+	if (fp) {
+		slots.delete(fp);
+		slots.set(fp, { ...state, updatedAt: Date.now() });
+		while (slots.size > MAX_SLOTS) {
+			const oldest = slots.keys().next().value;
+			if (oldest === undefined) { break; }
+			slots.delete(oldest);
+		}
+	}
+	const changed =
+		!conversation ||
+		conversation.conversationUrl !== conversationUrl ||
+		conversation.turn !== turn;
+	conversation = { ...state, updatedAt: Date.now() };
+	if (changed) {
+		for (const l of [...listeners]) {
+			try { l(conversation); } catch { /* 订阅者异常不影响主流程 */ }
+		}
+	}
+}
+
+/**
+ * 供发送前使用。
+ *
+ * 语义（重要）：带指纹时**只查本会话槽**，查不到返回 undefined——
+ * 绝不回退到其它会话的绑定（否则切回旧会话 A（A 槽尚未建立，如旧版本
+ * 遗留记录、或扩展重启后）续聊时，会把 A 的消息定向到最近会话 B 的
+ * 网页对话，造成串台）。调用方拿到 undefined 就应走默认端点，让 sidecar
+ * 按消息指纹自行路由；响应回写会把本会话槽补建起来。
+ * 不带指纹（bridge 迁移等调用方）仍返回「最近一次」引用。
+ */
+export function getUwaConversationState(
+	fp?: string | undefined,
+): UwaConversationState | undefined {
+	if (fp) {
+		return slots.get(fp);
+	}
+	return conversation;
+}
+
+/** 订阅绑定状态变化（bridge 层用于刷新状态栏 / binding） */
+export function onUwaConversationChanged(
+	listener: (state: UwaConversationState | undefined) => void,
+): () => void {
+	listeners.add(listener);
+	return () => listeners.delete(listener);
 }

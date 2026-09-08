@@ -25,7 +25,12 @@ import {
   toChatBody,
   toResponsesInput,
 } from "../openaiTypeConverters.js";
-import { consumeUwaFields, getUwaConversationState, setUwaConversationState } from "../../util/uwaRequestContext.js";
+import {
+  consumeUwaFields,
+  getUwaConversationState,
+  setUwaConversationState,
+  uwaConversationFingerprint,
+} from "../../util/uwaRequestContext.js";
 import {
   ensureConversationPage,
   prepareUwaTargetUrl,
@@ -547,6 +552,9 @@ class OpenAI extends BaseLLM {
     // 否则它会按默认逻辑在同一会话里反复开新对话。
     const uwaFields = consumeUwaFields() ?? {};
     Object.assign(body as any, uwaFields);
+    // 本请求所属 IDE 会话的指纹（首条 user 文本摘要）：绑定按会话分槽，
+    // 多会话切回时不把 A 的消息定向到 B 的网页对话。
+    const uwaFp = uwaConversationFingerprint(messages);
 
     // 需求「切回旧会话 → 网页切回原对话」：续聊（非强制开新）且本会话
     // 已绑定网页对话 URL 时，发送前把请求对准绑定会话页：
@@ -559,12 +567,24 @@ class OpenAI extends BaseLLM {
       const mode = String((uwaFields as any).history_mode ?? "").toLowerCase();
       const forceNew = Boolean((uwaFields as any).force_new_conversation);
       if (mode === "ide" && !forceNew && this.apiBase) {
-        const st = getUwaConversationState();
-        if (st?.conversationUrl) {
-          const origin = new URL(this.apiBase).origin;
-          const target = await prepareUwaTargetUrl(origin, st.conversationUrl);
-          if (target) {
-            uwaTargetUrl = new URL(target);
+        // 只对「续聊形态」请求做定向：含 assistant 回复或 ≥2 条 user 才算
+        // 续聊；新会话首轮应交给 sidecar 开新对话（旧槽指向的旧页不该被
+        // 复用），否则「复制旧会话另起炉灶」的场景会把首条发到旧网页页。
+        const hasAssistant = messages.some(
+          (m) => String((m as any).role ?? "").toLowerCase() === "assistant",
+        );
+        const userCount = messages.filter(
+          (m) => String((m as any).role ?? "").toLowerCase() === "user",
+        ).length;
+        const isContinuation = hasAssistant || userCount >= 2;
+        if (isContinuation) {
+          const st = getUwaConversationState(uwaFp);
+          if (st?.conversationUrl) {
+            const origin = new URL(this.apiBase).origin;
+            const target = await prepareUwaTargetUrl(origin, st.conversationUrl);
+            if (target) {
+              uwaTargetUrl = new URL(target);
+            }
           }
         }
       }
@@ -590,7 +610,7 @@ class OpenAI extends BaseLLM {
         return; // Aborted by user
       }
       const data = await response.json();
-      this.recordUwaExt((data as any)?.x_uwa);
+      this.recordUwaExt((data as any)?.x_uwa, uwaFp);
       yield data.choices[0].message;
       return;
     }
@@ -600,7 +620,7 @@ class OpenAI extends BaseLLM {
       const xu = raw?.x_uwa;
       if (xu && !Array.isArray(raw?.choices)) {
         // sidecar 在流末尾追加的会话信息帧（无 choices）
-        this.recordUwaExt(xu);
+        this.recordUwaExt(xu, uwaFp);
         continue;
       }
       const chunk = fromChatCompletionChunk(value);
@@ -611,19 +631,22 @@ class OpenAI extends BaseLLM {
   }
 
   /** 从 x_uwa 响应扩展里记录网页对话绑定（需求：会话 ↔ 网页对话一致） */
-  private recordUwaExt(xu: any): void {
+  private recordUwaExt(xu: any, fp?: string): void {
     const url = xu?.conversation_url;
     if (!url || typeof url !== "string") {
       return;
     }
-    setUwaConversationState({
-      conversationUrl: url,
-      conversationId:
-        typeof xu.conversation_id === "string" ? xu.conversation_id : "",
-      tabIndex: Number.isFinite(xu.tab_index) ? Number(xu.tab_index) : -1,
-      turn: Number.isFinite(xu.turn) ? Number(xu.turn) : 0,
-      updatedAt: Date.now(),
-    });
+    setUwaConversationState(
+      {
+        conversationUrl: url,
+        conversationId:
+          typeof xu.conversation_id === "string" ? xu.conversation_id : "",
+        tabIndex: Number.isFinite(xu.tab_index) ? Number(xu.tab_index) : -1,
+        turn: Number.isFinite(xu.turn) ? Number(xu.turn) : 0,
+        updatedAt: Date.now(),
+      },
+      fp,
+    );
   }
 
   // Minimal draft: Responses API support for select models
