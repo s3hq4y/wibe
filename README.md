@@ -129,7 +129,7 @@ The sidecar ships selectors for several sites (ChatGPT, Claude, Gemini, DeepSeek
 ## Notes
 
 - Personal / research use. Respect each site’s terms. This is a local browser-automation bridge, not a hosted proxy and not a bypass for login, captchas, or paywalls.
-- The editor is MIT (`LICENSE.txt`). The sidecar is AGPL-3.0 (`resources/uwa-sidecar/LICENSE`).
+- The project is AGPL-3.0 (`resources/uwa-sidecar/LICENSE`).
 - Issues: the URL in `product.json` → `reportIssueUrl`.
 
 ## Acknowledgments

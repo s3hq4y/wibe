@@ -129,7 +129,7 @@ Sidecar 内置了若干站点的选择器（ChatGPT、Claude、Gemini、DeepSeek
 ## 说明
 
 - 仅供个人研究与本地调试。请遵守各网站服务条款。这是本机浏览器自动化桥，不是托管代理，也不提供绕过登录、验证码或付费墙的能力。
-- 编辑器为 MIT（`LICENSE.txt`）。Sidecar 为 AGPL-3.0（`resources/uwa-sidecar/LICENSE`）。
+- AGPL-3.0（`resources/uwa-sidecar/LICENSE`）。
 - 反馈入口见 `product.json` 的 `reportIssueUrl`。
 
 ## 致谢
