@@ -13,7 +13,6 @@ import subprocess
 import sys
 import threading
 import time
-import webbrowser
 from typing import Any, Dict, Optional
 from urllib.request import urlopen
 from pathlib import Path
@@ -127,29 +126,6 @@ _setup_windows_event_loop_policy()
 
 
 # ================= Lifespan =================
-
-def _open_startup_page_non_blocking(page_url: str, page_name: str, initial_delay_sec: float = 1.2):
-    """Use the system browser for a local startup page, not the controlled browser."""
-    def _worker():
-        try:
-            time.sleep(max(0.0, float(initial_delay_sec)))
-
-            # 等待本地 HTTP 服务可达，避免 lifespan 内部自访问卡住。
-            if not _wait_for_local_page(page_url):
-                logger.warning(f"[startup] {page_name}未就绪，跳过自动打开: {page_url}")
-                return
-
-            webbrowser.open_new_tab(page_url)
-            logger.info(f"[startup] {page_name}已在系统浏览器打开: {page_url}")
-        except Exception as e:
-            logger.warning(f"[startup] 打开{page_name}失败: {e}")
-
-    threading.Thread(
-        target=_worker,
-        daemon=True,
-        name="open-startup-page-non-blocking",
-    ).start()
-
 
 def _wait_for_local_page(page_url: str, attempts: int = 12, interval_sec: float = 0.5) -> bool:
     for _ in range(max(1, int(attempts))):
@@ -432,14 +408,7 @@ async def lifespan(app: FastAPI):
             if _should_open_startup_pages(browser):
                 try:
                     base_url = _get_local_startup_base_url()
-                    tutorial_url = f"{base_url}/static/tutorial/index.html"
                     guide_url = f"{base_url}/static/controlled-browser-guide.html"
-                    logger.info(f"[startup] 首次启动，使用系统浏览器打开教程页: {tutorial_url}")
-                    _open_startup_page_non_blocking(
-                        tutorial_url,
-                        page_name="教程页",
-                        initial_delay_sec=1.2,
-                    )
                     logger.info(f"[startup] 首次启动，准备在受控浏览器打开引导页: {guide_url}")
                     _open_controlled_browser_page_non_blocking(
                         browser,
@@ -449,14 +418,14 @@ async def lifespan(app: FastAPI):
                         startup_blank_tab_id=startup_blank_tab_id,
                     )
                 except Exception as e:
-                    logger.warning(f"⚠️ 无法打开教程页: {e}")
+                    logger.warning(f"⚠️ 无法打开受控浏览器引导页: {e}")
             else:
                 # 显示已连接状态
                 try:
                     existing_tab_count = _count_existing_remote_pages(browser)
                 except Exception:
                     existing_tab_count = "?"
-                logger.info(f"✅ 浏览器已连接 (检测到 {existing_tab_count} 个现有网页，跳过教程)")
+                logger.info(f"✅ 浏览器已连接 (检测到 {existing_tab_count} 个现有网页，跳过启动引导)")
         else:
             logger.warning(f"⚠️ 浏览器未连接: {health.get('error', '未知')}")
         

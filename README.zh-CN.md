@@ -1,97 +1,133 @@
+<p align="center">
+  <img src="./docs/reference_shape_vscode.svg" alt="Wibe" width="96">
+</p>
+
 # Wibe
 
-**Wibe** 是基于 [Visual Studio Code — Open Source](https://github.com/microsoft/vscode)（`Code - OSS` **1.136.1**）
-的个人改版构建。编辑器主体保持上游不变，在此之上叠加了两件事：
+[English](README.md) · **简体中文**
 
-1. **Agent / 对话桥接**：接入本地 sidecar（内部代号 *uwa* / *InControl*），让工作台对话可以驱动一个由浏览器支撑的
-   模型运行时——按会话隔离的绑定槽位、历史会话恢复、目标压缩 → 摘要 → 新会话，以及"手动刷新可用模型"。
-   详见 [`docs/uwa-incontrol-bridge.md`](docs/uwa-incontrol-bridge.md)、[`docs/uwa-vs-vanilla-vscode.md`](docs/uwa-vs-vanilla-vscode.md)。
-2. **独立品牌**：产品名为 **Wibe**，全部产品图标换成单色"拱门"标志。
+Wibe 是基于 [Visual Studio Code — Open Source](https://github.com/microsoft/vscode)（**Code - OSS 1.136.1**）的桌面编辑器。编辑器、扩展宿主、用户目录布局都跟上游一致；在此之上加了一层**本地 Agent**：用你已经登录的 AI 网页，在本机真实浏览器里对话。
 
-[English](README.md) · 简体中文
+**版本：** `alpha-1.0.0-base-1.136.1`  
+Wibe **1.0.0 alpha**，基线为 Code - OSS **1.136.1**。
+
+> **仅在 DeepSeek**（[chat.deepseek.com](https://chat.deepseek.com)）上验证过功能。Sidecar 里其它站点可能有内置适配，但**本 alpha 未测试**。
 
 ---
 
-## 改名：产品名称
+## 它解决什么问题
 
-只改 `product.json` 的**显示层**，因此现有安装的用户目录、扩展、命令行、深链全部原样继承：
+多数「AI IDE」把仓库发到云端 API。Wibe 反过来：
 
-| `product.json` 字段 | 改前 | 改后 | 出现位置 |
-| --- | --- | --- | --- |
-| `nameShort` | `Code - OSS` | `Wibe` | 菜单、关于对话框、窗口标题 |
-| `nameLong` | `Code - OSS` | `Wibe` | 窗口标题后缀 |
-| `win32NameVersion` | `Microsoft Code OSS` | `Wibe` | `Wibe.exe` 文件属性、任务栏提示 |
-| `win32DirName` | `Microsoft Code OSS` | `Wibe` | 开始菜单文件夹名 |
-| `win32ShellNameShort` | `C&ode - OSS` | `W&ibe` | 开始菜单快捷方式名 |
-| `win32RegValueName` | `CodeOSS` | `Wibe` | `HKCU\Software\Classes` 外壳项 |
-| `win32AppUserModelId` | `Microsoft.CodeOSS` | `Wibe.Desktop` | 任务栏分组、通知 |
-| `win32MutexName` | `vscodeoss` | `wibe` | 单实例互斥体（顺带让 Wibe 与原版 Code - OSS 可同时运行） |
-| `reportIssueUrl` | microsoft/vscode | 本仓库 `/issues/new` | 帮助 → 报告问题 |
+1. 在 Wibe 拉起的**受控 Chrome**里，登录 ChatGPT、Claude、Gemini、DeepSeek、Kimi……
+2. 本地 Python sidecar（**UWA**）把已登录的标签页变成 OpenAI 兼容接口 `http://127.0.0.1:8199/v1`。
+3. 内置 **InControl** 聊天连这个接口。每个 IDE 会话绑定一个网页对话：侧栏续聊 = 同一网页续聊；压缩对话 / 切模型 = 网页开新会话并改绑。
 
-**刻意不改**（改了会让配置、扩展、命令行"看起来像重装"）：
+除了你本来就会打到那些网站的流量，数据不出本机。
 
-`applicationName`（`code-oss`）· `dataFolderName`（`.vscode-oss`）· `sharedDataFolderName` · `urlProtocol`（`code-oss`）
-· `serverApplicationName` / `serverDataFolderName` / `tunnelApplicationName` · `linuxIconName` · `darwinBundleIdentifier`
-· `package.json` 的 `name`（`code-oss-dev`，被 `build/`、`.vscode/launch.json`、agent skills 引用）· MIT 相关 `license*` 字段与 `LICENSE.txt`。
+---
 
-## 改名：图标集
+## 运行
 
-19 个受版本管理的图标资源统一为一张图：由上游轮廓派生的扁平单色拱门，逐尺寸原生渲染（不做缩放重采样），
-并保留主题语义（浅色 10 % 不透明度、深色 30 %、高对比度为纯色 `#D9D9D9` / `#3C3C3C`、Sessions 为纯灰）：
+1. 从已打包的 Windows 构建里启动 `Wibe.exe`。
+2. 等受控 Chrome 窗口出现，登录 **DeepSeek**（本构建唯一测过的站点），并停在可对话页面。
+3. 打开侧栏 InControl 聊天，正常说话即可。
 
-| 资源 | 用途 |
+**启动时不再自动用系统浏览器打开教程 / 说明页。** 需要时自己打开：
+
+| 用途 | 地址 |
 | --- | --- |
-| `src/vs/workbench/browser/media/code-icon.svg` | 工作台产品图标（对话框、空工作台） |
-| `src/vs/workbench/browser/parts/editor/media/letterpress-{light,dark,hcLight,hcDark}.svg` | 编辑器标签页压印底纹 |
-| `src/vs/sessions/browser/media/vscode-icon.svg` | Sessions 启动页与标题 |
-| `src/vs/sessions/contrib/chat/browser/media/letterpress-sessions-{light,dark}.svg` | 对话区压印底纹 |
-| `resources/win32/code.ico` | `Wibe.exe` 资源图标、快捷方式 |
-| `resources/win32/code_70x70.png`、`code_150x150.png` | 开始菜单 / 通知图块 |
-| `resources/linux/code.png` | Linux 窗口图标 |
-| `resources/darwin/code.icns` | macOS 图标包（11 个尺寸，16 → 1024 px） |
-| `resources/server/code-192.png`、`code-512.png`、`favicon.ico` | `code-server` / tunnel 网页端 |
-| `extensions/github-authentication/media/code-icon.svg`、`favicon.ico` | 登录页图标与 favicon |
-| `extensions/microsoft-authentication/media/favicon.ico` | 登录页 favicon |
+| Sidecar 控制台 | http://127.0.0.1:8199 |
+| 教程 | http://127.0.0.1:8199/static/tutorial/index.html |
+| OpenAI 兼容 Base URL | `http://127.0.0.1:8199/v1` |
 
-母版图见 [`docs/reference_shape_vscode.svg`](docs/reference_shape_vscode.svg)（3105 B）。
+用户目录仍是 `.vscode-oss`，因此可以沿用原 Code - OSS 的配置，也可以和原版并排运行（互斥体不同）。
 
-## 构建
+---
+
+## 相对原版 Code - OSS 多了什么
+
+| 方面 | 原版 | Wibe |
+| --- | --- | --- |
+| 产品名 / 图标 | Code - OSS | **Wibe**（只改显示层） |
+| 聊天 | Copilot / 无 | 内置 **InControl** |
+| 模型从哪来 | 云端 API Key | **UWA sidecar** → 你已登录的 AI 网页 |
+| 会话身份 | 无 | 一个 IDE 会话 ↔ 一个网页对话 URL |
+| 压缩 / 切模型 | 无 | 摘要后在网页**开新会话**并改绑 |
+| 配置路径 / 命令行 / URI | `.vscode-oss`、`code-oss://` | **故意不改** |
+
+更细的地图：[docs/uwa-vs-vanilla-vscode.md](docs/uwa-vs-vanilla-vscode.md)（相对上游的 diff）、[docs/uwa-incontrol-bridge.md](docs/uwa-incontrol-bridge.md)（协议）。
+
+```
+Wibe.exe  (Electron / Code - OSS)
+  └── extensions/incontrol          TypeScript 聊天客户端
+        │  拉起、探活、关闭
+        ▼
+     uwa-sidecar  (Python, :8199)   OpenAI 兼容 API + 控制台
+        │  驱动
+        ▼
+     Chrome --remote-debugging-port=9222
+        └── DeepSeek（已测）/ 其它站点（未测）
+```
+
+---
+
+## 从源码构建
+
+需要 `.nvmrc` 对应的 **Node.js**、**Python 3.10+**，以及 Chrome / Edge / Brave 等 Chromium 浏览器。
 
 ```bash
-npm install                    # 一次性
-npm run build-fast             # 快速开发构建（node build/next/index.ts build-fast）
-npm run build-fast-extensions  # codicons 与扩展媒体资源，改动扩展时用
-npm run compile                # 完整编译客户端 + copilot
+npm install
+npm run build-fast              # 快速编译工作台
+npm run build-fast-extensions   # 扩展媒体有改动时
+npm run compile                 # 完整客户端 + copilot
 ```
 
-想看到改名效果并不一定要跑完整打包：已构建目录里的 `resources/app/product.json` 可以就地替换，
-可执行文件的图标资源也能用 `rcedit` 直接替换。本仓库用过的脚本放在 `.build/iconwork/`（已被 git 忽略），
-它们会把新的 `product.json`、打包版 `package.json`、`VisualElementsManifest.xml`、两个 `bin` 启动器铺好，
-再把 `Code - OSS.exe` 重命名为 `Wibe.exe`。
-
-## 打补丁后的构建目录结构
+日常不必跑完整 gulp 打包。改完 InControl 或 sidecar 后，把这两个目录镜像进已打包应用的 `resources/app/`，再 Reload Window：
 
 ```
-vscode-1.136.1/            本仓库（唯一事实来源）
-  product.json             显示层改名就在这里
-  .build/iconwork/         暂存文件、生成脚本、日志（git 忽略）
-  .build/icon-backup-*/    原始文件与 rcedit 之前的 exe（git 忽略）
-../VSCode-win32-x64/       可直接运行的产品树
-  Wibe.exe                 已重命名并换过图标的可执行文件（文件版本名 Wibe）
-  Wibe.VisualElementsManifest.xml   ShortDisplayName="Wibe"
-  bin/code-oss[.cmd]       名字不变，但已指向 Wibe.exe
-  bin/wibe[.cmd]           同一份启动器的 Wibe 品牌别名
-  resources/app/product.json   打好的副本（构建时间戳里的 commit/version 保持原值）
+本仓库
+  extensions/incontrol/
+  resources/uwa-sidecar/
+        │  镜像
+        ▼
+<已打包应用>/resources/app/
+  extensions/incontrol/
+  resources/uwa-sidecar/
 ```
 
-## 回退
+**不要改** `resources/uwa-sidecar/app/core/`。Sidecar 定制走 `resources/uwa-sidecar/uwa-plugins/`，否则上游 sidecar 一更新就会把桥接冲掉。
 
-* 源码侧：`git checkout -- product.json README.md extensions resources src` 且 `git clean -f README.zh-CN.md`
-* 产品树：从 `.build\icon-backup-<时间戳>-nameswap\` 恢复（product.json、package.json、清单、`bin\*`），
-  再把 `Wibe.exe` 改回原名；`rcedit` 之前的原始 exe 保存在 `.build\icon-backup-<时间戳>-tree\Code - OSS.exe.pre-icon`。
-* Windows 可能仍显示缓存图标：脚本已调用 `SHChangeNotify(0x08000000, …)`；被钉选的快捷方式需要取消钉选再钉一次。
+---
 
-## 上游与许可
+## 目录
 
-上游：<https://github.com/microsoft/vscode>，`1.136.1`。源码仍按 [MIT 许可](LICENSE.txt) 发布并保留原版权声明；
-图标为上游 VS Code 标志的派生作品。Wibe 与 Microsoft 无隶属、无赞助、无背书关系。
+| 路径 | 作用 |
+| --- | --- |
+| `product.json` | 显示名改牌（`nameShort` / `nameLong` = Wibe）。`applicationName`、`dataFolderName` 仍是 `code-oss` / `.vscode-oss`。 |
+| `extensions/incontrol/` | 聊天 UI、会话槽位、压缩、sidecar 生命周期 |
+| `resources/uwa-sidecar/` | 本地 Web-to-API 服务 |
+| `docs/` | 桥接协议、相对原版说明 |
+| `BRIDGE.md` | 短契约 / 不能破坏的规则 |
+| `WIBE_VERSION` | 展示版本（`alpha-1.0.0-base-1.136.1`） |
+
+---
+
+## 当成本地 API 用
+
+任何 OpenAI 兼容客户端都可以指向 sidecar（IDE 已经在用）：
+
+```
+Base URL:  http://127.0.0.1:8199/v1
+API key:   AUTH_ENABLED=false（默认）时填任意字符串即可
+```
+
+Sidecar 内置了若干站点的选择器（ChatGPT、Claude、Gemini、DeepSeek、Kimi、通义、Grok、豆包、Google AI Studio、Arena）。**本 alpha 只测过 DeepSeek**，其余视为未验证。
+
+---
+
+## 说明
+
+- 仅供个人研究与本地调试。请遵守各网站服务条款。这是本机浏览器自动化桥，不是托管代理，也不提供绕过登录、验证码或付费墙的能力。
+- 编辑器为 MIT（`LICENSE.txt`）。Sidecar 为 AGPL-3.0（`resources/uwa-sidecar/LICENSE`）。
+- 反馈入口见 `product.json` 的 `reportIssueUrl`。
