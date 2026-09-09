@@ -1,52 +1,47 @@
-<svg width="96" height="96" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg">
-<g filter="url(#filter0_d_1844_64)">
-<mask id="mask0_1844_64" style="mask-type:alpha" maskUnits="userSpaceOnUse" x="6" y="6" width="84" height="84">
-<path fill-rule="evenodd" clip-rule="evenodd" d="M65.566 89.4264C66.889 89.9418 68.3976 89.9087 69.7329 89.2662L87.0271 80.9446C88.8444 80.0701 90 78.231 90 76.2132V19.7872C90 17.7695 88.8444 15.9303 87.0271 15.0559L69.7329 6.73395C67.9804 5.89069 65.9295 6.09724 64.3914 7.21543C64.1716 7.37517 63.9624 7.55352 63.7659 7.75007L30.6583 37.9548L16.2372 27.0081C14.8948 25.9891 13.0171 26.0726 11.7702 27.2067L7.14495 31.4141C5.61986 32.8014 5.61811 35.2007 7.14117 36.5902L19.6476 48.0001L7.14117 59.4099C5.61811 60.7995 5.61986 63.1988 7.14495 64.5861L11.7702 68.7934C13.0171 69.9276 14.8948 70.0111 16.2372 68.9921L30.6583 58.0453L63.7659 88.2501C64.2897 88.7741 64.9046 89.1688 65.566 89.4264ZM69.0128 28.9311L43.8917 48.0001L69.0128 67.069V28.9311Z" fill="white"/>
-</mask>
-<g mask="url(#mask0_1844_64)">
-<path d="M87.0275 15.0688L69.7198 6.73546C67.7164 5.77087 65.3223 6.17776 63.75 7.75L7.09081 59.4099C5.56682 60.7994 5.56857 63.1987 7.09459 64.586L11.7227 68.7934C12.9703 69.9275 14.8491 70.011 16.1924 68.992L84.4232 17.2307C86.7122 15.4942 90 17.1268 90 20V19.7991C90 17.7823 88.8447 15.9437 87.0275 15.0688Z" fill="#0065A9"/>
-<g filter="url(#filter1_d_1844_64)">
-<path d="M87.0275 80.9312L69.7198 89.2646C67.7164 90.2292 65.3223 89.8223 63.75 88.25L7.09081 36.5902C5.56682 35.2007 5.56857 32.8013 7.09459 31.414L11.7227 27.2067C12.9703 26.0725 14.8491 25.989 16.1924 27.008L84.4232 78.7693C86.7122 80.5058 90 78.8732 90 76V76.201C90 78.2178 88.8447 80.0563 87.0275 80.9312Z" fill="#007ACC"/>
-</g>
-<g filter="url(#filter2_d_1844_64)">
-<path d="M69.7206 89.2661C67.7166 90.2298 65.3224 89.8223 63.75 88.25C65.6874 90.1873 69 88.8152 69 86.0753V9.92459C69 7.18472 65.6874 5.81259 63.75 7.74996C65.3224 6.17757 67.7166 5.77012 69.7206 6.73385L87.0253 15.0558C88.8437 15.9302 90 17.7694 90 19.7871V76.2131C90 78.2309 88.8436 80.07 87.0253 80.9445L69.7206 89.2661Z" fill="#1F9CF0"/>
-</g>
-<g opacity="0.25" style="mix-blend-mode:overlay">
-<path fill-rule="evenodd" clip-rule="evenodd" d="M65.5149 89.4264C66.8379 89.9417 68.3465 89.9087 69.6818 89.2662L86.976 80.9445C88.7933 80.0701 89.9489 78.2309 89.9489 76.2132V19.7871C89.9489 17.7694 88.7933 15.9303 86.9761 15.0558L69.6818 6.7339C67.9294 5.89064 65.8784 6.09718 64.3403 7.21538C64.1206 7.37512 63.9113 7.55347 63.7149 7.75001L30.6072 37.9548L16.1862 27.008C14.8437 25.989 12.966 26.0725 11.7192 27.2067L7.09389 31.4141C5.5688 32.8013 5.56705 35.2007 7.09011 36.5902L19.5965 48L7.09011 59.4099C5.56705 60.7994 5.5688 63.1987 7.09389 64.586L11.7192 68.7934C12.966 69.9275 14.8437 70.011 16.1862 68.992L30.6072 58.0453L63.7149 88.25C64.2386 88.7741 64.8536 89.1687 65.5149 89.4264ZM68.9617 28.9311L43.8406 48L68.9617 67.069V28.9311Z" fill="url(#paint0_linear_1844_64)"/>
-</g>
-</g>
-</g>
-<defs>
-<filter id="filter0_d_1844_64" x="3" y="4" width="90" height="90" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-<feFlood flood-opacity="0" result="BackgroundImageFix"/>
-<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
-<feOffset dy="1"/>
-<feGaussianBlur stdDeviation="1.5"/>
-<feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0"/>
-<feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1844_64"/>
-<feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1844_64" result="shape"/>
-</filter>
-<filter id="filter1_d_1844_64" x="-1.05106" y="19.2964" width="98.0511" height="77.4863" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-<feFlood flood-opacity="0" result="BackgroundImageFix"/>
-<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
-<feOffset/>
-<feGaussianBlur stdDeviation="3.5"/>
-<feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0"/>
-<feBlend mode="overlay" in2="BackgroundImageFix" result="effect1_dropShadow_1844_64"/>
-<feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1844_64" result="shape"/>
-</filter>
-<filter id="filter2_d_1844_64" x="56.75" y="-0.783493" width="40.25" height="97.5669" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-<feFlood flood-opacity="0" result="BackgroundImageFix"/>
-<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
-<feOffset/>
-<feGaussianBlur stdDeviation="3.5"/>
-<feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0"/>
-<feBlend mode="overlay" in2="BackgroundImageFix" result="effect1_dropShadow_1844_64"/>
-<feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1844_64" result="shape"/>
-</filter>
-<linearGradient id="paint0_linear_1844_64" x1="47.9489" y1="6.21656" x2="47.9489" y2="89.7835" gradientUnits="userSpaceOnUse">
-<stop stop-color="white"/>
-<stop offset="1" stop-color="white" stop-opacity="0"/>
-</linearGradient>
-</defs>
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- 柔和、偏产品插画风格的阴影 -->
+    <filter id="panelShadow" x="-25%" y="-25%" width="160%" height="170%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="7.14" dy="11.42" stdDeviation="9.99" flood-color="#0B1F14" flood-opacity="0.20"/>
+    </filter>
+    <!-- 轻微高光，让边缘更像产品图标 -->
+    <linearGradient id="leftPanel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#12FF86"/>
+      <stop offset="100%" stop-color="#00F06E"/>
+    </linearGradient>
+    <linearGradient id="rightPanel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#06B85D"/>
+      <stop offset="100%" stop-color="#00A34D"/>
+    </linearGradient>
+    <!-- 拱肩落影：沿蓝色箭头线段，向腿内侧衰减 -->
+    <linearGradient id="springShade" gradientUnits="userSpaceOnUse" x1="258.68" y1="233.85" x2="242.69" y2="323.78">
+      <stop offset="0%" stop-color="#00220C" stop-opacity="0.46"/>
+      <stop offset="26%" stop-color="#00220C" stop-opacity="0.30"/>
+      <stop offset="62%" stop-color="#00220C" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#00220C" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="frontClip">
+      <path d="M 612.73 89.14 L 613.93 144.51 Q 614.04 149.65 609.15 151.22 L 324.94 242.28 Q 320.05 243.84 320.05 248.98 L 320.05 846.96 Q 320.05 849.1 317.99 848.49 L 203.64 814.29 Q 201.59 813.68 201.56 811.54 L 194.52 230.43 Q 194.46 225.29 199.32 223.64 L 607.75 85.64 Q 612.62 84 612.73 89.14 Z"/>
+    </clipPath>
+  </defs>
+
+  <g filter="url(#panelShadow)" stroke-linejoin="round" stroke-linecap="round">
+    <!-- 左侧折面：用微曲线弱化尖角 -->
+    <path d="M 612.73 89.14 L 613.93 144.51 Q 614.04 149.65 609.15 151.22 L 324.94 242.28 Q 320.05 243.84 320.05 248.98 L 320.05 846.96 Q 320.05 849.1 317.99 848.49 L 203.64 814.29 Q 201.59 813.68 201.56 811.54 L 194.52 230.43 Q 194.46 225.29 199.32 223.64 L 607.75 85.64 Q 612.62 84 612.73 89.14 Z" fill="url(#leftPanel)"/>
+
+    <!-- 左侧内边缘，形成更柔和的视觉层次 -->
+    <path d="M 320.05 243.84 L 614.04 149.65" fill="none" stroke="#00E96D" stroke-width="2.85" stroke-opacity="0.28"/>
+
+    <!-- 右侧主面：下端落到红色箭头所在的地面线 -->
+    <path d="M 622.59 85.88 L 822.43 152.05 Q 828.12 153.93 828.13 159.93 L 829.53 872.94 Q 829.54 878.93 823.8 880.64 L 626.08 939.39 Q 624.03 940 624.01 937.86 L 616.95 89.99 Q 616.9 84 622.59 85.88 Z" fill="url(#rightPanel)"/>
+
+    <!-- 右面顶部边缘高光 -->
+    <path d="M 619.75 85.43 L 828.12 153.93" fill="none" stroke="#19C96E" stroke-width="2.85" stroke-opacity="0.22"/>
+
+    <!-- 拱肩阴影（裁剪在正面内），让整体读作拱门 -->
+    <g clip-path="url(#frontClip)">
+      <path d="M 171.97 218.44 L 345.38 249.27 L 329.4 339.2 L 155.99 308.37 Z" fill="url(#springShade)"/>
+      <path d="M 194.46 222.44 L 322.9 245.27" fill="none" stroke="#EAFFF3" stroke-opacity="0.33" stroke-width="2.57"/>
+    </g>
+  </g>
 </svg>
