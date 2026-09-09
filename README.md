@@ -8,7 +8,7 @@
 
 Wibe is a desktop editor based on [Visual Studio Code — Open Source](https://github.com/microsoft/vscode) (**Code - OSS 1.136.1**). The editor, extensions host, and settings layout stay upstream. On top of that, Wibe ships a local agent that talks to the AI websites you already use — in a real browser, on your machine.
 
-**Version:** `alpha-1.0.0-base-1.136.1`  
+**Version:** `alpha-1.0.0-base-1.136.1`
 Wibe **1.0.0 alpha**, built on Code - OSS **1.136.1**.
 
 > **Tested only on DeepSeek** ([chat.deepseek.com](https://chat.deepseek.com)). Other sites may have built-in automations in the sidecar, but this build has **not** been verified on them.
@@ -131,3 +131,8 @@ The sidecar ships selectors for several sites (ChatGPT, Claude, Gemini, DeepSeek
 - Personal / research use. Respect each site’s terms. This is a local browser-automation bridge, not a hosted proxy and not a bypass for login, captchas, or paywalls.
 - The editor is MIT (`LICENSE.txt`). The sidecar is AGPL-3.0 (`resources/uwa-sidecar/LICENSE`).
 - Issues: the URL in `product.json` → `reportIssueUrl`.
+
+## Acknowledgments
+
+- Thanks to lumingya for the universal-web-api project (https://github.com/lumingya/universal-web-api); the `uwa-sidecar` component of this project is built and adapted based on it.
+- Thanks to continuedev for the Continue project (https://github.com/continuedev/continue); the `incontrol` component of this project is a custom fork of Continue version 1.3.40.

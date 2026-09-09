@@ -8,7 +8,7 @@
 
 Wibe 是基于 [Visual Studio Code — Open Source](https://github.com/microsoft/vscode)（**Code - OSS 1.136.1**）的桌面编辑器。编辑器、扩展宿主、用户目录布局都跟上游一致；在此之上加了一层**本地 Agent**：用你已经登录的 AI 网页，在本机真实浏览器里对话。
 
-**版本：** `alpha-1.0.0-base-1.136.1`  
+**版本：** `alpha-1.0.0-base-1.136.1`
 Wibe **1.0.0 alpha**，基线为 Code - OSS **1.136.1**。
 
 > **仅在 DeepSeek**（[chat.deepseek.com](https://chat.deepseek.com)）上验证过功能。Sidecar 里其它站点可能有内置适配，但**本 alpha 未测试**。
@@ -131,3 +131,8 @@ Sidecar 内置了若干站点的选择器（ChatGPT、Claude、Gemini、DeepSeek
 - 仅供个人研究与本地调试。请遵守各网站服务条款。这是本机浏览器自动化桥，不是托管代理，也不提供绕过登录、验证码或付费墙的能力。
 - 编辑器为 MIT（`LICENSE.txt`）。Sidecar 为 AGPL-3.0（`resources/uwa-sidecar/LICENSE`）。
 - 反馈入口见 `product.json` 的 `reportIssueUrl`。
+
+## 致谢
+
+- 感谢 lumingya 的 universal-web-api 项目 (https://github.com/lumingya/universal-web-api)，本项目的 uwa-sidecar 基于此制作并适配。
+- 感谢 continuedev 的 Continue 项目 (https://github.com/continuedev/continue)，本项目的 incontrol 是 Continue 1.3.40 的 fork 自定义版。
