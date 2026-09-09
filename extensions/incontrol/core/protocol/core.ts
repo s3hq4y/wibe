@@ -1,6 +1,7 @@
 import {
   BlockType,
   ConfigResult,
+  ConfigValidationError,
   DevDataLogEvent,
   ModelRole,
 } from "@incontrol/config-yaml";
@@ -57,6 +58,20 @@ export interface ListHistoryOptions {
   offset?: number;
   limit?: number;
   workspaceDirectory?: string;
+}
+
+/** Summary returned by `config/refreshModels`. */
+export interface RefreshModelsResult {
+  /** True when a config was loaded (false = fatal load error). */
+  ok: boolean;
+  /** Number of distinct model titles available after the refresh. */
+  modelCount: number;
+  /** Available model titles, keyed by role. */
+  modelsByRole: Record<string, string[]>;
+  /** Config validation errors produced by this load, if any. */
+  errors: ConfigValidationError[];
+  /** Title of the profile that was refreshed. */
+  profileTitle?: string;
 }
 
 export type ToCoreFromIdeOrWebviewProtocol = {
@@ -116,6 +131,20 @@ export type ToCoreFromIdeOrWebviewProtocol = {
         }
     ),
     void,
+  ];
+  /**
+   * Manual "refresh available models". Re-reads the active profile's config so
+   * the model list picks up changes without the user having to edit + save
+   * config.yaml (which is what the fs watcher keys off). Lighter than
+   * `config/refreshProfiles`: only the current profile is reloaded, assistant /
+   * agent files are not rescanned. AUTODETECT providers are re-queried.
+   */
+  "config/refreshModels": [
+    | undefined
+    | {
+        reason?: string;
+      },
+    RefreshModelsResult,
   ];
   "config/openProfile": [{ profileId: string | undefined }, void];
   "config/updateSharedConfig": [SharedConfigSchema, SharedConfigSchema];

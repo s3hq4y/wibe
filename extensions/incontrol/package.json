@@ -269,6 +269,13 @@
         "group": "incontrol"
       },
       {
+        "command": "incontrol.refreshModels",
+        "category": "incontrol",
+        "title": "%command.incontrol.refreshModels%",
+        "icon": "$(refresh)",
+        "group": "incontrol"
+      },
+      {
         "command": "incontrol.toggleTabAutocompleteEnabled",
         "category": "incontrol",
         "title": "%command.incontrol.toggleTabAutocompleteEnabled%",
@@ -587,6 +594,9 @@
           "command": "incontrol.focusIncontrolInput"
         },
         {
+          "command": "incontrol.refreshModels"
+        },
+        {
           "command": "incontrol.focusIncontrolInputWithoutClear"
         },
         {
@@ -665,6 +675,11 @@
         {
           "command": "incontrol.viewHistory",
           "group": "navigation@2",
+          "when": "view == incontrol.incontrolGUIView"
+        },
+        {
+          "command": "incontrol.refreshModels",
+          "group": "navigation@3",
           "when": "view == incontrol.incontrolGUIView"
         },
         {

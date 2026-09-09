@@ -479,6 +479,43 @@ export class Core {
       }
     });
 
+    on("config/refreshModels", async (msg) => {
+      const reason =
+        msg.data?.reason ?? "Manual model refresh (config/refreshModels)";
+
+      // Drop the caches the fs-watcher path relies on so that an *unchanged*
+      // config.yaml still produces a fresh model list, and AUTODETECT entries
+      // get re-queried against their provider.
+      walkDirCache.invalidate();
+      const codebaseRulesCache = CodebaseRulesCache.getInstance();
+      await codebaseRulesCache.refresh(this.ide);
+
+      const { config, errors } = await this.configHandler.reloadConfig(reason);
+
+      const modelsByRole: Record<string, string[]> = {};
+      const uniqueTitles = new Set<string>();
+      for (const [role, models] of Object.entries(config?.modelsByRole ?? {})) {
+        const titles = (models ?? [])
+          .map((model) => model.title)
+          .filter((title): title is string => typeof title === "string");
+        modelsByRole[role] = titles;
+        for (const title of titles) {
+          uniqueTitles.add(title);
+        }
+      }
+
+      // `reloadConfig` already notified listeners, so the GUI receives a
+      // `configUpdate` and re-renders its model lists on its own.
+      return {
+        ok: !!config,
+        modelCount: uniqueTitles.size,
+        modelsByRole,
+        errors: errors ?? [],
+        profileTitle:
+          this.configHandler.currentProfile?.profileDescription.title,
+      };
+    });
+
     on("config/updateSharedConfig", async (msg) => {
       const newSharedConfig = this.globalContext.updateSharedConfig(msg.data);
       await this.configHandler.reloadConfig(

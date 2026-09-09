@@ -428,6 +428,36 @@ const getCommandsMap: (
     "incontrol.openConfigPage": () => {
       vscode.commands.executeCommand("incontrol.navigateTo", "/config", false);
     },
+    // Manual model refresh: reloads the active profile's config so the model
+    // list updates without the user having to edit + save config.yaml.
+    "incontrol.refreshModels": async () => {
+      const result = await core.invoke("config/refreshModels", {
+        reason: "Command: incontrol.refreshModels"
+      });
+
+      if (!result || !result.ok) {
+        const detail = result?.errors?.[0]?.message;
+        void vscode.window.showErrorMessage(
+          detail
+            ? t("Failed to refresh available models: {0}", detail)
+            : t("Failed to refresh available models")
+        );
+        return;
+      }
+
+      const summary =
+        result.modelCount > 0
+          ? t("Available models refreshed: {0} model(s) loaded", result.modelCount)
+          : t("Available models refreshed, but none are configured yet");
+
+      if (result.errors.length > 0) {
+        void vscode.window.showWarningMessage(
+          `${summary} - ${t("{0} config error(s)", result.errors.length)}`
+        );
+      } else {
+        void vscode.window.showInformationMessage(summary);
+      }
+    },
     "incontrol.selectFilesAsContext": async (
       firstUri: vscode.Uri,
       uris: vscode.Uri[]

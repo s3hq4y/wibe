@@ -10,6 +10,7 @@
   "command.incontrol.debugTerminal": "Debug Terminal",
   "command.incontrol.exitEditMode": "Exit Edit Mode",
   "command.incontrol.openConfigPage": "Open Settings",
+  "command.incontrol.refreshModels": "Refresh Available Models",
   "command.incontrol.toggleTabAutocompleteEnabled": "Toggle Autocomplete Enabled",
   "command.incontrol.forceAutocomplete": "incontrol: Force Autocomplete",
   "command.incontrol.selectFilesAsContext": "Select Files as Context",

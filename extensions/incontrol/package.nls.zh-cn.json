@@ -10,6 +10,7 @@
   "command.incontrol.debugTerminal": "调试终端",
   "command.incontrol.exitEditMode": "退出编辑模式",
   "command.incontrol.openConfigPage": "打开设置",
+  "command.incontrol.refreshModels": "刷新可用模型",
   "command.incontrol.toggleTabAutocompleteEnabled": "切换自动补全开关",
   "command.incontrol.forceAutocomplete": "incontrol: 强制触发自动补全",
   "command.incontrol.selectFilesAsContext": "选择文件作为上下文",

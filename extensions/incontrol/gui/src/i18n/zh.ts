@@ -8,9 +8,17 @@ export const zh: Record<string, string> = {
   "Accept Top Change in Diff": "接受最顶层更改",
   "Add Chat model": "添加 Chat 模型",
   "Add a model in config.yaml": "在 config.yaml 中添加模型",
+  "Add or change providers, API keys and models under the `models:` key, then save the file - the list below reloads automatically. Changed something outside the editor? Use Refresh to reload it now.":
+    "在 `models:` 下添加或修改提供商、API 密钥和模型，保存文件后下方列表会自动重新加载。如果是在编辑器之外改动的，点「刷新」即可立即重新加载。",
   "Add model (config.yaml)": "添加模型（config.yaml）",
-  "Add or change providers, API keys and models under the `models:` key, then save the file - the list below reloads automatically.":
-    "在 `models:` 下添加或修改提供商、API 密钥和模型，保存文件后下方列表会自动重新加载。",
+  "Configure models": "配置模型",
+  "Failed to refresh models": "刷新模型失败",
+  "Failed to refresh models: {0}": "刷新模型失败：{0}",
+  "Models refreshed: {0} available": "模型已刷新：共 {0} 个可用",
+  "Models refreshed, but none are configured yet": "模型已刷新，但当前没有配置任何模型",
+  Refresh: "刷新",
+  "Refresh available models": "刷新可用模型",
+  "Refreshing…": "正在刷新…",
   "Add Current File by Default": "默认添加当前文件",
   "Add an Embeddings model to enable codebase indexing. See the docs for examples:":
     "添加 Embeddings 模型以启用代码库索引，示例请见文档：",

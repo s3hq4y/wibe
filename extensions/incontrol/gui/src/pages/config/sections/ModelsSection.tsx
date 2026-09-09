@@ -1,5 +1,5 @@
 import { ModelRole } from "@incontrol/config-yaml";
-import { PencilSquareIcon } from "@heroicons/react/24/outline";
+import { ArrowPathIcon, PencilSquareIcon } from "@heroicons/react/24/outline";
 import { ModelDescription } from "core";
 import { useContext, useState } from "react";
 import Shortcut from "../../../components/gui/Shortcut";
@@ -10,16 +10,18 @@ import { IdeMessengerContext } from "../../../context/IdeMessenger";
 import { useAppDispatch, useAppSelector } from "../../../redux/hooks";
 import { updateSelectedModelByRole } from "../../../redux/thunks/updateSelectedModelByRole";
 import { getMetaKeyLabel, isJetBrains } from "../../../util";
+import { cn } from "../../../util/cn";
 import { ConfigHeader } from "../components/ConfigHeader";
 import { ModelRoleRow } from "../components/ModelRoleRow";
 import { t } from "../../../i18n";
 
 export function ModelsSection() {
-  const { selectedProfile } = useAuth();
+  const { selectedProfile, refreshModels } = useAuth();
   const dispatch = useAppDispatch();
   const ideMessenger = useContext(IdeMessengerContext);
 
   const config = useAppSelector((state) => state.config.config);
+  const configLoading = useAppSelector((state) => state.config.loading);
   const jetbrains = isJetBrains();
   const metaKey = getMetaKeyLabel();
   const [showAdditionalRoles, setShowAdditionalRoles] = useState(false);
@@ -51,6 +53,16 @@ export function ModelsSection() {
     }
   }
 
+  // Manual refresh for when the file on disk already changed (edited outside
+  // the editor, AUTODETECT provider restarted, synced web models, ...) and the
+  // user does not want to re-save config.yaml just to trigger the watcher.
+  function handleRefreshModels() {
+    if (configLoading) {
+      return;
+    }
+    void refreshModels("Manual refresh from Models tab");
+  }
+
   return (
     <div className="space-y-4">
       <ConfigHeader
@@ -68,19 +80,39 @@ export function ModelsSection() {
               </span>
               <span className="text-description mt-1 text-xs">
                 {t(
-                  "Add or change providers, API keys and models under the `models:` key, then save the file - the list below reloads automatically.",
+                  "Add or change providers, API keys and models under the `models:` key, then save the file - the list below reloads automatically. Changed something outside the editor? Use Refresh to reload it now.",
                 )}
               </span>
             </div>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={handleOpenConfig}
-              className="flex flex-shrink-0 items-center gap-1.5"
-            >
-              <PencilSquareIcon className="h-3.5 w-3.5" />
-              <span>{t("Open config.yaml")}</span>
-            </Button>
+            <div className="flex flex-shrink-0 items-center gap-1.5">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={handleRefreshModels}
+                disabled={configLoading}
+                title={t("Refresh available models")}
+                className="flex items-center gap-1.5"
+              >
+                <ArrowPathIcon
+                  className={cn(
+                    "h-3.5 w-3.5",
+                    configLoading && "animate-spin-slow",
+                  )}
+                />
+                <span>
+                  {configLoading ? t("Refreshing…") : t("Refresh")}
+                </span>
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={handleOpenConfig}
+                className="flex items-center gap-1.5"
+              >
+                <PencilSquareIcon className="h-3.5 w-3.5" />
+                <span>{t("Open config.yaml")}</span>
+              </Button>
+            </div>
           </div>
           <pre className="bg-input text-description m-0 overflow-x-auto rounded p-2 text-[11px] leading-snug">
 {`models:

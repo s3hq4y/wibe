@@ -11,6 +11,7 @@ import { useAuth } from "../../context/Auth";
 import { useAppDispatch, useAppSelector } from "../../redux/hooks";
 import { updateSelectedModelByRole } from "../../redux/thunks/updateSelectedModelByRole";
 import { getMetaKeyLabel, isMetaEquivalentKeyPressed } from "../../util";
+import { cn } from "../../util/cn";
 import { CONFIG_ROUTES } from "../../util/navigation";
 import {
   Button,
@@ -126,7 +127,7 @@ function ModelSelect() {
   const buttonRef = useRef<HTMLButtonElement>(null);
   const [options, setOptions] = useState<Option[]>([]);
   const [sortedOptions, setSortedOptions] = useState<Option[]>([]);
-  const { selectedProfile } = useAuth();
+  const { selectedProfile, refreshModels } = useAuth();
   const tinyFont = useFontSize(-4);
 
   let selectedModel = null;
@@ -219,6 +220,19 @@ function ModelSelect() {
     navigate(CONFIG_ROUTES.MODELS);
   }
 
+  // Manual refresh: re-reads config.yaml (and re-queries AUTODETECT providers)
+  // without the user having to touch the file. The dropdown stays open so the
+  // reloaded list is immediately visible.
+  function onClickRefreshModels(e: React.MouseEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+
+    if (isConfigLoading) {
+      return;
+    }
+    void refreshModels("Manual refresh from model dropdown");
+  }
+
   const hasNoModels = allModels?.length === 0;
 
   return (
@@ -253,12 +267,29 @@ function ModelSelect() {
             <span className="text-description text-xs font-medium">{t("Models")}</span>
             <div className="flex items-center gap-0.5">
               <Button
+                onClick={onClickRefreshModels}
+                variant="ghost"
+                size="sm"
+                disabled={isConfigLoading}
+                title={t("Refresh available models")}
+                aria-label={t("Refresh available models")}
+                className="my-0 h-5 w-5 p-0"
+              >
+                <ArrowPathIcon
+                  className={cn(
+                    "text-description h-3.5 w-3.5",
+                    isConfigLoading && "animate-spin-slow",
+                  )}
+                />
+              </Button>
+              <Button
                 onClick={(e) => {
                   e.stopPropagation();
                   onClickConfigureModels(e);
                 }}
                 variant="ghost"
                 size="sm"
+                title={t("Configure models")}
                 className="my-0 h-5 w-5 p-0"
               >
                 <Cog6ToothIcon className="text-description h-3.5 w-3.5" />
