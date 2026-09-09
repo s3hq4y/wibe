@@ -134,5 +134,5 @@ Sidecar 内置了若干站点的选择器（ChatGPT、Claude、Gemini、DeepSeek
 
 ## 致谢
 
-- 感谢 lumingya 的 universal-web-api 项目 (https://github.com/lumingya/universal-web-api)，本项目的 uwa-sidecar 基于此制作并适配。
-- 感谢 continuedev 的 Continue 项目 (https://github.com/continuedev/continue)，本项目的 incontrol 是 Continue 1.3.40 的 fork 自定义版。
+- 感谢 lumingya 的 universal-web-api 项目 https://github.com/lumingya/universal-web-api ，本项目的 uwa-sidecar 基于此制作并适配。
+- 感谢 continuedev 的 Continue 项目 https://github.com/continuedev/continue ，本项目的 incontrol 是 Continue 1.3.40 的 fork 自定义版。

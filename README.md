@@ -134,5 +134,5 @@ The sidecar ships selectors for several sites (ChatGPT, Claude, Gemini, DeepSeek
 
 ## Acknowledgments
 
-- Thanks to lumingya for the universal-web-api project (https://github.com/lumingya/universal-web-api); the `uwa-sidecar` component of this project is built and adapted based on it.
-- Thanks to continuedev for the Continue project (https://github.com/continuedev/continue); the `incontrol` component of this project is a custom fork of Continue version 1.3.40.
+- Thanks to lumingya for the universal-web-api project https://github.com/lumingya/universal-web-api ; the `uwa-sidecar` component of this project is built and adapted based on it.
+- Thanks to continuedev for the Continue project https://github.com/continuedev/continue ; the `incontrol` component of this project is a custom fork of Continue version 1.3.40.
