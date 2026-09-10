@@ -634,7 +634,7 @@ if "!DEBUG_PORT_OK!"=="1" (
 ) else (
     echo [WARN] !BROWSER_NAME! 启动超时
     echo [ERROR] 未检测到远程调试端口 !BROWSER_PORT!，为避免服务误连到错误的浏览器，本次启动已中止
-    echo [INFO] 当前建议使用独立的无空格配置目录，例如 C:\Users\QIU\AppData\Local\UniversalWebApiProfile
+    echo [INFO] 当前建议使用独立的无空格配置目录，例如 %LOCALAPPDATA%\UniversalWebApiProfile
     echo.
     pause
     exit /b 1
