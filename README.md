@@ -1,5 +1,14 @@
 <p align="center">
-  <img src="./docs/reference_shape_vscode.svg" alt="Wibe" width="96">
+  <img src="./docs/reference_shape_vscode.svg" alt="Wibe — local AI bridge built on Code - OSS" width="100%">
+</p>
+
+<p align="center">
+  <a href="./WIBE_VERSION"><img src="https://img.shields.io/badge/version-alpha--1.0.0--base--1.136.1-00A34D?style=flat-square&labelColor=071A10" alt="version alpha-1.0.0-base-1.136.1"></a>
+  <a href="https://github.com/microsoft/vscode"><img src="https://img.shields.io/badge/upstream-Code%20--%20OSS%201.136.1-3178C6?style=flat-square&labelColor=071A10" alt="upstream Code - OSS 1.136.1"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-8A2BE2?style=flat-square&labelColor=071A10" alt="license AGPL-3.0"></a>
+  <img src="https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&labelColor=071A10" alt="platform Windows">
+  <img src="https://img.shields.io/badge/local%20API-OpenAI--compatible%20%3A8199-00F06E?style=flat-square&labelColor=071A10" alt="local API OpenAI-compatible :8199">
+  <a href="https://chat.deepseek.com"><img src="https://img.shields.io/badge/tested%20on-DeepSeek-4D6BFF?style=flat-square&labelColor=071A10&logo=deepseek&logoColor=white" alt="tested on DeepSeek"></a>
 </p>
 
 # Wibe
@@ -129,7 +138,7 @@ The sidecar ships selectors for several sites (ChatGPT, Claude, Gemini, DeepSeek
 ## Notes
 
 - Personal / research use. Respect each site’s terms. This is a local browser-automation bridge, not a hosted proxy and not a bypass for login, captchas, or paywalls.
-- The project is AGPL-3.0 (`resources/uwa-sidecar/LICENSE`).
+- The project is AGPL-3.0.
 - Issues: the URL in `product.json` → `reportIssueUrl`.
 
 ## Acknowledgments

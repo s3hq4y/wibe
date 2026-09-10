@@ -1,5 +1,14 @@
 <p align="center">
-  <img src="./docs/reference_shape_vscode.svg" alt="Wibe" width="96">
+  <img src="./docs/reference_shape_vscode.svg" alt="Wibe — 基于 Code - OSS 的本地 AI 桥" width="100%">
+</p>
+
+<p align="center">
+  <a href="./WIBE_VERSION"><img src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-alpha--1.0.0--base--1.136.1-00A34D?style=flat-square&labelColor=071A10" alt="版本 alpha-1.0.0-base-1.136.1"></a>
+  <a href="https://github.com/microsoft/vscode"><img src="https://img.shields.io/badge/%E4%B8%8A%E6%B8%B8-Code%20--%20OSS%201.136.1-3178C6?style=flat-square&labelColor=071A10" alt="上游 Code - OSS 1.136.1"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF%E8%AF%81-AGPL--3.0-8A2BE2?style=flat-square&labelColor=071A10" alt="许可证 AGPL-3.0"></a>
+  <img src="https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows-0078D6?style=flat-square&labelColor=071A10" alt="平台 Windows">
+  <img src="https://img.shields.io/badge/%E6%9C%AC%E5%9C%B0%E6%8E%A5%E5%8F%A3-OpenAI%20%E5%85%BC%E5%AE%B9%20%3A8199-00F06E?style=flat-square&labelColor=071A10" alt="本地接口 OpenAI 兼容 :8199">
+  <a href="https://chat.deepseek.com"><img src="https://img.shields.io/badge/%E5%B7%B2%E5%9C%A8-DeepSeek%20%E9%AA%8C%E8%AF%81-4D6BFF?style=flat-square&labelColor=071A10&logo=deepseek&logoColor=white" alt="已在 DeepSeek 验证"></a>
 </p>
 
 # Wibe
@@ -129,7 +138,7 @@ Sidecar 内置了若干站点的选择器（ChatGPT、Claude、Gemini、DeepSeek
 ## 说明
 
 - 仅供个人研究与本地调试。请遵守各网站服务条款。这是本机浏览器自动化桥，不是托管代理，也不提供绕过登录、验证码或付费墙的能力。
-- AGPL-3.0（`resources/uwa-sidecar/LICENSE`）。
+- AGPL-3.0。
 - 反馈入口见 `product.json` 的 `reportIssueUrl`。
 
 ## 致谢
