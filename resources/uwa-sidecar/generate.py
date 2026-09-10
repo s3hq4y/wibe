@@ -8,13 +8,23 @@ import shutil
 import requests
 from pathlib import Path
 
-API_URL = "http://127.0.0.1:8199/group/arena-image/v1/chat/completions"
-OUTPUT_DIR = Path(r"C:\Users\QIU\Desktop\新建文件夹 (2)")
+API_URL = os.getenv(
+    "UWA_GENERATE_API_URL",
+    "http://127.0.0.1:8199/group/arena-image/v1/chat/completions",
+)
+
+# 输出目录与参考图一律从环境变量取，默认落在当前用户目录下。
+# 这里不要写死具体机器上的绝对路径：此前脚本里带着原作者的桌面路径与
+# Gemini 临时目录，换台机器跑必然失效，而这些路径对别人从来就没有意义。
+_REF_DIR = Path(os.getenv("UWA_GENERATE_REF_DIR") or (Path.home() / "uwa-generate"))
+OUTPUT_DIR = Path(
+    os.getenv("UWA_GENERATE_OUTPUT_DIR") or (Path.home() / "Desktop" / "uwa-generate")
+)
 PROMPT_FILE = Path(__file__).resolve().parent / "prompt.txt"
 
-# 用户上传的图一（风格/构图参考）与图二（角色参考）
-IMAGE1_PATH = Path(r"C:\Users\QIU\.gemini\antigravity\brain\13158e24-022d-4ee8-8b23-615a93ee4a28\.user_uploaded\media_1787220848527.jpg")
-IMAGE2_PATH = Path(r"C:\Users\QIU\.gemini\antigravity\brain\13158e24-022d-4ee8-8b23-615a93ee4a28\.user_uploaded\media_1787220871854.jpg")
+# 参考图一（风格/构图）与参考图二（角色）；文件不存在时自动跳过，见 get_image_base64
+IMAGE1_PATH = Path(os.getenv("UWA_GENERATE_IMAGE1") or (_REF_DIR / "image1.jpg"))
+IMAGE2_PATH = Path(os.getenv("UWA_GENERATE_IMAGE2") or (_REF_DIR / "image2.jpg"))
 DESKTOP_111_PATH = OUTPUT_DIR / "111.jpg"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

@@ -8,18 +8,31 @@
      鎵撳寘锛夛紝鍥犳瀹冧滑蹇呴』浠ョ湡瀹炴枃浠跺瓨鍦ㄤ簬鎵╁睍鐨?node_modules 閲岋紝鍚﹀垯
      activate() 鎶?MODULE_NOT_FOUND锛屼晶杈规爮姘歌繙杞湀銆?#>
 param(
-  [string]$Src  = "E:\Tools\IDE-Workspace\bridges\code-oss\vscode-1.136.1",
-  [string]$Prod = "E:\Tools\IDE-Workspace\bridges\code-oss\VSCode-win32-x64"
+  [string]$Src,
+  [string]$Prod
 )
 $ErrorActionPreference = "Stop"
+
+# 默认从脚本自身位置推导，避免把构建机的绝对路径写进源码。
+# 约定：$Src 为源码仓库根，$Prod 为 gulp 产物目录（仓库的上一级）。
+if (-not $Src)  { $Src  = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path }
+if (-not $Prod) { $Prod = Join-Path (Split-Path $PSScriptRoot -Parent) "VSCode-win32-x64" }
 $extSrc  = Join-Path $Src  "extensions\incontrol"
 $extProd = Join-Path $Prod "resources\app\extensions\incontrol"
 
 Write-Host "[1/4] uwa-sidecar -> product"
 $sideSrc = Join-Path $Src  "resources\uwa-sidecar"
 $sideDst = Join-Path $Prod "resources\app\resources\uwa-sidecar"
-robocopy $sideSrc $sideDst /E /NFL /NDL /NJH /NJS /XD __pycache__ .git chrome_profile /XF *.pyc | Out-Null
+robocopy $sideSrc $sideDst /E /NFL /NDL /NJH /NJS /XD __pycache__ .git chrome_profile venv logs temp download_images /XF *.pyc | Out-Null
 if(-not (Test-Path (Join-Path $sideDst "start.py"))){ throw "uwa-sidecar copy failed" }
+# venv/chrome_profile 是本机运行时产物，绝不该进发行包：
+# venv 里的 pyvenv.cfg 记录的是构建机的 Python 路径，装到别的机器上引导器
+# 会直接退码 103，而扩展又会因为它"存在"而优先选中它。宁可打包失败。
+foreach ($leak in @("venv", "chrome_profile")) {
+  if (Test-Path (Join-Path $sideDst $leak)) {
+    throw "product contains $leak - runtime artifact must not be shipped"
+  }
+}
 Write-Host ("      files: " + (Get-ChildItem $sideDst -Recurse -File).Count)
 
 Write-Host "[2/4] external node_modules -> product"

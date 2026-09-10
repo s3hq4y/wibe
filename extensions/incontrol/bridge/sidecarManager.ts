@@ -9,10 +9,28 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ChildProcess, spawn } from 'child_process';
+import * as fs from 'fs';
 import { BrowserLauncher } from './browserLauncher';
 import * as net from 'net';
 import * as path from 'path';
 import { DEFAULT_SIDECAR_PORT, SidecarHealth } from './protocol';
+
+/** sidecar 最低要求的 Python 版本（与 resources/uwa-sidecar/requirements.txt 的 >=3.10 对应） */
+const MIN_PYTHON = '3.10';
+
+/** 由 MIN_PYTHON 派生的元组字面量（'3.10' → '(3, 10)'），供探针脚本内联 */
+const MIN_PYTHON_TUPLE = `(${MIN_PYTHON.split('.').join(', ')})`;
+
+/** 候选 Python 的主版本号，由高到低 */
+const WINDOWS_PYTHON_MINORS = [14, 13, 12, 11, 10];
+
+/** 解释器探测结果 */
+interface InterpreterProbe {
+	ok: boolean;
+	/** 失败原因（ok=false 时有值），用于日志与最终提示 */
+	reason?: string;
+}
+
 
 export interface SidecarOptions {
 	/** resources/uwa-sidecar 的绝对路径 */
@@ -66,28 +84,222 @@ export class SidecarManager {
 	}
 
 	/**
+	 * 跑一次子进程并收集输出。
+	 *
+	 * 探测失败是预期路径而非异常，所以这里永不 reject —— 调用方只看返回值。
+	 */
+	private static run(
+		exe: string,
+		args: string[],
+		cwd: string,
+		timeoutMs: number,
+	): Promise<{ code: number | null; stdout: string; stderr: string; spawnError?: string }> {
+		return new Promise(resolve => {
+			let settled = false;
+			let timer: NodeJS.Timeout | undefined;
+			const finish = (r: { code: number | null; stdout: string; stderr: string; spawnError?: string }) => {
+				if (settled) { return; }
+				settled = true;
+				if (timer) { clearTimeout(timer); }
+				resolve(r);
+			};
+
+			const child = spawn(exe, args, {
+				cwd,
+				windowsHide: true,
+				stdio: ['ignore', 'pipe', 'pipe'],
+			});
+			let stdout = '';
+			let stderr = '';
+			child.stdout?.on('data', d => { stdout += String(d); });
+			child.stderr?.on('data', d => { stderr += String(d); });
+			child.on('error', err => {
+				const e = err as NodeJS.ErrnoException;
+				finish({ code: null, stdout, stderr, spawnError: e.code ?? e.message });
+			});
+			child.on('close', code => finish({ code, stdout, stderr }));
+
+			timer = setTimeout(() => {
+				try { child.kill(); } catch { /* ignore */ }
+				finish({ code: null, stdout, stderr, spawnError: 'timeout' });
+			}, timeoutMs);
+		});
+	}
+
+	/**
+	 * venv 引导器的经典报错：pyvenv.cfg 里的 home 指向一台不存在的基础解释器
+	 * （典型场景：venv 是在别的机器上创建的）。
+	 */
+	private static isForeignVenv(stderr: string): boolean {
+		return /No Python at\s/i.test(stderr || '');
+	}
+
+	/**
+	 * 探测解释器是否**真的可用**。
+	 *
+	 * 只判断文件存在是不够的：曾出现发行包里带着一台开发机的 venv，它的
+	 * pyvenv.cfg 指向的基础解释器在用户机器上并不存在，引导器直接退码 103；
+	 * 而它因为"文件存在"被优先选中，随后回落到 PATH 上的 Python 3.8（缺依赖），
+	 * 报错发生在 20 秒之后的 import 阶段 —— 用户最终只看到 60 秒启动超时。
+	 * 把判据从"存在"换成"能跑且依赖齐全"，问题就会在选择阶段立刻暴露。
+	 */
+	private async probeInterpreter(pythonPath: string): Promise<InterpreterProbe> {
+		// 1) 版本门槛：低于要求的版本直接排除
+		const ver = await SidecarManager.run(
+			pythonPath,
+			['-c', `import sys; raise SystemExit(0 if sys.version_info >= ${MIN_PYTHON_TUPLE} else 1)`],
+			this.opts.sidecarRoot,
+			10_000,
+		);
+		if (ver.spawnError) {
+			return { ok: false, reason: `无法执行（${ver.spawnError}）` };
+		}
+		if (SidecarManager.isForeignVenv(ver.stderr)) {
+			return {
+				ok: false,
+				reason: 'pyvenv.cfg 指向的基础解释器不存在（该 venv 多半是在别的机器上创建的），建议删除 venv 后重新运行 start.py',
+			};
+		}
+		if (ver.code !== 0) {
+			return { ok: false, reason: `不满足 Python >= ${MIN_PYTHON}` };
+		}
+
+		// 2) 依赖完整性：复用 sidecar 自带的 check_deps.py，
+		//    避免在 TS 里再维护一份依赖清单 —— requirements.txt 是唯一事实来源
+		const checkScript = path.join(this.opts.sidecarRoot, 'check_deps.py');
+		if (!fs.existsSync(checkScript)) {
+			// 旧版 sidecar 没有这个脚本：只能卡版本，依赖问题留给运行时暴露
+			this.log(`python: 未找到 ${checkScript}，跳过依赖完整性检查`);
+			return { ok: true };
+		}
+		const deps = await SidecarManager.run(pythonPath, [checkScript], this.opts.sidecarRoot, 30_000);
+		if (deps.spawnError || deps.code !== 0) {
+			const detail = (deps.stdout || deps.stderr || '').trim().split('\n').pop() ?? '';
+			return { ok: false, reason: detail ? `依赖不完整（${detail}）` : '依赖不完整' };
+		}
+		return { ok: true };
+	}
+
+	/**
+	 * 按优先级列出候选解释器路径。
+	 *
+	 * 顺序：用户显式指定 → 随包分发的内置 Python → sidecar 自建 venv → 系统安装。
+	 * 这里只负责列路径，可用与否交给 probeInterpreter 判断。
+	 */
+	private listCandidates(): string[] {
+		const win = process.platform === 'win32';
+		const exe = win ? 'python.exe' : 'python';
+		const list: string[] = [];
+
+		if (this.opts.pythonPath) {
+			list.push(this.opts.pythonPath);
+		}
+		// 随产品分发的 embeddable Python（当前构建未提供，保留以便将来启用）
+		list.push(path.join(this.opts.sidecarRoot, '..', 'python', exe));
+		// sidecar 自建 venv（start.py 跑过后会有）
+		list.push(path.join(this.opts.sidecarRoot, 'venv', win ? 'Scripts' : 'bin', exe));
+
+		if (win) {
+			// 布局与 start.py:_find_installed_fixed_python 对齐。旧实现漏掉了
+			// %LOCALAPPDATA%\Programs\Python\Python3XX —— 而这正是 python.org
+			// "仅为当前用户"安装的落地位置，本机 Python 3.11 就是这样被跳过的。
+			const roots = [process.env.LOCALAPPDATA, process.env.ProgramFiles, process.env['ProgramFiles(x86)']];
+			for (const minor of WINDOWS_PYTHON_MINORS) {
+				const tag = `Python3${minor}`;
+				for (const root of roots) {
+					if (!root) { continue; }
+					list.push(path.join(root, 'Programs', 'Python', tag, exe));
+					list.push(path.join(root, tag, exe));
+				}
+			}
+		}
+
+		return list;
+	}
+
+	/**
+	 * 通过 py 启动器解析真实解释器路径。
+	 *
+	 * py 能覆盖注册表里登记过的任意安装位置（包括非默认目录），比穷举路径可靠；
+	 * start.py 也是这么做的。
+	 */
+	private async resolveViaPyLauncher(): Promise<string[]> {
+		if (process.platform !== 'win32') { return []; }
+		const found: string[] = [];
+		for (const minor of WINDOWS_PYTHON_MINORS) {
+			const r = await SidecarManager.run(
+				'py', [`-3.${minor}`, '-c', 'import sys; print(sys.executable)'],
+				this.opts.sidecarRoot, 10_000,
+			);
+			const resolved = r.stdout.trim();
+			if (r.code === 0 && resolved) {
+				found.push(resolved);
+			}
+		}
+		return found;
+	}
+
+	/**
+	 * 选解释器：按优先级逐个探测，返回第一个**真正可用**的。
+	 *
+	 * 与旧实现的关键差别是不再"存在即采用"。坏掉的 venv 会被跳过并记下原因，
+	 * 而不是把问题拖到 60 秒后以启动超时的形式呈现。
+	 */
+	private async resolvePython(): Promise<string | undefined> {
+		const seen = new Set<string>();
+		const failures: string[] = [];
+
+		const firstViable = async (candidates: string[]): Promise<string | undefined> => {
+			for (const c of candidates) {
+				if (!c || seen.has(c)) { continue; }
+				seen.add(c);
+				const probe = await this.probeInterpreter(c);
+				if (probe.ok) {
+					this.log(`python: ${c}`);
+					return c;
+				}
+				// 路径压根不存在的候选不记日志，避免刷屏；只报"存在但不可用"的
+				if (probe.reason && !probe.reason.startsWith('无法执行')) {
+					this.log(`python: 跳过 ${c} —— ${probe.reason}`);
+					failures.push(`${c} → ${probe.reason}`);
+				}
+			}
+			return undefined;
+		};
+
+		const explicit = this.opts.pythonPath;
+
+		const hit = await firstViable(this.listCandidates());
+		if (hit) { return hit; }
+
+		// py 启动器兜底：覆盖注册表里任意安装位置的 Python
+		const viaPy = await firstViable(await this.resolveViaPyLauncher());
+		if (viaPy) { return viaPy; }
+
+		// PATH 兜底同样要先探测：旧实现直接采用，于是选中了没有 DrissionPage
+		// 的 conda Python 3.8，把"环境不对"伪装成了 import 报错。
+		const viaPath = await firstViable([process.platform === 'win32' ? 'python.exe' : 'python3']);
+		if (viaPath) { return viaPath; }
+
+		this.log('未找到可用的 Python 解释器。');
+		if (explicit) {
+			this.log(`  当前 incontrol.sidecar.pythonPath 指向 "${explicit}"，但该解释器不可用。`);
+		}
+		this.log('  处理方式（任选其一）：');
+		this.log(`    1) 运行 ${path.join(this.opts.sidecarRoot, 'start.py')} 自动创建 venv 并安装依赖`);
+		this.log('    2) 在设置 incontrol.sidecar.pythonPath 中指定一个已装好依赖的解释器');
+		for (const f of failures.slice(0, 5)) {
+			this.log(`  已排除：${f}`);
+		}
+		return undefined;
+	}
+
+	/**
 	 * 启动 sidecar。
 	 *
 	 * 若目标端口上已有健康实例（用户手动起的、或上次未清理干净的），
 	 * 直接复用而不重复 spawn —— 避免两个实例抢同一个 chrome_profile。
 	 */
-	/**
-	 * 选解释器：sidecar 自带的 venv 优先（start.py 若跑过会生成），
-	 * 否则回退到系统 Python 探测。
-	 */
-	private resolvePython(): string | undefined {
-		const venvPy = process.platform === 'win32'
-			? path.join(this.opts.sidecarRoot, 'venv', 'Scripts', 'python.exe')
-			: path.join(this.opts.sidecarRoot, 'venv', 'bin', 'python');
-		try {
-			// eslint-disable-next-line @typescript-eslint/no-var-requires
-			if (require('fs').existsSync(venvPy)) {
-				return venvPy;
-			}
-		} catch { /* ignore */ }
-		return this.detectPython();
-	}
-
 	async start(): Promise<SidecarHealth> {
 		const preferred = this.opts.preferredPort ?? DEFAULT_SIDECAR_PORT;
 
@@ -104,6 +316,23 @@ export class SidecarManager {
 
 		this.port = await this.pickPort(preferred);
 
+		// 解释器必须是"能跑且依赖齐全"的才会被返回；先解析解释器再动浏览器，
+		// 免得选不出来时已经白白拉起一个 Chrome。选不出来时立刻失败 ——
+		// 不 spawn、也不进入 60 秒健康探测窗口，避免把配置问题伪装成超时。
+		const python = await this.resolvePython();
+		if (!python) {
+			// 上一轮可能已经起过浏览器；这里补一刀确保不留孤儿
+			await this.browser?.dispose();
+			this.browser = undefined;
+			// 没有解释器不是瞬时故障，重试没有意义，只会每 15 秒刷一次同样的日志
+			this.stopHealthLoop();
+			return {
+				alive: false,
+				port: this.port,
+				error: '未找到可用的 Python 解释器，详见「uwa Sidecar」输出通道',
+			};
+		}
+
 		// start.py 是 venv 引导脚本：它会新建 venv/、联网装依赖、必要时下载
 		// Python 本体，耗时以分钟计，远超我们 15s 的探活窗口，且装出来的解释器
 		// 与我们探测到的不是同一个。main.py 才是真正的 uvicorn 服务入口。
@@ -119,8 +348,6 @@ export class SidecarManager {
 		await this.browser.ensure();
 
 		const entry = path.join(this.opts.sidecarRoot, 'main.py');
-		const python = this.opts.pythonPath || this.resolvePython();
-
 		this.log(`spawning: ${python} ${entry} (port ${this.port})`);
 		this.proc = spawn(python, [entry], {
 			cwd: this.opts.sidecarRoot,
@@ -165,51 +392,6 @@ export class SidecarManager {
 
 		this.startHealthLoop();
 		return this.checkHealth(this.port);
-	}
-
-	/**
-	 * 逐个候选探测可用的 Python，全部校验存在性后才返回。
-	 *
-	 * 之前这里无条件返回随产品分发的 embeddable Python 路径，但该文件在
-	 * 当前构建中并不存在 —— spawn 立刻 ENOENT，而错误被静默吞掉，
-	 * 表象是「startup timeout (60s)」，完全指错了方向。
-	 */
-	private detectPython(): string | undefined {
-		// eslint-disable-next-line @typescript-eslint/no-var-requires
-		const fsMod = require('fs');
-		const candidates: string[] = [];
-
-		// 1) 随产品分发的 embeddable Python（若将来提供）
-		candidates.push(path.join(this.opts.sidecarRoot, '..', 'python', 'python.exe'));
-		// 2) sidecar 自建 venv（start.py 跑过后会有）
-		if (process.platform === 'win32') {
-			candidates.push(path.join(this.opts.sidecarRoot, 'venv', 'Scripts', 'python.exe'));
-		} else {
-			candidates.push(path.join(this.opts.sidecarRoot, 'venv', 'bin', 'python'));
-		}
-		// 3) 本机已安装的解释器（依赖已装在这里）
-		if (process.platform === 'win32') {
-			for (const root of [process.env.LOCALAPPDATA, process.env.ProgramFiles, 'E:\\System\\environment']) {
-				if (!root) { continue; }
-				for (const v of ['python-3.14.4', 'Python314', 'Python313', 'Python312', 'Python311', 'Programs\\Python\\Python313', 'Programs\\Python\\Python312']) {
-					candidates.push(path.join(root, v, 'python.exe'));
-				}
-			}
-		}
-
-		for (const c of candidates) {
-			try {
-				if (fsMod.existsSync(c)) {
-					this.log(`python: ${c}`);
-					return c;
-				}
-			} catch { /* ignore */ }
-		}
-
-		// 4) 回落到 PATH，交给 spawn 解析（失败会被 on('error') 捕获）
-		const fallback = process.platform === 'win32' ? 'python.exe' : 'python3';
-		this.log(`python: no explicit interpreter found, falling back to "${fallback}" on PATH`);
-		return fallback;
 	}
 
 	private async waitReady(timeoutMs: number): Promise<boolean> {
