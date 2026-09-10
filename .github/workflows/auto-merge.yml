@@ -1,0 +1,195 @@
+# 自动合并白名单贡献者的 PR —— 按「提交作者」判定，而不是按「PR 开单人」
+#
+# 为什么落在 commit author 而不是 github.actor：
+#   按 actor 过滤在 s3hq4y/wibe 上其实是有效的（PR #4 就是 ZachariahChu 本人开的），
+#   但它只保证「谁开的 PR」，不保证「PR 里每个提交都是 TA 写的」——任何人往这条
+#   分支上追加一个提交，就会被自动合并。逐提交校验作者 + 严格模式（只认可由 GitHub
+#   账号映射出来的 login）才堵得住这个洞。
+#
+# ⚠️ 这个文件必须存在于 PR 实际发生的那个仓库才会生效。
+#   现状：PR #1–#4 全部在 s3hq4y/wibe（public）；s3hq4y/code-oss（private）只是同源镜像。
+#   → 保护规则、Allow auto-merge 都要配在 wibe 上；code-oss 上配了也没有 PR 可管。
+#
+# 启用前的设置（都在 wibe 上做一次）：
+#   1) Settings → General → Pull Requests → ✅ Allow auto-merge
+#      或一条 API：  gh api -X PATCH repos/s3hq4y/wibe -f allow_auto_merge=true
+#   1b) ⚠️ Settings → Actions → General → Workflow permissions →
+#       ✅ Allow GitHub Actions to create and approve pull requests
+#       默认是关的；不打开，下面 `gh pr review --approve` 会被 GitHub 直接拒。
+#   2) Settings → Rules → Rulesets → New branch ruleset（或 Settings → Code and
+#      automation → Branches → Add classic branch protection rule），Target branches = master，
+#      勾上「Require a pull request before merging」+「Status checks → Require a check to pass」。
+#      * wibe 是 public，GitHub Free 就支持；code-oss 是 private，Free 下没有这个入口
+#        （官方文档：Protected branches 在 public 仓库 Free 可用，private 需要 Pro/Team/Enterprise）。
+#      * 勾选框里的搜索框只会列出「历史上上报过的」check 名；master 上现在一个 check 都没有
+#        （wibe 的 be8d3737：check runs total=0），所以下拉可能为空——直接在框里手输
+#        "chat-lib tests (ubuntu-latest)" 之类即可。
+#   3) 先决定 CI：pr.yml 目前只在 base ∈ {main, release/*} 的 PR 上触发，master 的 PR 不跑。
+#      要么把 master 加进 pr.yml 的 branches，要么接受「只校验作者、不等主 CI」
+#      （本 workflow 的 WAIT_FOR_CHECKS=true 会等 chat-lib 那几个 check；一个 check 都没有时
+#        超过 CHECK_GRACE_SECONDS 会判定为「无 CI 前置」并继续合并）。
+#
+# 安全说明：
+#   REQUIRE_LOGIN=true 已开：只认 GitHub 账号 login（由账号已验证邮箱映射，本地伪造不了）。
+#   已核实 39eb795e 的 author.login = ZachariahChu，故当前提交形态可直接通过。
+#   注意：TA 若改用未验证的邮箱提交，login 会变成 null 而被拒——那是预期行为，
+#   补验证邮箱即可，不要退回 REQUIRE_LOGIN=false（那是可伪造的）。
+#   提交均未签名（commit_verification.verified=None），所以没有开签名校验的余地。
+#   本 workflow 全程不 checkout / 不执行 PR 代码，pull_request_target 的密钥外带路径在这里不存在。
+
+name: Auto-merge (trusted contributor)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write      # 合并需要向 master 写入
+  pull-requests: write # 需要创建 review 与调用 merge API
+
+concurrency:
+  group: automerge-pr-${{ github.event.pull_request.number }}
+  # 新 push 取消仍在轮询的旧 run；正确性由「合并时 pin 住 head_sha」保证，不靠这里
+  cancel-in-progress: true
+
+jobs:
+  automerge:
+    name: Verify authorship, then auto-merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: |
+      github.event.pull_request.draft == false &&
+      (github.event.pull_request.base.ref == 'master' || github.event.pull_request.base.ref == 'main')
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 本 workflow 不 checkout 代码 → runner 上没有 git 仓库，gh 无法从 remote 推断仓库；
+      # 必须显式给 GH_REPO，否则 `gh pr review/merge "$PR"` 会报 "no git repository"。
+      GH_REPO: ${{ github.repository }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      # 白名单（逗号分隔，大小写不敏感）
+      ALLOW_LOGINS: zachariahchu
+      ALLOW_EMAILS: 1762459322@qq.com
+      # 严格模式：只认不可伪造的 GitHub login（email 是本地可伪造的，此处仅作记录/兜底参考）
+      REQUIRE_LOGIN: 'true'
+      # 兜底路径：先等 CI 再合；false = 批准后立即合并
+      WAIT_FOR_CHECKS: 'true'
+      CHECK_TIMEOUT_MINUTES: '50'
+      CHECK_GRACE_SECONDS: '180'
+      CHECK_POLL_SECONDS: '30'
+      # 与现状一致：保留 TA 的原始提交，生成 merge commit（不要 squash）
+      MERGE_METHOD: merge
+
+    steps:
+      - name: Gate — PR 内每个非 merge 提交都必须命中白名单
+        id: gate
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPO}/pulls/${PR}/commits" --paginate > /tmp/commits.json
+          python3 - <<'PY'
+          import json, os, sys
+
+          commits = json.load(open('/tmp/commits.json'))
+          logins = {s.strip().lower() for s in os.environ['ALLOW_LOGINS'].split(',') if s.strip()}
+          emails = {s.strip().lower() for s in os.environ['ALLOW_EMAILS'].split(',') if s.strip()}
+          require_login = os.environ.get('REQUIRE_LOGIN', 'false').strip().lower() == 'true'
+
+          checked = skipped = bad = 0
+          for c in commits:
+              msg = (c['commit'].get('message') or '').splitlines()
+              msg = msg[0] if msg else ''
+              parents = len(c.get('parents') or [])
+              login = ((c.get('author') or {}).get('login') or '').lower()
+              email = ((c['commit'].get('author') or {}).get('email') or '').lower()
+
+              # merge commit（含把 master 回灌进特性分支产生的那种）不做作者校验
+              if parents > 1 or msg.lower().startswith('merge '):
+                  skipped += 1
+                  print(f'skip   merge commit: {msg}')
+                  continue
+
+              checked += 1
+              hit_login = login in logins
+              hit_email = email in emails
+              ok = hit_login if require_login else (hit_login or hit_email)
+              how = 'login' if hit_login else ('email' if hit_email else 'none')
+              print(f'{"ok    " if ok else "REJECT"}  {login or "-"} <{email}> {c["sha"][:8]} [{how}] {msg}')
+              if not ok:
+                  bad += 1
+                  print(f'::error::非白名单作者，拒绝自动合并: {login or "-"} <{email}> — {msg}', file=sys.stderr)
+
+          print(f'--- checked={checked} skipped={skipped} rejected={bad} require_login={require_login}')
+          if checked == 0:
+              print('::error::PR 中没有可校验的非 merge 提交', file=sys.stderr)
+              sys.exit(2)
+          if bad:
+              sys.exit(1)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'should_merge=true\nhead_sha={commits[-1]["sha"]}\nchecked={checked}\n')
+          PY
+
+      - name: Auto-approve（保护规则要求 review 时才需要）
+        if: steps.gate.outputs.should_merge == 'true'
+        continue-on-error: true   # 没要求 review 或 org 未开该权限时会报错，忽略即可
+        env:
+          CHECKED: ${{ steps.gate.outputs.checked }}
+        run: |
+          gh pr review "$PR" --approve \
+            --body "自动批准：本 PR 的 ${CHECKED} 个提交全部由白名单作者（GitHub login 校验）提交；CI 通过后自动合并。"
+
+      - name: 开启 native auto-merge；不可用则轮询 CI 后用 REST 直接合并
+        if: steps.gate.outputs.should_merge == 'true'
+        env:
+          HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
+          CHECKED: ${{ steps.gate.outputs.checked }}
+        run: |
+          set -uo pipefail
+          if gh pr merge "$PR" --auto --"${MERGE_METHOD}"; then
+            echo "✅ 已开启 native auto-merge：required checks 全绿后 GitHub 自动合并 PR #${PR}（merge commit）。"
+            exit 0
+          fi
+          echo "::warning::开不了 auto-merge（wibe 需勾 Allow auto-merge，且 master 的规则里要有 required status check）；改用轮询 + REST 兜底。"
+
+          if [ "${WAIT_FOR_CHECKS}" = "true" ]; then
+            seen_any=0
+            while :; do
+              json="$(gh pr view "$PR" --json statusCheckRollup,mergeable,mergeStateStatus 2>/dev/null || echo '{}')"
+              n=$(jq -r '(.statusCheckRollup // []) | length' <<<"$json")
+              bad=$(jq -r '[.statusCheckRollup[]? | select(((.conclusion // "") | test("FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED|STARTUP_")))] | length' <<<"$json")
+              pend=$(jq -r '[.statusCheckRollup[]? | select(((.status // "") | test("^(QUEUED|IN_PROGRESS|PENDING)$")))] | length' <<<"$json")
+              pass=$(jq -r '[.statusCheckRollup[]? | select(((.conclusion // "") | test("^(SUCCESS|NEUTRAL|SKIPPED)$")))] | length' <<<"$json")
+              mergeable=$(jq -r '.mergeable // "UNKNOWN"' <<<"$json")
+              [ "${n:-0}" -gt 0 ] && seen_any=1
+              echo "poll: checks=${n} pending=${pend} passed=${pass} failed=${bad} mergeable=${mergeable}"
+
+              if [ "${mergeable}" = "CONFLICTING" ]; then
+                echo "::error::PR 有冲突（mergeable=CONFLICTING），不合并。请让作者 rebase。" >&2
+                exit 1
+              fi
+              if [ "${bad:-0}" -gt 0 ]; then
+                echo "::error::CI 有失败项，拒绝合并。" >&2
+                exit 1
+              fi
+              if [ "${seen_any}" = 1 ] && [ "${pend:-0}" = 0 ] && [ "${pass:-0}" -gt 0 ]; then
+                echo "✅ 所有 check 已上报且无失败，进入合并。"
+                break
+              fi
+              if [ "${seen_any}" = 0 ] && [ "${SECONDS}" -gt "${CHECK_GRACE_SECONDS}" ]; then
+                echo "::warning::${CHECK_GRACE_SECONDS}s 内没有任何 check 上报（pr.yml 不在 master 的 PR 上触发），按「无 CI 前置」继续合并。"
+                break
+              fi
+              if [ "${SECONDS}" -gt $(( CHECK_TIMEOUT_MINUTES * 60 )) ]; then
+                echo "::error::等待 CI 超时（${CHECK_TIMEOUT_MINUTES} 分钟），不合并。" >&2
+                exit 1
+              fi
+              sleep "${CHECK_POLL_SECONDS}"
+            done
+          fi
+
+          # 兜底路径：显式 pin head sha，避免竞态合并到别的提交
+          gh api -X PUT "repos/${REPO}/pulls/${PR}/merge" \
+            -f sha="${HEAD_SHA}" \
+            -f merge_method="${MERGE_METHOD}" \
+            -f commit_message="Auto-merged: 白名单贡献者提交（${CHECKED} 个，GitHub login 校验通过）。"
+          echo "✅ 已通过 REST 直接合并（PR #${PR}，sha ${HEAD_SHA:0:10}）。"
