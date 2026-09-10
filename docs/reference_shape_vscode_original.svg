@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- 柔和、偏产品插画风格的阴影 -->
+    <filter id="panelShadow" x="-25%" y="-25%" width="160%" height="170%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="7.14" dy="11.42" stdDeviation="9.99" flood-color="#0B1F14" flood-opacity="0.20"/>
+    </filter>
+    <!-- 轻微高光，让边缘更像产品图标 -->
+    <linearGradient id="leftPanel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#12FF86"/>
+      <stop offset="100%" stop-color="#00F06E"/>
+    </linearGradient>
+    <linearGradient id="rightPanel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#06B85D"/>
+      <stop offset="100%" stop-color="#00A34D"/>
+    </linearGradient>
+    <!-- 拱肩落影：沿蓝色箭头线段，向腿内侧衰减 -->
+    <linearGradient id="springShade" gradientUnits="userSpaceOnUse" x1="258.68" y1="233.85" x2="242.69" y2="323.78">
+      <stop offset="0%" stop-color="#00220C" stop-opacity="0.46"/>
+      <stop offset="26%" stop-color="#00220C" stop-opacity="0.30"/>
+      <stop offset="62%" stop-color="#00220C" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#00220C" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="frontClip">
+      <path d="M 612.73 89.14 L 613.93 144.51 Q 614.04 149.65 609.15 151.22 L 324.94 242.28 Q 320.05 243.84 320.05 248.98 L 320.05 846.96 Q 320.05 849.1 317.99 848.49 L 203.64 814.29 Q 201.59 813.68 201.56 811.54 L 194.52 230.43 Q 194.46 225.29 199.32 223.64 L 607.75 85.64 Q 612.62 84 612.73 89.14 Z"/>
+    </clipPath>
+  </defs>
+
+  <g filter="url(#panelShadow)" stroke-linejoin="round" stroke-linecap="round">
+    <!-- 左侧折面：用微曲线弱化尖角 -->
+    <path d="M 612.73 89.14 L 613.93 144.51 Q 614.04 149.65 609.15 151.22 L 324.94 242.28 Q 320.05 243.84 320.05 248.98 L 320.05 846.96 Q 320.05 849.1 317.99 848.49 L 203.64 814.29 Q 201.59 813.68 201.56 811.54 L 194.52 230.43 Q 194.46 225.29 199.32 223.64 L 607.75 85.64 Q 612.62 84 612.73 89.14 Z" fill="url(#leftPanel)"/>
+
+    <!-- 左侧内边缘，形成更柔和的视觉层次 -->
+    <path d="M 320.05 243.84 L 614.04 149.65" fill="none" stroke="#00E96D" stroke-width="2.85" stroke-opacity="0.28"/>
+
+    <!-- 右侧主面：下端落到红色箭头所在的地面线 -->
+    <path d="M 622.59 85.88 L 822.43 152.05 Q 828.12 153.93 828.13 159.93 L 829.53 872.94 Q 829.54 878.93 823.8 880.64 L 626.08 939.39 Q 624.03 940 624.01 937.86 L 616.95 89.99 Q 616.9 84 622.59 85.88 Z" fill="url(#rightPanel)"/>
+
+    <!-- 右面顶部边缘高光 -->
+    <path d="M 619.75 85.43 L 828.12 153.93" fill="none" stroke="#19C96E" stroke-width="2.85" stroke-opacity="0.22"/>
+
+    <!-- 拱肩阴影（裁剪在正面内），让整体读作拱门 -->
+    <g clip-path="url(#frontClip)">
+      <path d="M 171.97 218.44 L 345.38 249.27 L 329.4 339.2 L 155.99 308.37 Z" fill="url(#springShade)"/>
+      <path d="M 194.46 222.44 L 322.9 245.27" fill="none" stroke="#EAFFF3" stroke-opacity="0.33" stroke-width="2.57"/>
+    </g>
+  </g>
+</svg>
