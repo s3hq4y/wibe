@@ -234,6 +234,19 @@ GUI 点击「压缩对话」（CompactConversationButton）
 - **双树同步**：源码树 `vscode-1.136.1/…` 是开发位；运行中的 VS Code 产品位
   `VSCode-win32-x64/resources/app/…` 也要同步插件与打包产物（`npm run esbuild` 后复制
   `out/extension.js`）。改动前先确认当前测试实例到底加载哪棵树。
+- **Python 解释器来源**：扩展侧按「显式设置 → 系统环境变量（`PATH`/`PYTHON`/`PYTHONHOME`）→
+  `py` 启动器 → 常见安装目录 → 随包/venv」探测，**默认约定 Windows 已把 Python 配置进环境变量**；
+  `start.py` 同理（`_find_env_python()` 优先，找不到才走下载安装）。随包 venv 排最后：发行包里
+  混进过开发机的 venv（`pyvenv.cfg` 指向不存在的基础解释器，引导器直接退码 103），它一旦排在
+  前面就会把启动拖成 60 秒超时。
+- **快捷键全哑 = 缺 `native-keymap` 的原生二进制**：该模块失败时**静默降级**（`getKeyMap()`
+  返回 `[]`、`getCurrentKeyboardLayout()` 返回 `null`，只 `console.error` 到主进程 stderr，
+  不进 `main.log`），而 `createKeyboardMapper()` 在 Windows 分支没有兜底，于是所有默认键位
+  都被跳过，每条 chord 解析成 `[KeybindingService]: No keybinding entries.`——用
+  `Developer: Toggle Keyboard Shortcuts Troubleshooting` 可直接看到这行。打包侧由
+  `build/package-bridge-postbuild.ps1` 的 `[5/5]` 步硬校验（缺失即打包失败）；运行时临时绕过：
+  设 `keyboard.dispatch: "keyCode"`（`getKeyboardMapper()` 改走 `FallbackKeyboardMapper`，
+  完全不依赖该模块）。
 - **插件文件**：`api_patch.py`（中间件挂载）、`hooks.py`（钩子注册 + ext 通道 + 收尾 x_uwa）、
   `ide_mode.py`（分类逻辑）三件套要一起考虑。
 - 保留备份文件以 `.bak-<stamp>` 形式放在同目录，便于回退。
