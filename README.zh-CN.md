@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="./WIBE_VERSION"><img src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-alpha--1.0.0--base--1.136.1-00A34D?style=flat-square&labelColor=071A10" alt="版本 alpha-1.0.0-base-1.136.1"></a>
+  <a href="./WIBE_VERSION"><img src="https://img.shields.io/badge/%E7%89%88%E6%9C%AC-alpha--1.0.1--base--1.136.1-00A34D?style=flat-square&labelColor=071A10" alt="版本 alpha-1.0.1-base-1.136.1"></a>
   <a href="https://github.com/microsoft/vscode"><img src="https://img.shields.io/badge/%E4%B8%8A%E6%B8%B8-Code%20--%20OSS%201.136.1-3178C6?style=flat-square&labelColor=071A10" alt="上游 Code - OSS 1.136.1"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF%E8%AF%81-AGPL--3.0-8A2BE2?style=flat-square&labelColor=071A10" alt="许可证 AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows-0078D6?style=flat-square&labelColor=071A10" alt="平台 Windows">
@@ -17,7 +17,7 @@
 
 Wibe 是基于 [Visual Studio Code — Open Source](https://github.com/microsoft/vscode)（**Code - OSS 1.136.1**）的桌面编辑器。编辑器、扩展宿主、用户目录布局都跟上游一致；在此之上加了一层**本地 Agent**：用你已经登录的 AI 网页，在本机真实浏览器里对话。
 
-**版本：** `alpha-1.0.0-base-1.136.1`
+**版本：** `alpha-1.0.1-base-1.136.1`
 Wibe **1.0.0 alpha**，基线为 Code - OSS **1.136.1**。
 
 > **仅在 DeepSeek**（[chat.deepseek.com](https://chat.deepseek.com)）上验证过功能。Sidecar 里其它站点可能有内置适配，但**本 alpha 未测试**。
@@ -118,7 +118,7 @@ npm run compile                 # 完整客户端 + copilot
 | `resources/uwa-sidecar/` | 本地 Web-to-API 服务 |
 | `docs/` | 桥接协议、相对原版说明 |
 | `BRIDGE.md` | 短契约 / 不能破坏的规则 |
-| `WIBE_VERSION` | 展示版本（`alpha-1.0.0-base-1.136.1`） |
+| `WIBE_VERSION` | 展示版本（`alpha-1.0.1-base-1.136.1`） |
 
 ---
 
