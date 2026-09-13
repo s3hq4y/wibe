@@ -286,9 +286,90 @@ def _python_version_ok(python_path: Path) -> bool:
         return False
 
 
+def _find_env_python() -> Path | None:
+    """从系统环境变量解析 Python —— 默认约定：Windows 已把 Python 配置进环境变量。
+
+    覆盖 PYTHON / PYTHON_EXE（可指到 exe，也可指到安装根目录）、PYTHONHOME，以及 PATH。
+    只按版本门槛筛选，不要求落在钉死的安装目录里 —— 否则用户机器上已经配好的
+    Python 会被无视，进而触发无谓的下载安装。
+
+    Windows Store 的 python.exe 是占位符（执行它会拉起应用商店），一律跳过。
+    """
+    if sys.platform.startswith("win"):
+        names = ("python.exe", "python")
+    else:
+        names = ("python3", "python")
+
+    candidates: list[Path] = []
+
+    def add_path(raw: str | None) -> None:
+        if not raw:
+            return
+        value = raw.strip().strip('"')
+        if not value:
+            return
+        candidate = Path(value)
+        try:
+            if candidate.is_dir():
+                candidates.extend(candidate / name for name in names)
+                return
+        except OSError:
+            pass
+        candidates.append(candidate)
+
+    for key in ("PYTHON", "PYTHON_EXE"):
+        add_path(os.getenv(key))
+    add_path(os.getenv("PYTHONHOME"))
+
+    for entry in os.getenv("PATH", "").split(os.pathsep):
+        value = entry.strip().strip('"')
+        if not value or "windowsapps" in value.lower():
+            continue
+        candidates.extend(Path(value) / name for name in names)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen or "windowsapps" in key:
+            continue
+        seen.add(key)
+        try:
+            if candidate.exists() and _python_version_ok(candidate):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _switch_to_env_python() -> bool:
+    """当前解释器不可用时，先改用系统环境变量里配置的 Python。
+
+    默认约定：Windows 已把 Python 配置进环境变量。命中就直接用新解释器重启
+    start.py，避免下载安装一份 —— 用户机器上往往已经有可用的 Python。
+    """
+    found = _find_env_python()
+    if not found:
+        return False
+    try:
+        if Path(sys.executable).resolve() == found.resolve():
+            return False
+    except OSError:
+        pass
+
+    _log(f"[INFO] 找到系统环境变量中的 Python: {found}")
+    _log("[INFO] 正在使用它重新运行 start.py...")
+    os.execv(str(found), [str(found), str(Path(__file__).resolve()), *sys.argv[1:]])
+    return True
+
+
 def _find_installed_fixed_python() -> Path | None:
     if not sys.platform.startswith("win"):
         return None
+
+    # 0) 系统环境变量优先：默认约定 Windows 已把 Python 配置进环境变量
+    env_python = _find_env_python()
+    if env_python:
+        return env_python
 
     short_version = _python_install_short()
     major_minor = _python_install_major_minor()
@@ -400,10 +481,15 @@ def _check_python_version() -> None:
     _section("检查 Python 环境")
     version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     if _is_windows_store_python():
+        # 先看系统环境变量里有没有配好的 Python，有就换过去，不必下载安装
+        if _switch_to_env_python():
+            return
         if _offer_python_install("检测到 Windows Store Python 占位符"):
             return
         raise RuntimeError("检测到 Windows Store Python 占位符，请关闭应用执行别名或安装完整版 Python")
     if sys.version_info < (3, 8):
+        if _switch_to_env_python():
+            return
         if _offer_python_install(f"Python 版本过低: {version}，最低要求 Python 3.8+"):
             return
         raise RuntimeError(f"Python 版本过低: {version}，最低要求 Python 3.8+")

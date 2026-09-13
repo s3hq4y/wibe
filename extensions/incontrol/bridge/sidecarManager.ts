@@ -181,40 +181,101 @@ export class SidecarManager {
 	}
 
 	/**
-	 * 按优先级列出候选解释器路径。
+	 * 系统环境变量里声明的解释器 —— 默认来源。
 	 *
-	 * 顺序：用户显式指定 → 随包分发的内置 Python → sidecar 自建 venv → 系统安装。
-	 * 这里只负责列路径，可用与否交给 probeInterpreter 判断。
+	 * 约定：Windows 上 Python 已配置进系统环境变量（PATH 里有 python.exe），
+	 * 因此这一组排在最前。随包/vnev 里的解释器只在环境变量里找不到可用项时才用。
+	 *
+	 * 覆盖：
+	 *   PYTHON / PYTHON_EXE  显式指定解释器（可指到 exe，也可指到安装根目录）
+	 *   PYTHONHOME           解释器所在目录
+	 *   PATH                 逐目录展开，而不是只把 'python.exe' 交给 spawn ——
+	 *                        spawn 只能命中第一条，且无法跳过其中坏掉的那个
+	 *
+	 * 只做存在性过滤（PATH 动辄几十条，逐条 spawn 探测太慢）；是否真正可用仍交给
+	 * probeInterpreter 判断，依赖不全的解释器会在那里被跳过并记下原因。
 	 */
-	private listCandidates(): string[] {
+	private listEnvCandidates(): string[] {
 		const win = process.platform === 'win32';
 		const exe = win ? 'python.exe' : 'python';
 		const list: string[] = [];
 
-		if (this.opts.pythonPath) {
-			list.push(this.opts.pythonPath);
-		}
-		// 随产品分发的 embeddable Python（当前构建未提供，保留以便将来启用）
-		list.push(path.join(this.opts.sidecarRoot, '..', 'python', exe));
-		// sidecar 自建 venv（start.py 跑过后会有）
-		list.push(path.join(this.opts.sidecarRoot, 'venv', win ? 'Scripts' : 'bin', exe));
+		const unquote = (p: string) => p.trim().replace(/^"(.*)"$/, '$1');
 
-		if (win) {
-			// 布局与 start.py:_find_installed_fixed_python 对齐。旧实现漏掉了
-			// %LOCALAPPDATA%\Programs\Python\Python3XX —— 而这正是 python.org
-			// "仅为当前用户"安装的落地位置，本机 Python 3.11 就是这样被跳过的。
-			const roots = [process.env.LOCALAPPDATA, process.env.ProgramFiles, process.env['ProgramFiles(x86)']];
-			for (const minor of WINDOWS_PYTHON_MINORS) {
-				const tag = `Python3${minor}`;
-				for (const root of roots) {
-					if (!root) { continue; }
-					list.push(path.join(root, 'Programs', 'Python', tag, exe));
-					list.push(path.join(root, tag, exe));
+		/** 目录则拼上 exe，其余原样返回（兼容 PATH 里直接写命令名的情形） */
+		const asExe = (p: string): string => {
+			try {
+				if (fs.existsSync(p) && fs.statSync(p).isDirectory()) {
+					return path.join(p, exe);
 				}
+			} catch {
+				// 无权限等情况按普通路径处理
 			}
+			return p;
+		};
+
+		const push = (raw: string | undefined): void => {
+			if (!raw) { return; }
+			const cleaned = unquote(raw);
+			if (!cleaned) { return; }
+			// 绝对路径要求真实存在；非绝对路径（配置里写的命令名）保留给 spawn 解析
+			if (path.isAbsolute(cleaned) && !fs.existsSync(cleaned)) { return; }
+			list.push(cleaned);
+		};
+
+		for (const key of ['PYTHON', 'PYTHON_EXE']) {
+			const v = process.env[key];
+			if (v) { push(asExe(unquote(v))); }
+		}
+		if (process.env.PYTHONHOME) {
+			push(path.join(unquote(process.env.PYTHONHOME), exe));
+		}
+		for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+			if (dir) { push(path.join(dir, exe)); }
 		}
 
 		return list;
+	}
+
+	/**
+	 * Windows 常见安装位置（PATH 未配置 Python 时的补充）。
+	 *
+	 * 布局与 start.py:_find_installed_fixed_python 对齐。旧实现漏掉了
+	 * %LOCALAPPDATA%\Programs\Python\Python3XX —— 而这正是 python.org
+	 * "仅为当前用户"安装的落地位置，本机 Python 3.11 就是这样被跳过的。
+	 */
+	private listInstalledCandidates(): string[] {
+		if (process.platform !== 'win32') { return []; }
+		const exe = 'python.exe';
+		const list: string[] = [];
+		const roots = [process.env.LOCALAPPDATA, process.env.ProgramFiles, process.env['ProgramFiles(x86)']];
+		for (const minor of WINDOWS_PYTHON_MINORS) {
+			const tag = `Python3${minor}`;
+			for (const root of roots) {
+				if (!root) { continue; }
+				list.push(path.join(root, 'Programs', 'Python', tag, exe));
+				list.push(path.join(root, tag, exe));
+			}
+		}
+		return list;
+	}
+
+	/**
+	 * 随产品分发 / 随 sidecar 生成的解释器 —— 兜底，排最后。
+	 *
+	 * sidecar 自建 venv 尤其不能排在前面：发行包里混进过开发机的 venv
+	 * （pyvenv.cfg 指向不存在的基础解释器，引导器直接退码 103），而它因为
+	 * "文件存在"被优先选中，把问题一路拖到 60 秒启动超时。
+	 */
+	private listPackagedCandidates(): string[] {
+		const win = process.platform === 'win32';
+		const exe = win ? 'python.exe' : 'python';
+		return [
+			// 随产品分发的 embeddable Python（当前构建未提供，保留以便将来启用）
+			path.join(this.opts.sidecarRoot, '..', 'python', exe),
+			// sidecar 自建 venv（start.py 跑过之后会有）
+			path.join(this.opts.sidecarRoot, 'venv', win ? 'Scripts' : 'bin', exe),
+		];
 	}
 
 	/**
@@ -242,8 +303,14 @@ export class SidecarManager {
 	/**
 	 * 选解释器：按优先级逐个探测，返回第一个**真正可用**的。
 	 *
-	 * 与旧实现的关键差别是不再"存在即采用"。坏掉的 venv 会被跳过并记下原因，
-	 * 而不是把问题拖到 60 秒后以启动超时的形式呈现。
+	 * 顺序：用户显式指定 → 系统环境变量（PATH / PYTHON / PYTHONHOME）→ py 启动器
+	 *       → 常见安装目录 → 随包/venv 兜底。
+	 *
+	 * 与旧实现的两个关键差别：
+	 *   1) 系统环境变量（Windows 默认已配置 Python）优先于随包 venv。此前 venv
+	 *      排在第二，一个坏掉的 venv 就能把启动拖成超时。
+	 *   2) 不再"存在即采用"。坏掉的 venv 会被跳过并记下原因，而不是把问题拖到
+	 *      60 秒后以启动超时的形式呈现。
 	 */
 	private async resolvePython(): Promise<string | undefined> {
 		const seen = new Set<string>();
@@ -268,26 +335,38 @@ export class SidecarManager {
 		};
 
 		const explicit = this.opts.pythonPath;
+		if (explicit) {
+			const hit = await firstViable([explicit]);
+			if (hit) { return hit; }
+		}
 
-		const hit = await firstViable(this.listCandidates());
-		if (hit) { return hit; }
+		// 系统环境变量（PATH / PYTHON / PYTHONHOME）：Windows 默认已配置 Python
+		// 环境变量，这是主来源。同样要先探测 —— 旧实现直接采用 PATH 上的第一个
+		// python.exe，于是选中了没有 DrissionPage 的 conda Python 3.8，把
+		// "环境不对"伪装成了 import 报错。
+		const viaEnv = await firstViable(this.listEnvCandidates());
+		if (viaEnv) { return viaEnv; }
 
-		// py 启动器兜底：覆盖注册表里任意安装位置的 Python
+		// py 启动器：覆盖注册表里登记过的任意安装位置（包括不在 PATH 里的）
 		const viaPy = await firstViable(await this.resolveViaPyLauncher());
 		if (viaPy) { return viaPy; }
 
-		// PATH 兜底同样要先探测：旧实现直接采用，于是选中了没有 DrissionPage
-		// 的 conda Python 3.8，把"环境不对"伪装成了 import 报错。
-		const viaPath = await firstViable([process.platform === 'win32' ? 'python.exe' : 'python3']);
-		if (viaPath) { return viaPath; }
+		// 常见安装目录
+		const viaInstalled = await firstViable(this.listInstalledCandidates());
+		if (viaInstalled) { return viaInstalled; }
+
+		// 随包分发的内置 Python / sidecar 自建 venv —— 兜底，排最后
+		const viaPackaged = await firstViable(this.listPackagedCandidates());
+		if (viaPackaged) { return viaPackaged; }
 
 		this.log('未找到可用的 Python 解释器。');
 		if (explicit) {
 			this.log(`  当前 incontrol.sidecar.pythonPath 指向 "${explicit}"，但该解释器不可用。`);
 		}
 		this.log('  处理方式（任选其一）：');
-		this.log(`    1) 运行 ${path.join(this.opts.sidecarRoot, 'start.py')} 自动创建 venv 并安装依赖`);
-		this.log('    2) 在设置 incontrol.sidecar.pythonPath 中指定一个已装好依赖的解释器');
+		this.log('    1) 把 Python 加入系统环境变量 PATH（默认约定；python.org 安装时勾选 Add python.exe to PATH）');
+		this.log(`    2) 运行 ${path.join(this.opts.sidecarRoot, 'start.py')} 自动创建 venv 并安装依赖`);
+		this.log('    3) 在设置 incontrol.sidecar.pythonPath 中指定一个已装好依赖的解释器');
 		for (const f of failures.slice(0, 5)) {
 			this.log(`  已排除：${f}`);
 		}

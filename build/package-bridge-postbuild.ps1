@@ -20,7 +20,7 @@ if (-not $Prod) { $Prod = Join-Path (Split-Path $PSScriptRoot -Parent) "VSCode-w
 $extSrc  = Join-Path $Src  "extensions\incontrol"
 $extProd = Join-Path $Prod "resources\app\extensions\incontrol"
 
-Write-Host "[1/4] uwa-sidecar -> product"
+Write-Host "[1/5] uwa-sidecar -> product"
 $sideSrc = Join-Path $Src  "resources\uwa-sidecar"
 $sideDst = Join-Path $Prod "resources\app\resources\uwa-sidecar"
 robocopy $sideSrc $sideDst /E /NFL /NDL /NJH /NJS /XD __pycache__ .git chrome_profile venv logs temp download_images /XF *.pyc | Out-Null
@@ -35,7 +35,7 @@ foreach ($leak in @("venv", "chrome_profile")) {
 }
 Write-Host ("      files: " + (Get-ChildItem $sideDst -Recurse -File).Count)
 
-Write-Host "[2/4] external node_modules -> product"
+Write-Host "[2/5] external node_modules -> product"
 $nmDst = Join-Path $extProd "node_modules"
 New-Item -ItemType Directory -Force -Path $nmDst | Out-Null
 $roots = @((Join-Path $extSrc "core\node_modules"), (Join-Path $extSrc "node_modules"))
@@ -55,7 +55,7 @@ New-Item -ItemType Directory -Force -Path (Split-Path $binDst) | Out-Null
 Copy-Item $binSrc $binDst -Force
 if(-not (Test-Path $binDst)){ throw "sqlite3 native binary missing" }
 
-Write-Host "[3/4] incontrol dist -> product"
+Write-Host "[3/5] incontrol dist -> product"
 # VS Code 鎵撳寘浼氭妸 main 閲嶅啓涓?./dist/extension.js锛岄€傞厤灞備篃蹇呴』杈撳嚭 dist/
 $distSrc = Join-Path $extSrc  "dist"
 $distDst = Join-Path $extProd "dist"
@@ -83,7 +83,7 @@ if (Test-Path $pkgSrc) {
   Write-Host "      package.json synced (main -> dist, no BOM)"
 }
 
-Write-Host "[4/4] node-pty native module -> product"
+Write-Host "[4/5] node-pty native module -> product"
 # node-pty 的 .node 不随 npm install 落地（prebuild 脚本对 electron ABI 无预编译产物），
 # 必须用 node-gyp 按 .npmrc 里的 runtime=electron/target 手工编译一次：
 #   cd node_modules\node-pty
@@ -112,7 +112,7 @@ if (Test-Path (Join-Path $ptyBin "conpty.node")) {
   }
   Write-Host "      conpty.node deployed"
   # 文件放到 .unpacked 还不够：Electron 只对 asar 头部登记过的条目做重定向。
-  $reg = Join-Path $Src "build\register-pty-in-asar.cjs"
+  $reg = Join-Path $Src "build\register-asar-unpacked-entries.cjs"
   $asar = Join-Path $Prod "resources\app\node_modules.asar"
   if ((Test-Path $reg) -and (Test-Path $asar)) {
     $env:ASAR = $asar
@@ -121,6 +121,71 @@ if (Test-Path (Join-Path $ptyBin "conpty.node")) {
   }
 } else {
   Write-Host "      WARN: conpty.node not built; terminal will not launch"
+}
+
+Write-Host "[5/5] native-keymap / native-is-elevated native modules -> product"
+# 这两个模块决定键盘快捷键能否工作，其 .node 同样不随 npm install 落地时必须手工编译：
+#   native-keymap 缺 keymapping.node → 主进程 readKeyboardLayoutData() 拿到空布局与空扫描码映射
+#     → createKeyboardMapper() 在 Windows 分支（该分支没有兜底）直接构造
+#       WindowsKeyboardMapper(undefined, undefined)，无法把默认键位的 KeyCode 映射成扫描码
+#     → KeybindingService 里所有默认绑定被跳过
+#     → 症状：按键能到达、能正确转换，但每条 chord 都解析成 "No keybinding entries."，快捷键全哑
+#   更麻烦的是失败是**静默**的：native-keymap/index.js 把异常吞掉，getKeyMap() 返回 []、
+#   getCurrentKeyboardLayout() 返回 null，只 console.error 到主进程 stderr，不进 main.log。
+#   所以这里必须硬校验：缺了它宁可打包失败，也不要把一个"快捷键全哑"的包发出去。
+#   native-is-elevated 缺 iselevated.node 只影响"以管理员身份重启"的判定（恒为 false），不阻断。
+#
+# 编译（与 .npmrc 的 runtime=electron/target 对齐；binding.gyp 与源码都在 npm tarball 里）：
+#   cd node_modules\native-keymap
+#   npx node-gyp rebuild --runtime=electron --target=<ver> --dist-url=https://electronjs.org/headers --arch=x64
+$electronTarget = $null
+$npmrcPath = Join-Path $Src ".npmrc"
+if (Test-Path $npmrcPath) {
+  $m = [regex]::Match([System.IO.File]::ReadAllText($npmrcPath), '(?m)^target="(?<v>[^"]+)"')
+  if ($m.Success) { $electronTarget = $m.Groups['v'].Value }
+}
+$asarUnpacked = Join-Path $Prod "resources\app\node_modules.asar.unpacked"
+$nativeMods = @(
+  @{ Name = "native-keymap";      Rel = "build\Release\keymapping.node"; Critical = $true  },
+  @{ Name = "native-is-elevated"; Rel = "build\Release\iselevated.node"; Critical = $false }
+)
+foreach ($mod in $nativeMods) {
+  $srcBin = Join-Path $Src "node_modules\$($mod.Name)\$($mod.Rel)"
+  if (-not (Test-Path $srcBin)) {
+    $pkgDir = Join-Path $Src "node_modules\$($mod.Name)"
+    if ((Test-Path (Join-Path $pkgDir "binding.gyp")) -and $electronTarget) {
+      Write-Host "      $($mod.Name): binary missing, compiling with node-gyp (electron $electronTarget)"
+      $gyp = Join-Path $Src "build\npm\gyp\node_modules\.bin\node-gyp.cmd"
+      if (-not (Test-Path $gyp)) { $gyp = "node-gyp" }
+      Push-Location $pkgDir
+      try {
+        & $gyp rebuild --runtime=electron --target=$electronTarget --dist-url=https://electronjs.org/headers --arch=x64 2>&1 |
+          ForEach-Object { Write-Host "        $_" }
+      } finally { Pop-Location }
+    }
+  }
+  if (Test-Path $srcBin) {
+    $dstBin = Join-Path $asarUnpacked "$($mod.Name)\$($mod.Rel)"
+    New-Item -ItemType Directory -Force -Path (Split-Path $dstBin) | Out-Null
+    Copy-Item $srcBin $dstBin -Force
+    Write-Host "      $($mod.Name): $($mod.Rel) deployed"
+  } elseif ($mod.Critical) {
+    throw "$($mod.Name) native binary missing ($($mod.Rel)). Without it every keyboard shortcut resolves to 'No keybinding entries.'. Compile it first: cd node_modules\$($mod.Name) && npx node-gyp rebuild --runtime=electron --target=$electronTarget --dist-url=https://electronjs.org/headers --arch=x64"
+  } else {
+    Write-Host "      WARN: $($mod.Name) native binary missing; 'restart as administrator' will always report false"
+  }
+}
+# 登记到 asar 头部（幂等）。正常构建由 gulpfile 的 createAsar（unpackGlobs 含 '**/*.node'）
+# 完成；这里覆盖"打包时二进制还不存在、事后才补进来"的情况 —— 头部缺条目时 Electron 不做重定向。
+$regNative = Join-Path $Src "build\register-asar-unpacked-entries.cjs"
+$asar = Join-Path $Prod "resources\app\node_modules.asar"
+if ((Test-Path $regNative) -and (Test-Path $asar)) {
+  $env:ASAR = $asar
+  $env:PICKLE = Join-Path $Src "node_modules\chromium-pickle-js"
+  node $regNative
+}
+if (-not (Test-Path (Join-Path $asarUnpacked "native-keymap\build\Release\keymapping.node"))) {
+  throw "native-keymap binary not present in product (resources\app\node_modules.asar.unpacked). Keyboard shortcuts will be dead."
 }
 
 Write-Host "verify:"
