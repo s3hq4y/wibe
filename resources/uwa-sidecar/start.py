@@ -34,6 +34,13 @@ REQUIREMENTS_FILE = PROJECT_DIR / "requirements.txt"
 DEFAULT_PIP_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"
 DEFAULT_GITHUB_REPO = "lumingya/universal-web-api"
 DEFAULT_PYTHON_INSTALL_VERSION = "3.13.6"
+
+# sidecar 的依赖（requirements.txt）要求 Python >= 3.10。下面描述的三处版本
+# 判定必须用同一个门槛：此前这里写 3.8，而 requirements 写 3.10，于是用
+# PATH 上的 Python 3.8 也能建出 venv，pip 却装不出依赖，留下一个空壳环境，
+# 而且 _ensure_venv 只看文件在不在，再跑一次也不会重建。
+MIN_PYTHON = (3, 10)
+MIN_PYTHON_LABEL = "3.10"
 _PYTHON_PROXY_SCHEMES = frozenset({
     "http",
     "https",
@@ -274,7 +281,10 @@ def _python_version_ok(python_path: Path) -> bool:
             [
                 str(python_path),
                 "-c",
-                "import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)",
+                (
+                    "import sys; raise SystemExit("
+                    f"0 if sys.version_info >= {MIN_PYTHON!r} else 1)"
+                ),
             ],
             check=False,
             capture_output=True,
@@ -487,12 +497,12 @@ def _check_python_version() -> None:
         if _offer_python_install("检测到 Windows Store Python 占位符"):
             return
         raise RuntimeError("检测到 Windows Store Python 占位符，请关闭应用执行别名或安装完整版 Python")
-    if sys.version_info < (3, 8):
+    if sys.version_info < MIN_PYTHON:
         if _switch_to_env_python():
             return
-        if _offer_python_install(f"Python 版本过低: {version}，最低要求 Python 3.8+"):
+        if _offer_python_install(f"Python 版本过低: {version}，最低要求 Python {MIN_PYTHON_LABEL}+"):
             return
-        raise RuntimeError(f"Python 版本过低: {version}，最低要求 Python 3.8+")
+        raise RuntimeError(f"Python 版本过低: {version}，最低要求 Python {MIN_PYTHON_LABEL}+")
     _log(f"[OK] Python {version}")
     _log(f"    路径: {sys.executable}")
     _log()
@@ -550,10 +560,22 @@ def _ensure_project_structure() -> None:
 def _ensure_venv() -> None:
     _section("准备虚拟环境")
     python_path = _venv_python()
+
     if python_path.exists():
-        _log("[OK] 虚拟环境已存在")
-        _log()
-        return
+        # 只判断"文件在不在"是不够的，失效的 venv 有两种常见形态：
+        #   1) 用版本过低的 Python 建的 —— 能跑，但 pip 装不出满足
+        #      requirements 的依赖，最后留下一堆缺包；
+        #   2) 基础解释器已不存在（venv 从别的机器拷过来的典型后果）——
+        #      pyvenv.cfg 里的 home 指向不存在的路径，引导器直接退码 103。
+        # 两种情况 _python_version_ok 都会返回 False，这里就地重建，
+        # 否则用户按提示重跑 start.py 也只是白跑（旧逻辑直接 return）。
+        if _python_version_ok(python_path):
+            _log("[OK] 虚拟环境已存在")
+            _log()
+            return
+        _log(f"[WARN] 现有虚拟环境不满足 Python >= {MIN_PYTHON_LABEL}，或基础解释器已失效")
+        _log("[INFO] 删除并重建虚拟环境...")
+        shutil.rmtree(VENV_DIR, ignore_errors=True)
 
     if VENV_DIR.exists():
         raise RuntimeError("虚拟环境损坏，缺少 Python 解释器。请删除 venv 后重新运行。")
