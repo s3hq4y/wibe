@@ -16,14 +16,15 @@ $ErrorActionPreference = "Stop"
 # 默认从脚本自身位置推导，避免把构建机的绝对路径写进源码。
 # 约定：$Src 为源码仓库根，$Prod 为 gulp 产物目录（仓库的上一级）。
 if (-not $Src)  { $Src  = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path }
-if (-not $Prod) { $Prod = Join-Path (Split-Path $PSScriptRoot -Parent) "VSCode-win32-x64" }
+if (-not $Prod) { $Prod = Join-Path (Split-Path $Src -Parent) "VSCode-win32-x64" }
 $extSrc  = Join-Path $Src  "extensions\incontrol"
 $extProd = Join-Path $Prod "resources\app\extensions\incontrol"
 
 Write-Host "[1/5] uwa-sidecar -> product"
 $sideSrc = Join-Path $Src  "resources\uwa-sidecar"
 $sideDst = Join-Path $Prod "resources\app\resources\uwa-sidecar"
-robocopy $sideSrc $sideDst /E /NFL /NDL /NJH /NJS /XD __pycache__ .git chrome_profile venv logs temp download_images /XF *.pyc | Out-Null
+robocopy $sideSrc $sideDst /E /NFL /NDL /NJH /NJS /XD __pycache__ .git chrome_profile venv .venv logs temp tmp scratch download_images node_modules tests /XF *.pyc *.pyo .env .env.* *.local* *.log *.bak *.tmp .agent_bridge.json marketplace_cache.json app_stats.json request_history.json commands.json | Out-Null
+if ($LASTEXITCODE -ge 8) { throw "uwa-sidecar copy failed" }
 if(-not (Test-Path (Join-Path $sideDst "start.py"))){ throw "uwa-sidecar copy failed" }
 # venv/chrome_profile 是本机运行时产物，绝不该进发行包：
 # venv 里的 pyvenv.cfg 记录的是构建机的 Python 路径，装到别的机器上引导器
@@ -34,6 +35,18 @@ foreach ($leak in @("venv", "chrome_profile")) {
   }
 }
 Write-Host ("      files: " + (Get-ChildItem $sideDst -Recurse -File).Count)
+
+Write-Host "      bundled Python + locked dependencies -> product"
+& node (Join-Path $Src "build\python\prepare-runtime.mjs")
+if ($LASTEXITCODE -ne 0) { throw "Bundled Python preparation failed" }
+$pythonSrc = Join-Path $Src "resources\python"
+$pythonDst = Join-Path $Prod "resources\app\resources\python"
+robocopy $pythonSrc $pythonDst /E /NFL /NDL /NJH /NJS | Out-Null
+if ($LASTEXITCODE -ge 8) { throw "Bundled Python copy failed" }
+& (Join-Path $pythonDst "python.exe") -I -B -X utf8 (Join-Path $sideDst "check_deps.py")
+if ($LASTEXITCODE -ne 0) { throw "Packaged Python dependency verification failed" }
+& (Join-Path $pythonDst "python.exe") -I -B -X utf8 (Join-Path $Src "build\python\verify-runtime.py") $Src
+if ($LASTEXITCODE -ne 0) { throw "Packaged Python lock/native module verification failed" }
 
 Write-Host "[2/5] external node_modules -> product"
 $nmDst = Join-Path $extProd "node_modules"

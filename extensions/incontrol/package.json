@@ -152,7 +152,7 @@
         "incontrol.sidecar.pythonPath": {
           "type": "string",
           "default": "",
-          "description": "Python 解释器路径。留空时按优先级自动探测：随包分发的内置 Python → sidecar 自建 venv → 系统已安装的 Python（含 py 启动器）。候选会实际校验版本（>= 3.10）与依赖完整性，不可用的会被跳过并记录原因。"
+          "description": "Python 解释器路径（可选覆盖）。留空时优先使用随 Wibe 安装的独立 Python 和依赖，无需安装系统 Python。仅未提供内置运行时的开发环境会探测系统 Python 和本地 venv；内置运行时损坏时请重新安装完整的 Wibe 安装包。候选会校验版本（>= 3.10）与依赖完整性。"
         },
         "incontrol.bridge.modelRoutes": {
           "type": "object",

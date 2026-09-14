@@ -93,6 +93,7 @@ export class SidecarManager {
 		args: string[],
 		cwd: string,
 		timeoutMs: number,
+		env: NodeJS.ProcessEnv = process.env,
 	): Promise<{ code: number | null; stdout: string; stderr: string; spawnError?: string }> {
 		return new Promise(resolve => {
 			let settled = false;
@@ -106,6 +107,7 @@ export class SidecarManager {
 
 			const child = spawn(exe, args, {
 				cwd,
+				env,
 				windowsHide: true,
 				stdio: ['ignore', 'pipe', 'pipe'],
 			});
@@ -134,6 +136,33 @@ export class SidecarManager {
 		return /No Python at\s/i.test(stderr || '');
 	}
 
+	/** Bundled Python is relocatable and must never inherit a system/Conda Python environment. */
+	private bundledPython(): string {
+		return path.resolve(this.opts.sidecarRoot, '..', 'python', process.platform === 'win32' ? 'python.exe' : 'bin/python3');
+	}
+
+	private isBundledPython(executable: string): boolean {
+		const resolved = path.resolve(executable);
+		const bundled = this.bundledPython();
+		return process.platform === 'win32' ? resolved.toLowerCase() === bundled.toLowerCase() : resolved === bundled;
+	}
+
+	private pythonEnvironment(executable: string): NodeJS.ProcessEnv {
+		const env = { ...process.env };
+		if (this.isBundledPython(executable)) {
+			for (const key of Object.keys(env)) {
+				if (/^PYTHON/i.test(key)) { delete env[key]; }
+			}
+		}
+		return env;
+	}
+
+	private pythonArguments(executable: string, args: string[]): string[] {
+		// -I ignores PYTHONHOME/PYTHONPATH/user site; -B permits read-only installation directories.
+		// Encoding and unbuffered output use flags because isolated mode ignores PYTHON* variables.
+		return this.isBundledPython(executable) ? ['-I', '-B', '-X', 'utf8', '-u', ...args] : args;
+	}
+
 	/**
 	 * 探测解释器是否**真的可用**。
 	 *
@@ -147,9 +176,10 @@ export class SidecarManager {
 		// 1) 版本门槛：低于要求的版本直接排除
 		const ver = await SidecarManager.run(
 			pythonPath,
-			['-c', `import sys; raise SystemExit(0 if sys.version_info >= ${MIN_PYTHON_TUPLE} else 1)`],
+			this.pythonArguments(pythonPath, ['-c', `import sys; raise SystemExit(0 if sys.version_info >= ${MIN_PYTHON_TUPLE} else 1)`]),
 			this.opts.sidecarRoot,
 			10_000,
+			this.pythonEnvironment(pythonPath),
 		);
 		if (ver.spawnError) {
 			return { ok: false, reason: `无法执行（${ver.spawnError}）` };
@@ -168,11 +198,12 @@ export class SidecarManager {
 		//    避免在 TS 里再维护一份依赖清单 —— requirements.txt 是唯一事实来源
 		const checkScript = path.join(this.opts.sidecarRoot, 'check_deps.py');
 		if (!fs.existsSync(checkScript)) {
-			// 旧版 sidecar 没有这个脚本：只能卡版本，依赖问题留给运行时暴露
+			if (this.isBundledPython(pythonPath)) { return { ok: false, reason: '安装包缺少 check_deps.py，请重新安装完整的 Wibe 安装包' }; }
+			// 旧版开发环境保留兼容；发行包必须包含依赖检测脚本
 			this.log(`python: 未找到 ${checkScript}，跳过依赖完整性检查`);
 			return { ok: true };
 		}
-		const deps = await SidecarManager.run(pythonPath, [checkScript], this.opts.sidecarRoot, 30_000);
+		const deps = await SidecarManager.run(pythonPath, this.pythonArguments(pythonPath, [checkScript]), this.opts.sidecarRoot, 30_000, this.pythonEnvironment(pythonPath));
 		if (deps.spawnError || deps.code !== 0) {
 			const detail = (deps.stdout || deps.stderr || '').trim().split('\n').pop() ?? '';
 			return { ok: false, reason: detail ? `依赖不完整（${detail}）` : '依赖不完整' };
@@ -181,10 +212,9 @@ export class SidecarManager {
 	}
 
 	/**
-	 * 系统环境变量里声明的解释器 —— 默认来源。
+	 * 系统环境变量里声明的解释器 —— 未提供内置运行时的开发环境回退来源。
 	 *
-	 * 约定：Windows 上 Python 已配置进系统环境变量（PATH 里有 python.exe），
-	 * 因此这一组排在最前。随包/vnev 里的解释器只在环境变量里找不到可用项时才用。
+	 * 仅当未随产品分发内置运行时时才探测系统环境变量。
 	 *
 	 * 覆盖：
 	 *   PYTHON / PYTHON_EXE  显式指定解释器（可指到 exe，也可指到安装根目录）
@@ -261,7 +291,7 @@ export class SidecarManager {
 	}
 
 	/**
-	 * 随产品分发 / 随 sidecar 生成的解释器 —— 兜底，排最后。
+	 * 随 sidecar 生成的开发环境解释器 —— 兜底，排最后。
 	 *
 	 * sidecar 自建 venv 尤其不能排在前面：发行包里混进过开发机的 venv
 	 * （pyvenv.cfg 指向不存在的基础解释器，引导器直接退码 103），而它因为
@@ -271,8 +301,6 @@ export class SidecarManager {
 		const win = process.platform === 'win32';
 		const exe = win ? 'python.exe' : 'python';
 		return [
-			// 随产品分发的 embeddable Python（当前构建未提供，保留以便将来启用）
-			path.join(this.opts.sidecarRoot, '..', 'python', exe),
 			// sidecar 自建 venv（start.py 跑过之后会有）
 			path.join(this.opts.sidecarRoot, 'venv', win ? 'Scripts' : 'bin', exe),
 		];
@@ -301,16 +329,8 @@ export class SidecarManager {
 	}
 
 	/**
-	 * 选解释器：按优先级逐个探测，返回第一个**真正可用**的。
-	 *
-	 * 顺序：用户显式指定 → 系统环境变量（PATH / PYTHON / PYTHONHOME）→ py 启动器
-	 *       → 常见安装目录 → 随包/venv 兜底。
-	 *
-	 * 与旧实现的两个关键差别：
-	 *   1) 系统环境变量（Windows 默认已配置 Python）优先于随包 venv。此前 venv
-	 *      排在第二，一个坏掉的 venv 就能把启动拖成超时。
-	 *   2) 不再"存在即采用"。坏掉的 venv 会被跳过并记下原因，而不是把问题拖到
-	 *      60 秒后以启动超时的形式呈现。
+	 * Explicit override -> bundled runtime -> system Python -> local development venv.
+	 * A present but damaged bundle fails closed instead of silently selecting an unrelated Python.
 	 */
 	private async resolvePython(): Promise<string | undefined> {
 		const seen = new Set<string>();
@@ -340,10 +360,15 @@ export class SidecarManager {
 			if (hit) { return hit; }
 		}
 
-		// 系统环境变量（PATH / PYTHON / PYTHONHOME）：Windows 默认已配置 Python
-		// 环境变量，这是主来源。同样要先探测 —— 旧实现直接采用 PATH 上的第一个
-		// python.exe，于是选中了没有 DrissionPage 的 conda Python 3.8，把
-		// "环境不对"伪装成了 import 报错。
+		const bundled = this.bundledPython();
+		if (fs.existsSync(path.dirname(bundled))) {
+			const hit = await firstViable([bundled]);
+			if (hit) { return hit; }
+			this.log('内置 Python 运行时损坏或依赖不完整，请重新安装完整的 Wibe 安装包；不会回退到系统 Python。');
+			return undefined;
+		}
+
+		// Compatibility for source checkouts and platforms without a bundled runtime.
 		const viaEnv = await firstViable(this.listEnvCandidates());
 		if (viaEnv) { return viaEnv; }
 
@@ -355,7 +380,7 @@ export class SidecarManager {
 		const viaInstalled = await firstViable(this.listInstalledCandidates());
 		if (viaInstalled) { return viaInstalled; }
 
-		// 随包分发的内置 Python / sidecar 自建 venv —— 兜底，排最后
+		// sidecar 自建 venv —— 仅用于开发环境兜底
 		const viaPackaged = await firstViable(this.listPackagedCandidates());
 		if (viaPackaged) { return viaPackaged; }
 
@@ -364,7 +389,7 @@ export class SidecarManager {
 			this.log(`  当前 incontrol.sidecar.pythonPath 指向 "${explicit}"，但该解释器不可用。`);
 		}
 		this.log('  处理方式（任选其一）：');
-		this.log('    1) 把 Python 加入系统环境变量 PATH（默认约定；python.org 安装时勾选 Add python.exe to PATH）');
+		this.log('    1) Windows x64 用户请重新安装包含内置 Python 的完整 Wibe 安装包；开发者运行 node build/python/prepare-runtime.mjs');
 		this.log(`    2) 运行 ${path.join(this.opts.sidecarRoot, 'start.py')} 自动创建 venv 并安装依赖`);
 		this.log('    3) 在设置 incontrol.sidecar.pythonPath 中指定一个已装好依赖的解释器');
 		for (const f of failures.slice(0, 5)) {
@@ -428,10 +453,11 @@ export class SidecarManager {
 
 		const entry = path.join(this.opts.sidecarRoot, 'main.py');
 		this.log(`spawning: ${python} ${entry} (port ${this.port})`);
-		this.proc = spawn(python, [entry], {
+		this.proc = spawn(python, this.pythonArguments(python, [entry]), {
 			cwd: this.opts.sidecarRoot,
+			windowsHide: true,
 			env: {
-				...process.env,
+				...this.pythonEnvironment(python),
 				APP_PORT: String(this.port),
 				BROWSER_PORT: String(browserPort),
 				// ide 模式是本项目为 IDE 场景新增的历史模式
