@@ -452,6 +452,22 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 		];
 		let all = es.merge(...mergeStreams);
 
+		// Sidecar source and Python must remain real files, outside node_modules.asar.
+		if (platform === 'win32' && arch === 'x64') {
+			all = es.merge(all, gulp.src([
+				'resources/python/**',
+				'resources/uwa-sidecar/**',
+				'!resources/uwa-sidecar/**/{__pycache__,venv,.venv,.git,chrome_profile,logs,temp,tmp,scratch,download_images,tests,node_modules,backup_*}/**',
+				'!resources/uwa-sidecar/**/*.{pyc,pyo,log,bak,tmp}',
+				'!resources/uwa-sidecar/**/*.local*',
+				'!resources/uwa-sidecar/**/.*',
+				'!resources/uwa-sidecar/config/{marketplace_cache,app_stats,request_history,commands}.json',
+				'!resources/uwa-sidecar/**/.env',
+				'!resources/uwa-sidecar/**/.env.*',
+				'resources/uwa-sidecar/.env.example'
+			], { base: '.', dot: true }));
+		}
+
 		if (platform === 'win32') {
 			all = es.merge(all, gulp.src([
 				'resources/win32/bower.ico',
@@ -718,6 +734,13 @@ BUILD_TARGETS.forEach(buildTarget => {
 		const destinationFolderName = `VSCode${dashed(platform)}${dashed(arch)}`;
 
 		const packageTasks: task.Task[] = [
+			async () => {
+				if (platform === 'win32' && arch === 'x64') {
+					await promisify(cp.execFile)(process.execPath, [path.join(root, 'build/python/prepare-runtime.mjs')], {
+						cwd: root, timeout: 1_800_000, maxBuffer: 10 * 1024 * 1024
+					});
+				}
+			},
 			compileNativeExtensionsBuildTask,
 			util.rimraf(path.join(buildRoot, destinationFolderName)),
 			packageTask(platform, arch, sourceFolderName, destinationFolderName, opts),

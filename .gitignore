@@ -102,3 +102,7 @@ resources/uwa-sidecar/chrome_profile*/
 /bridge/
 /core/
 /gui/
+# Wibe bundled Python is generated and hash-verified by build/python/prepare-runtime.mjs
+/resources/python/
+/resources/.python-stage-*/
+/resources/python.previous-*/
