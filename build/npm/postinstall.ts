@@ -10,6 +10,7 @@ import * as child_process from 'child_process';
 import { dirs } from './dirs.ts';
 import { root, stateFile, stateContentsFile, computeState, computeContents, isUpToDate } from './installStateHash.ts';
 import { ensureElectronTypes } from './electronTypes.ts';
+import { patchWindowsSdkDiscovery } from './windowsSdk.ts';
 
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const rootNpmrcConfigKeys = getNpmrcConfigKeys(path.join(root, '.npmrc'));
@@ -239,6 +240,7 @@ async function runWithConcurrency(tasks: (() => Promise<void>)[], concurrency: n
 }
 
 async function main() {
+	patchWindowsSdkDiscovery(root);
 	await ensureElectronTypes();
 
 	if (!process.env['VSCODE_FORCE_INSTALL'] && isUpToDate()) {
