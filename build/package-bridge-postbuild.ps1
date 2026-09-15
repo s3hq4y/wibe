@@ -59,7 +59,17 @@ foreach($pkg in $pkgs){
   foreach($r in $roots){ $c = Join-Path $r $pkg; if(Test-Path $c){ $from = $c; break } }
   if(-not $from){ throw "Required extension runtime dependency missing: $pkg" }
   $to = Join-Path $nmDst $pkg
-  robocopy $from $to /E /R:2 /W:2 /NFL /NDL /NJH /NJS /XD test tests docs /XF *.md *.map | Out-Null
+  # win-ca postinstall exports the build machine certificate store to pem/.
+  # Never distribute that machine-specific cache; retain the runtime API.
+  $excludedDirs = @("test", "tests", "docs")
+  if ($pkg -eq "win-ca") {
+    $excludedDirs += "pem"
+    $certificateCache = Join-Path $to "pem"
+    if (Test-Path -LiteralPath $certificateCache) {
+      Remove-Item -LiteralPath $certificateCache -Recurse -Force
+    }
+  }
+  robocopy $from $to /E /R:2 /W:2 /NFL /NDL /NJH /NJS /XD $excludedDirs /XF *.md *.map | Out-Null
   if ($LASTEXITCODE -ge 8) { throw "Runtime dependency copy failed: $pkg" }
 }
 # 棰勭紪璇戜簩杩涘埗涓嶈兘琚繃婊ゆ帀
