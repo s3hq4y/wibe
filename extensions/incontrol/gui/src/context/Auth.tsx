@@ -77,8 +77,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         ideMessenger.post("showToast", [
           "info",
           result.modelCount > 0
-            ? t("Models refreshed: {0} available", result.modelCount)
-            : t("Models refreshed, but none are configured yet"),
+            ? t("Model configuration reloaded: {0} available. Only AUTODETECT queries the service.", result.modelCount)
+            : t("No models returned. Check the service connection and AUTODETECT configuration."),
         ]);
         return result;
       } catch (e) {

@@ -18,6 +18,9 @@ export const generateToolsSystemMessage = (
   const instructions: string[] = [];
   instructions.push(TOOL_INSTRUCTIONS_TAG);
   instructions.push(framework.systemMessagePrefix);
+  if (tools.some((tool) => tool.function.name === BuiltInToolNames.MultiEdit)) {
+    instructions.push("For file changes, use the structured Edit/MultiEdit tools rather than terminal commands or scripts. They preserve before/after snapshots for a visible diff and safe undo. Use the terminal for running commands, not as a substitute for file editing.");
+  }
 
   if (slimToolDescriptions) {
     // Compact directory: one line per tool. Call syntax (prefix, generic

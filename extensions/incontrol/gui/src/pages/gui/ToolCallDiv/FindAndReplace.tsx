@@ -1,6 +1,5 @@
 import { ChevronDownIcon } from "@heroicons/react/24/outline";
 import { ApplyState } from "core";
-import { trimEmptyLines } from "core/edit/searchAndReplace/findAndReplaceUtils";
 import { executeFindAndReplace } from "core/edit/searchAndReplace/performReplace";
 import { EditOperation } from "core/tools/definitions/multiEdit";
 import { renderContextItems } from "core/util/messageContent";
@@ -10,12 +9,13 @@ import { useContext, useMemo, useState } from "react";
 import { ApplyActions } from "../../../components/StyledMarkdownPreview/StepContainerPreToolbar/ApplyActions";
 import { FileInfo } from "../../../components/StyledMarkdownPreview/StepContainerPreToolbar/FileInfo";
 import { IdeMessengerContext } from "../../../context/IdeMessenger";
-import { useAppSelector } from "../../../redux/hooks";
+import { useAppDispatch, useAppSelector } from "../../../redux/hooks";
 import {
   selectApplyStateByToolCallId,
   selectToolCallById,
 } from "../../../redux/selectors/selectToolCalls";
-import { cn } from "../../../util/cn";
+import { setProcessedToolCallArgs, updateToolCallOutput } from "../../../redux/slices/sessionSlice";
+import { EditDiff } from "./EditDiff";
 import { getStatusIcon } from "./utils";
 import { t } from "../../../i18n";
 
@@ -27,48 +27,6 @@ interface FindAndReplaceDisplayProps {
   edits: EditOperation[];
   toolCallId: string;
   historyIndex: number;
-}
-
-const MAX_SAME_LINES = 2;
-
-function EllipsisLine() {
-  return (
-    <div className="text-description-muted px-3 py-1 text-left font-mono">
-      ⋯
-    </div>
-  );
-}
-
-function DiffLines({
-  lines,
-  className = "",
-  diffChar = " ",
-  diffCharClass = "text-description-muted",
-}: {
-  lines: string[];
-  diffChar?: string;
-  diffCharClass?: string;
-  className?: string;
-}) {
-  return (
-    <>
-      {lines.map((line, lineIndex) => {
-        const isLastPartLine = lineIndex === lines.length - 1;
-        if (line === "" && isLastPartLine) return null;
-        return (
-          <div
-            key={lineIndex}
-            className={cn("text-foreground px-3 py-px font-mono", className)}
-          >
-            <span className={cn("mr-2 select-none", diffCharClass)}>
-              {diffChar}
-            </span>
-            {line}
-          </div>
-        );
-      })}
-    </>
-  );
 }
 
 function DiffStats({ added, removed }: { added: number; removed: number }) {
@@ -95,6 +53,7 @@ export function FindAndReplaceDisplay({
 }: FindAndReplaceDisplayProps) {
   const [isExpanded, setIsExpanded] = useState<boolean | undefined>(undefined);
   const ideMessenger = useContext(IdeMessengerContext);
+  const dispatch = useAppDispatch();
   const applyState: ApplyState | undefined = useAppSelector((state) =>
     selectApplyStateByToolCallId(state, toolCallId),
   );
@@ -102,8 +61,33 @@ export function FindAndReplaceDisplay({
   const toolCallState = useAppSelector((state) =>
     selectToolCallById(state, toolCallId),
   );
-  const showContent = isExpanded ?? toolCallState?.status === "generated";
-  const config = useAppSelector((state) => state.config.config);
+  const showContent = isExpanded ?? ["generated", "calling", "done"].includes(toolCallState?.status ?? "");
+  const [undoState, setUndoState] = useState<"idle" | "busy" | "done">("idle");
+  const [undoMessage, setUndoMessage] = useState("");
+  const alreadyUndone = toolCallState?.processedArgs?.editUndone === true;
+  async function undoCompletedEdit() {
+    if (!fileUri || typeof editingFileContents !== "string" || typeof newFileContents !== "string" || (undoState !== "idle" || alreadyUndone)) return;
+    setUndoState("busy");
+    try {
+      const response = await ideMessenger.request("edit/undoCompleted", {
+        filepath: fileUri, before: editingFileContents, after: newFileContents,
+      });
+      if (response.status !== "success") throw new Error(String(response.error));
+      if (!response.content.ok) throw new Error(response.content.message);
+      dispatch(setProcessedToolCallArgs({ toolCallId, newArgs: {
+        ...toolCallState?.processedArgs, editUndone: true,
+      } }));
+      dispatch(updateToolCallOutput({ toolCallId, contextItems: [{
+        name: "Edit undone", description: fileUri,
+        content: `The user undid this edit to ${fileUri}. Read the file again before editing it.`, hidden: true,
+      }] }));
+      setUndoState("done");
+      setUndoMessage(response.content.saved ? t("Edit undone") : t("Edit undone in editor; save the file to persist it"));
+    } catch (error) {
+      setUndoState("idle");
+      setUndoMessage(error instanceof Error ? t(error.message) : String(error));
+    }
+  }
 
   const displayName = useMemo(() => {
     if (fileUri) {
@@ -117,7 +101,7 @@ export function FindAndReplaceDisplay({
 
   // Get file content from tool call state instead of reading file
   const currentFileContent = useMemo(() => {
-    if (editingFileContents) {
+    if (typeof editingFileContents === "string") {
       return editingFileContents;
     }
     if (Array.isArray(edits)) {
@@ -237,6 +221,14 @@ export function FindAndReplaceDisplay({
           <DiffStats added={diffStats.added} removed={diffStats.removed} />
         </div>
 
+        {toolCallState?.status === "done" && applyState?.status === "closed" &&
+          typeof editingFileContents === "string" && typeof newFileContents === "string" && (
+          <button type="button" disabled={undoState !== "idle" || alreadyUndone}
+            className="text-link cursor-pointer border-none bg-transparent text-xs"
+            onClick={(event) => { event.stopPropagation(); void undoCompletedEdit(); }}>
+            {undoState === "done" || alreadyUndone ? t("Edit undone") : undoState === "busy" ? t("Undoing edit…") : t("Undo edit")}
+          </button>
+        )}
         {applyState && (
           <ApplyActions
             onClickAccept={() => {
@@ -256,6 +248,7 @@ export function FindAndReplaceDisplay({
           />
         )}
       </div>
+      {undoMessage && <div role="status" className="text-description px-3 py-2 text-xs">{undoMessage}</div>}
       {showContent ? content : null}
     </div>
   );
@@ -278,66 +271,5 @@ export function FindAndReplaceDisplay({
     );
   }
 
-  return renderContainer(
-    <div
-      className={`${config?.ui?.showChatScrollbar ? "thin-scrollbar" : "no-scrollbar"} max-h-72 overflow-auto`}
-    >
-      <pre
-        className={`bg-editor m-0 w-fit min-w-full text-xs leading-tight ${config?.ui?.codeWrap ? "whitespace-pre-wrap" : "whitespace-pre"}`}
-      >
-        {diffResult.diff?.map((part, index) => {
-          if (part.removed) {
-            return (
-              <DiffLines
-                key={index}
-                lines={part.value.split("\n")}
-                className="border-l-4 border-red-900 bg-red-900/30"
-                diffCharClass="text-red-600"
-                diffChar="-"
-              />
-            );
-          } else if (part.added) {
-            return (
-              <DiffLines
-                key={index}
-                lines={part.value.split("\n")}
-                diffCharClass="text-green-600"
-                className="border-l-4 border-green-600 bg-green-600/20"
-                diffChar="+"
-              />
-            );
-          } else {
-            const isFirst = index === 0;
-            const isLast = index === diffResult.diff.length - 1;
-            const lines = part.value.split("\n");
-            const showStartEllipsis = isFirst && lines.length > MAX_SAME_LINES;
-            const showEndEllipsis = isLast && lines.length > MAX_SAME_LINES;
-            const showMiddleEllipses =
-              !isFirst && !isLast && lines.length > MAX_SAME_LINES * 2 + 1;
-
-            let startLines = showStartEllipsis
-              ? lines.slice(-MAX_SAME_LINES)
-              : showMiddleEllipses || showEndEllipsis
-                ? lines.slice(0, MAX_SAME_LINES)
-                : lines;
-            startLines = trimEmptyLines({ lines: startLines, fromEnd: false });
-            let endLines = showMiddleEllipses
-              ? lines.slice(-MAX_SAME_LINES)
-              : [];
-            endLines = trimEmptyLines({ lines: endLines, fromEnd: true });
-
-            return (
-              <div key={index}>
-                {showStartEllipsis && <EllipsisLine />}
-                <DiffLines lines={startLines} />
-                {showMiddleEllipses && <EllipsisLine />}
-                <DiffLines lines={endLines} />
-                {showEndEllipsis && <EllipsisLine />}
-              </div>
-            );
-          }
-        })}
-      </pre>
-    </div>,
-  );
+  return renderContainer(<EditDiff parts={diffResult.diff} />);
 }

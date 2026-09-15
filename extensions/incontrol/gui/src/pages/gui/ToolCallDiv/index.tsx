@@ -60,7 +60,8 @@ export function ToolCallDiv({
       );
     }
 
-    if (icon) {
+    if (icon && functionName !== BuiltInToolNames.SingleFindAndReplace &&
+        functionName !== BuiltInToolNames.MultiEdit && functionName !== BuiltInToolNames.RunTerminalCommand && functionName !== BuiltInToolNames.EditExistingFile) {
       return (
         <SimpleToolCallUI
           tool={tool}

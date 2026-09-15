@@ -102,6 +102,12 @@ describe("multiEditImpl GUI specific", () => {
       expect(mockExtras.ideMessenger.ide.readFile).toHaveBeenCalledWith(
         "file:///dir/test/file.txt",
       );
+      expect(mockExtras.dispatch).toHaveBeenCalledWith(expect.objectContaining({
+        type: "session/setProcessedToolCallArgs",
+        payload: expect.objectContaining({ toolCallId: "id", newArgs: expect.objectContaining({
+          editingFileContents: "Hello world", newFileContents: "Hi world", fileUri: "file:///dir/test/file.txt",
+        }) }),
+      }));
       expect(mockApplyForEditTool).toHaveBeenCalledWith({
         streamId: "test-uuid",
         toolCallId: "id",

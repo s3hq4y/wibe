@@ -1,5 +1,6 @@
 import { ConfigHandler } from "core/config/ConfigHandler";
 import { DataLogger } from "core/data/log";
+import { undoSnapshotError } from "core/edit/undoSnapshot";
 import { EDIT_MODE_STREAM_ID } from "core/edit/constants";
 import {
   FromCoreProtocol,
@@ -118,6 +119,27 @@ export class VsCodeMessenger {
         filepath,
         streamId,
       );
+    });
+
+    this.onWebview("edit/undoCompleted", async ({ data }) => {
+      const invalid = undoSnapshotError(data.before, data.after);
+      if (typeof data.filepath !== "string" || invalid) {
+        return { ok: false, message: invalid ?? "Invalid or oversized edit snapshot" };
+      }
+      const uri = vscode.Uri.parse(data.filepath);
+      if (uri.scheme !== "file" || !vscode.workspace.getWorkspaceFolder(uri)) {
+        return { ok: false, message: "Undo is limited to files in the current workspace" };
+      }
+      const document = await vscode.workspace.openTextDocument(uri);
+      const conflict = undoSnapshotError(data.before, data.after, document.getText());
+      if (conflict) return { ok: false, message: conflict };
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), data.before);
+      // WorkspaceEdit captures the open document version; conflicting edits are rejected by VS Code.
+      if (!(await vscode.workspace.applyEdit(edit))) {
+        return { ok: false, message: "The editor could not apply undo; the file may have changed" };
+      }
+      return { ok: true, saved: await document.save() };
     });
 
     this.onWebview("rejectDiff", async ({ data: { filepath, streamId } }) => {
