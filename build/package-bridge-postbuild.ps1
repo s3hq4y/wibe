@@ -23,7 +23,7 @@ $extProd = Join-Path $Prod "resources\app\extensions\incontrol"
 Write-Host "[1/5] uwa-sidecar -> product"
 $sideSrc = Join-Path $Src  "resources\uwa-sidecar"
 $sideDst = Join-Path $Prod "resources\app\resources\uwa-sidecar"
-robocopy $sideSrc $sideDst /E /NFL /NDL /NJH /NJS /XD __pycache__ .git chrome_profile venv .venv logs temp tmp scratch download_images node_modules tests /XF *.pyc *.pyo .env .env.* *.local* *.log *.bak *.tmp .agent_bridge.json marketplace_cache.json app_stats.json request_history.json commands.json | Out-Null
+robocopy $sideSrc $sideDst /E /R:2 /W:2 /NFL /NDL /NJH /NJS /XD __pycache__ .git chrome_profile venv .venv logs temp tmp scratch download_images node_modules tests /XF *.pyc *.pyo .env .env.* *.local* *.log *.bak *.tmp .agent_bridge.json marketplace_cache.json app_stats.json request_history.json commands.json | Out-Null
 if ($LASTEXITCODE -ge 8) { throw "uwa-sidecar copy failed" }
 if(-not (Test-Path (Join-Path $sideDst "start.py"))){ throw "uwa-sidecar copy failed" }
 # venv/chrome_profile 是本机运行时产物，绝不该进发行包：
@@ -41,7 +41,7 @@ Write-Host "      bundled Python + locked dependencies -> product"
 if ($LASTEXITCODE -ne 0) { throw "Bundled Python preparation failed" }
 $pythonSrc = Join-Path $Src "resources\python"
 $pythonDst = Join-Path $Prod "resources\app\resources\python"
-robocopy $pythonSrc $pythonDst /E /NFL /NDL /NJH /NJS | Out-Null
+robocopy $pythonSrc $pythonDst /E /R:2 /W:2 /NFL /NDL /NJH /NJS | Out-Null
 if ($LASTEXITCODE -ge 8) { throw "Bundled Python copy failed" }
 & (Join-Path $pythonDst "python.exe") -I -B -X utf8 (Join-Path $sideDst "check_deps.py")
 if ($LASTEXITCODE -ne 0) { throw "Packaged Python dependency verification failed" }
@@ -57,12 +57,25 @@ $pkgs  = @("sqlite3","web-tree-sitter","tree-sitter-wasms","win-ca",
 foreach($pkg in $pkgs){
   $from = $null
   foreach($r in $roots){ $c = Join-Path $r $pkg; if(Test-Path $c){ $from = $c; break } }
-  if(-not $from){ Write-Host "      MISSING $pkg"; continue }
+  if(-not $from){ throw "Required extension runtime dependency missing: $pkg" }
   $to = Join-Path $nmDst $pkg
-  robocopy $from $to /E /NFL /NDL /NJH /NJS /XD test tests docs /XF *.md *.map | Out-Null
+  # win-ca postinstall exports the build machine certificate store to pem/.
+  # Never distribute that machine-specific cache; retain the runtime API.
+  $excludedDirs = @("test", "tests", "docs")
+  if ($pkg -eq "win-ca") {
+    $excludedDirs += "pem"
+    $certificateCache = Join-Path $to "pem"
+    if (Test-Path -LiteralPath $certificateCache) {
+      Remove-Item -LiteralPath $certificateCache -Recurse -Force
+    }
+  }
+  robocopy $from $to /E /R:2 /W:2 /NFL /NDL /NJH /NJS /XD $excludedDirs /XF *.md *.map | Out-Null
+  if ($LASTEXITCODE -ge 8) { throw "Runtime dependency copy failed: $pkg" }
 }
 # 棰勭紪璇戜簩杩涘埗涓嶈兘琚繃婊ゆ帀
-$binSrc = Join-Path $extSrc "core\node_modules\sqlite3\build\Release\vscode-sqlite3.node"
+# Use the root binary built against Electron, not the extension build-Node ABI.
+$binSrc = Join-Path $Src "node_modules\@vscode\sqlite3\build\Release\vscode-sqlite3.node"
+if (-not (Test-Path $binSrc)) { throw "Electron-targeted sqlite3 native binary missing" }
 $binDst = Join-Path $nmDst  "sqlite3\build\Release\vscode-sqlite3.node"
 New-Item -ItemType Directory -Force -Path (Split-Path $binDst) | Out-Null
 Copy-Item $binSrc $binDst -Force
@@ -73,7 +86,8 @@ Write-Host "[3/5] incontrol dist -> product"
 $distSrc = Join-Path $extSrc  "dist"
 $distDst = Join-Path $extProd "dist"
 if(Test-Path $distSrc){
-  robocopy $distSrc $distDst /E /NFL /NDL /NJH /NJS | Out-Null
+  robocopy $distSrc $distDst /E /R:2 /W:2 /NFL /NDL /NJH /NJS | Out-Null
+  if ($LASTEXITCODE -ge 8) { throw "Extension dist copy failed" }
 }
 if(-not (Test-Path (Join-Path $distDst "extension.js"))){ throw "dist/extension.js missing in product" }
 
@@ -133,7 +147,7 @@ if (Test-Path (Join-Path $ptyBin "conpty.node")) {
     node $reg
   }
 } else {
-  Write-Host "      WARN: conpty.node not built; terminal will not launch"
+  throw "conpty.node not built; refusing to package a broken terminal"
 }
 
 Write-Host "[5/5] native-keymap / native-is-elevated native modules -> product"
@@ -208,6 +222,19 @@ foreach($m in @("sqlite3","web-tree-sitter","win-ca")){
   Write-Host ("      {0,-18} {1}" -f $m, $r)
 }
 Pop-Location
+# Validate against the shipped Electron ABI, never against the build Node.
+$productConfig = [IO.File]::ReadAllText((Join-Path $Src "product.json")) | ConvertFrom-Json
+$electronExe = Join-Path $Prod ($productConfig.nameShort + ".exe")
+$previousRunAsNode = $env:ELECTRON_RUN_AS_NODE
+try {
+  $env:ELECTRON_RUN_AS_NODE = "1"
+  $checkScript = Join-Path $Src "build\verify-windows-native.cjs"
+  $checkArgs = @(('"' + $checkScript + '"'), ('"' + $Prod + '"'))
+  $validation = Start-Process -FilePath $electronExe -ArgumentList $checkArgs -WorkingDirectory $Src -NoNewWindow -Wait -PassThru
+  if ($validation.ExitCode -ne 0) { throw "Packaged Electron native validation failed (exit $($validation.ExitCode))" }
+} finally {
+  $env:ELECTRON_RUN_AS_NODE = $previousRunAsNode
+}
 Write-Host "post-build done."
 
 

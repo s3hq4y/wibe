@@ -15,13 +15,25 @@ for %%I in ("!SCRIPT_DIR!.") do cd /d "%%~fI"
 set "PROJECT_DIR=%cd%"
 set "SCRIPT_DIR="
 
-REM Prefer the Python launcher when an interpreter is already available.
-REM This avoids CMD argument parsing differences while keeping the legacy bootstrap
-REM below as a fallback for machines that still need Python discovery or install.
+REM Pick a bootstrap interpreter, preferring the newest available.
+REM Do NOT just use whatever "python" resolves to on PATH: it may be 3.8/3.9,
+REM and a venv built from it cannot satisfy requirements.txt (>= 3.10). The
+REM py launcher is tried first because it also covers interpreters installed
+REM outside the default location. Version policy itself lives in start.py
+REM (MIN_PYTHON) -- it refuses a too-old interpreter and offers to install one,
+REM so this block only needs to hand over the best candidate it can find.
 if exist "start.py" (
-    python -c "import sys" >nul 2>&1
-    if not errorlevel 1 (
-        python start.py %*
+    set "BOOTSTRAP_PY="
+    for %%V in (3.13 3.12 3.11 3.10) do (
+        if not defined BOOTSTRAP_PY (
+            py -%%V -c "import sys" >nul 2>&1 && set "BOOTSTRAP_PY=py -%%V"
+        )
+    )
+    if not defined BOOTSTRAP_PY (
+        python -c "import sys" >nul 2>&1 && set "BOOTSTRAP_PY=python"
+    )
+    if defined BOOTSTRAP_PY (
+        !BOOTSTRAP_PY! start.py %*
         exit /b !errorlevel!
     )
 )

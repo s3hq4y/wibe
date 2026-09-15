@@ -106,3 +106,6 @@ resources/uwa-sidecar/chrome_profile*/
 /resources/python/
 /resources/.python-stage-*/
 /resources/python.previous-*/
+
+# Local project execution notes (never commit)
+/arena.md

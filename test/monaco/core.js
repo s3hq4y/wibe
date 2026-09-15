@@ -7,7 +7,7 @@ import * as monaco from 'monaco-editor-core';
 
 self.MonacoEnvironment = {
 	getWorkerUrl: function (moduleId, label) {
-		return './editorWebWorkerMain.bundle.js';
+		return './dist/editorWebWorkerMain.bundle.js';
 	}
 };
 
