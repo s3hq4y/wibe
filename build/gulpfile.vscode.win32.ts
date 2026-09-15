@@ -82,6 +82,7 @@ function buildWin32Setup(arch: string, target: string): task.CallbackTask {
 		productJson['target'] = target;
 
 		const definitions: Record<string, unknown> = {
+			LicenseFileName: product.licenseFileName,
 			NameLong: product.nameLong,
 			NameShort: product.nameShort,
 			DirName: product.win32DirName,
