@@ -16,7 +16,9 @@ assert.equal(process.versions.electron, target, 'Electron must match native buil
 const load = name => require(path.join(app, 'node_modules.asar', name));
 async function main() {
   const keymap = load('native-keymap');
-  assert.ok(keymap.getKeyMap().length > 0, 'Keyboard scan-code map is empty');
+  const mapping = keymap.getKeyMap();
+  assert.ok(mapping && !Array.isArray(mapping) && Object.keys(mapping).length > 0, 'Keyboard scan-code map is empty');
+  console.log('Keyboard mapping entries: ' + Object.keys(mapping).length);
   assert.ok(keymap.getCurrentKeyboardLayout(), 'Keyboard layout is missing');
   assert.equal(typeof load('native-is-elevated')(), 'boolean');
   console.log('PASS: packaged keyboard mapping and elevation detection');
@@ -48,4 +50,5 @@ async function main() {
   });
   console.log('PASS: packaged ConPTY spawned and completed a command');
 }
-main().catch(error => { console.error(error); process.exitCode = 1; });
+// Native monitoring threads can keep the test process alive after assertions complete.
+main().then(() => process.exit(0), error => { console.error(error); process.exit(1); });
