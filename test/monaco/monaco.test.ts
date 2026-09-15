@@ -10,7 +10,7 @@ import { injectAxe } from 'axe-playwright';
 const PORT = 8563;
 const TIMEOUT = 20 * 1000;
 
-const APP = `http://127.0.0.1:${PORT}/dist/core.html`;
+const APP = `http://127.0.0.1:${PORT}/core.html`;
 
 let browser: playwright.Browser;
 let page: playwright.Page;
@@ -47,10 +47,6 @@ beforeEach(async function () {
 		console.log(e);
 		pageErrors.push(e);
 	});
-	page.on('pageerror', (e) => {
-		console.log(e);
-		pageErrors.push(e);
-	});
 });
 
 afterEach(async () => {
@@ -64,7 +60,9 @@ describe('API Integration Tests', function (): void {
 	this.timeout(TIMEOUT);
 
 	beforeEach(async () => {
-		await page.goto(APP);
+		const response = await page.goto(APP);
+		assert.isTrue(response?.ok(), `Monaco fixture failed to load: ${response?.status()} ${APP}`);
+		await page.waitForFunction(`typeof window.instance !== 'undefined' && window.instance.getModel() !== null`, undefined, { timeout: TIMEOUT });
 	});
 
 	it('`monaco` is not exposed as global', async function (): Promise<any> {
@@ -138,7 +136,6 @@ describe('API Integration Tests', function (): void {
 	});
 	describe('Accessibility', function (): void {
 		beforeEach(async () => {
-			await page.goto(APP);
 			await injectAxe(page);
 			await page.evaluate(`
 			(function () {
