@@ -114,13 +114,16 @@ export function ModelsSection() {
               </Button>
             </div>
           </div>
+          <p className="text-description text-xs">
+            {t("Use model: AUTODETECT to query the service model list. Fixed model names only reload configuration. Keep your API key if authentication is required; image_input does not add vision support to a text-only model.")}
+          </p>
           <pre className="bg-input text-description m-0 overflow-x-auto rounded p-2 text-[11px] leading-snug">
 {`models:
-  - name: My model
-    provider: openai        # anthropic, ollama, gemini, ... (or any OpenAI-compatible)
-    model: gpt-4o
-    apiBase: https://api.openai.com/v1
-    apiKey: \${{ secrets.OPENAI_API_KEY }}
+  - name: Autodetect
+    provider: lmstudio
+    model: AUTODETECT
+    apiBase: http://127.0.0.1:8199/v1
+    capabilities: [image_input]
     roles: [chat, edit, apply]`}
           </pre>
         </div>

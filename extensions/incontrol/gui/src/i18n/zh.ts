@@ -2,6 +2,27 @@
 // missing entry falls back to English rather than breaking the UI.
 
 export const zh: Record<string, string> = {
+"Run {0}": "执行 {0}",
+"Command": "命令",
+
+"Read {0}": "读取 {0}",
+"Reading…": "读取中…",
+"Read failed": "读取失败",
+"Read complete": "读取完成",
+
+"The file has changed since this edit. Undo was stopped to protect newer changes.": "文件已有后续修改，已停止撤销以保护新内容。",
+"Undo is limited to files in the current workspace": "仅支持撤销当前工作区内文件的修改。",
+"The editor could not apply undo; the file may have changed": "无法应用撤销，文件可能已发生变化。",
+"Invalid or oversized edit snapshot": "修改快照无效或过大，无法一键撤销。",
+
+  "No models returned. Check the service connection and AUTODETECT configuration.": "未返回模型，请检查服务连接及 AUTODETECT 配置。",
+"Undo edit": "撤销本次修改",
+"Undoing edit…": "正在撤销…",
+"Edit undone": "已撤销修改",
+"Edit undone in editor; save the file to persist it": "已在编辑器撤销，请保存文件",
+"Model configuration reloaded: {0} available. Only AUTODETECT queries the service.": "模型配置已重载：{0} 个可用。仅 AUTODETECT 会查询服务模型。",
+"Use model: AUTODETECT to query the service model list. Fixed model names only reload configuration. Keep your API key if authentication is required; image_input does not add vision support to a text-only model.": "使用 model: AUTODETECT 查询服务模型列表；固定模型名只会重载配置。接口需要鉴权时请保留 API Key；image_input 不会让纯文本模型获得图片能力。",
+
   "API key": "API 密钥",
   Accept: "接受",
   "Accept Diff": "接受差异",

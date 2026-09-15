@@ -3,6 +3,7 @@ import { executeMultiFindAndReplace } from "core/edit/searchAndReplace/performRe
 import { validateSearchAndReplaceFilepath } from "core/edit/searchAndReplace/validateArgs";
 import { v4 as uuid } from "uuid";
 import { applyForEditTool } from "../../redux/thunks/handleApplyStateUpdate";
+import { setProcessedToolCallArgs } from "../../redux/slices/sessionSlice";
 import { ClientToolImpl } from "./callClientTool";
 
 export const multiEditImpl: ClientToolImpl = async (
@@ -24,6 +25,10 @@ export const multiEditImpl: ClientToolImpl = async (
     edits,
   );
 
+  extras.dispatch(setProcessedToolCallArgs({
+    toolCallId,
+    newArgs: { ...args, fileUri, editingFileContents, newFileContents },
+  }));
   const streamId = uuid();
   void extras.dispatch(
     applyForEditTool({

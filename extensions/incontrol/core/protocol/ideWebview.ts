@@ -39,6 +39,10 @@ export type ToIdeFromWebviewProtocol = ToIdeFromWebviewOrCoreProtocol & {
   "vscode/openMoveRightMarkdown": [undefined, void];
   acceptDiff: [AcceptOrRejectDiffPayload, void];
   rejectDiff: [AcceptOrRejectDiffPayload, void];
+  "edit/undoCompleted": [
+    { filepath: string; before: string; after: string },
+    { ok: boolean; saved?: boolean; message?: string },
+  ];
   "edit/sendPrompt": [
     {
       prompt: MessageContent;

@@ -9,8 +9,47 @@ import { moveTerminalProcessToBackground } from "../../redux/thunks/moveTerminal
 import { getFontSize } from "../../util";
 import { CopyButton } from "../StyledMarkdownPreview/StepContainerPreToolbar/CopyButton";
 import { RunInTerminalButton } from "../StyledMarkdownPreview/StepContainerPreToolbar/RunInTerminalButton";
-import { ButtonContent, SpoilerButton } from "../ui/SpoilerButton";
 import { t } from "../../i18n";
+import { terminalReadTarget } from "./terminalReadTitle";
+
+const titleSweep = keyframes`
+  from { background-position: 200% center; }
+  to { background-position: -200% center; }
+`;
+
+const CommandTitle = styled.span<{ $running: boolean }>`
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-left: 8px;
+  color: var(--vscode-foreground, var(--foreground));
+  ${({ $running }) => $running && `
+    @supports ((background-clip: text) or (-webkit-background-clip: text)) {
+      background-image: linear-gradient(105deg,
+        var(--vscode-descriptionForeground, var(--foreground)) 25%,
+        var(--vscode-textLink-foreground, #4daafc) 45%,
+        var(--vscode-foreground, var(--foreground)) 50%,
+        var(--vscode-textLink-foreground, #4daafc) 55%,
+        var(--vscode-descriptionForeground, var(--foreground)) 75%);
+      background-size: 250% 100%;
+      background-clip: text;
+      -webkit-background-clip: text;
+      color: transparent;
+    }
+  `}
+  animation: ${({ $running }) => $running ? titleSweep : "none"} 2.4s linear infinite;
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+    background-image: none;
+    color: var(--vscode-foreground, var(--foreground));
+  }
+  @media (forced-colors: active) {
+    animation: none;
+    background-image: none;
+    color: CanvasText;
+  }
+`;
 
 const blinkCursor = keyframes`
   0%, 50% { opacity: 1; }
@@ -82,7 +121,8 @@ const TerminalContent = styled.div`
     white-space: pre-wrap;
     max-width: 100%;
     overflow-x: scroll;
-    overflow-y: hidden;
+    overflow-y: auto;
+    max-height: 60vh;
     padding: 8px;
     margin: 0;
   }
@@ -257,64 +297,6 @@ function StatusIcon({ status }: StatusIconProps) {
   );
 }
 
-interface IndicatorOnlyProps {
-  hiddenLinesCount: number;
-  isExpanded: boolean;
-  onToggle: () => void;
-}
-
-function IndicatorOnly({
-  hiddenLinesCount,
-  isExpanded,
-  onToggle,
-}: IndicatorOnlyProps) {
-  return (
-    <div className="flex justify-center">
-      <SpoilerButton onClick={onToggle}>
-        <ButtonContent>
-          <span>
-            {isExpanded ? "Collapse" : `+${hiddenLinesCount} more lines`}
-          </span>
-          <ChevronDownIcon
-            className={`h-3 w-3 ${isExpanded ? "rotate-180" : ""}`}
-          />
-        </ButtonContent>
-      </SpoilerButton>
-    </div>
-  );
-}
-
-interface CollapsibleOutputContainerProps {
-  limitedContent: string;
-  fullContent: string;
-  isExpanded: boolean;
-  onToggle: () => void;
-}
-
-function CollapsibleOutputContainer({
-  limitedContent,
-  fullContent,
-  isExpanded,
-  onToggle,
-}: CollapsibleOutputContainerProps) {
-  return (
-    <div className="relative">
-      {/* Gradient overlay when collapsed */}
-      {!isExpanded && (
-        <div className="from-editor pointer-events-none absolute left-0 right-0 top-0 z-[5] h-[100px] rounded-t-md bg-gradient-to-b to-transparent" />
-      )}
-
-      <div onClick={onToggle} className="cursor-pointer">
-        <div>
-          <AnsiRenderer linkify>
-            {isExpanded ? fullContent : limitedContent}
-          </AnsiRenderer>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 interface UnifiedTerminalCommandProps {
   command: string;
   output?: string;
@@ -332,60 +314,21 @@ export function UnifiedTerminalCommand({
   statusMessage = "",
   toolCallState,
   toolCallId,
-  displayLines = 15,
 }: UnifiedTerminalCommandProps) {
   const dispatch = useAppDispatch();
-  const [isExpanded, setIsExpanded] = useState(true);
-  const [outputExpanded, setOutputExpanded] = useState(false);
+  const readTarget = useMemo(() => terminalReadTarget(command), [command]);
+  const isFileRead = readTarget !== undefined;
+  const [isExpanded, setIsExpanded] = useState(false);
+  const title = isFileRead ? t("Read {0}", readTarget) :
+    t("Run {0}", command.trim().split(/\r?\n/)[0] || t("Command"));
 
-  // Determine running state
-  const isRunning = toolCallState?.status === "calling" || status === "running";
+  // Explicit completion/failure/background signals take precedence over a
+  // briefly stale tool-call status while the output stream is settling.
+  const statusType = status === "failed" || statusMessage.includes("failed") ? "failed" :
+    status === "background" || statusMessage.includes("background") ? "background" :
+    toolCallState?.status === "calling" || status === "running" ? "running" : status;
+  const isRunning = statusType === "running";
   const hasOutput = output.length > 0;
-
-  // Process terminal content for line limiting
-  const processedTerminalContent = useMemo(() => {
-    if (!output) {
-      return {
-        fullContent: "",
-        limitedContent: "",
-        totalLines: 0,
-        isLimited: false,
-        hiddenLinesCount: 0,
-      };
-    }
-
-    const lines = output.split("\n");
-    const totalLines = lines.length;
-
-    if (totalLines > displayLines) {
-      const lastLines = lines.slice(-displayLines);
-      return {
-        fullContent: output,
-        limitedContent: lastLines.join("\n"),
-        totalLines,
-        isLimited: true,
-        hiddenLinesCount: totalLines - displayLines,
-      };
-    }
-
-    return {
-      fullContent: output,
-      limitedContent: output,
-      totalLines,
-      isLimited: false,
-      hiddenLinesCount: 0,
-    };
-  }, [output, displayLines]);
-
-  // Determine status type
-  let statusType: "running" | "completed" | "failed" | "background" = status;
-  if (isRunning) {
-    statusType = "running";
-  } else if (statusMessage?.includes("failed")) {
-    statusType = "failed";
-  } else if (statusMessage?.includes("background")) {
-    statusType = "background";
-  }
 
   const handleMoveToBackground = () => {
     if (toolCallId) {
@@ -422,19 +365,30 @@ export function UnifiedTerminalCommand({
           }`}
           style={{ fontSize: `${getFontSize() - 2}px` }}
         >
-          <div className="flex max-w-[50%] flex-row items-center">
+          <button type="button"
+            className="flex min-w-0 flex-1 cursor-pointer items-center border-none bg-transparent p-0 text-left"
+            aria-expanded={isExpanded}
+            onClick={() => setIsExpanded(!isExpanded)}
+            title={title}>
             <ChevronDownIcon
-              onClick={() => setIsExpanded(!isExpanded)}
-              className={`text-description h-3.5 w-3.5 flex-shrink-0 cursor-pointer hover:brightness-125 ${
-                isExpanded ? "rotate-0" : "-rotate-90"
-              }`}
+              className={`text-description h-3.5 w-3.5 flex-shrink-0 ${isExpanded ? "rotate-0" : "-rotate-90"}`}
             />
-            <span className="text-description ml-2 select-none">
-              {t("Terminal")}
+            <CommandTitle $running={isRunning && statusType === "running"}
+              data-testid="terminal-command-title"
+              data-running={isRunning && statusType === "running"}>
+              {title}
+            </CommandTitle>
+            <span className="text-description ml-2 flex flex-shrink-0 items-center text-xs" role="status">
+              <StatusIcon status={statusType} />
+              {isRunning ? t("Running") : statusType === "failed" ? t("Failed") : statusType === "background" ? t("Background") : t("Completed")}
             </span>
-          </div>
+          </button>
 
           <div className="flex items-center gap-2.5">
+            {isRunning && toolCallId && !isExpanded && (
+              <button type="button" className="text-link cursor-pointer border-none bg-transparent text-xs"
+                onClick={handleMoveToBackground}>{t("Move to background")}</button>
+            )}
             {!isRunning && (
               <div className="xs:flex hidden items-center gap-2.5">
                 <CopyButton text={copyContent} />
@@ -462,34 +416,8 @@ export function UnifiedTerminalCommand({
                 {/* Output with optional collapsible functionality */}
                 {hasOutput && (
                   <div className="mt-1">
-                    {/* Expand/Collapse indicator positioned between command and output */}
-                    {processedTerminalContent.isLimited && (
-                      <IndicatorOnly
-                        hiddenLinesCount={
-                          processedTerminalContent.hiddenLinesCount
-                        }
-                        isExpanded={outputExpanded}
-                        onToggle={() => setOutputExpanded(!outputExpanded)}
-                      />
-                    )}
-
                     <div className="pt-2">
-                      {processedTerminalContent.isLimited ? (
-                        <CollapsibleOutputContainer
-                          limitedContent={
-                            processedTerminalContent.limitedContent
-                          }
-                          fullContent={processedTerminalContent.fullContent}
-                          isExpanded={outputExpanded}
-                          onToggle={() => setOutputExpanded(!outputExpanded)}
-                        />
-                      ) : (
-                        <div>
-                          <AnsiRenderer linkify>
-                            {processedTerminalContent.fullContent}
-                          </AnsiRenderer>
-                        </div>
-                      )}
+                      <AnsiRenderer linkify>{output}</AnsiRenderer>
                     </div>
                   </div>
                 )}
@@ -499,7 +427,7 @@ export function UnifiedTerminalCommand({
         )}
 
         {/* Status information */}
-        {(statusMessage || isRunning) && (
+        {(statusMessage || isRunning) && isExpanded && (
           <div
             className="text-description flex items-center px-2 pb-2 pt-2 text-xs"
             style={{

@@ -1,8 +1,10 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { ApplyState } from "core";
 import { EditOperation } from "core/tools/definitions/multiEdit";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FindAndReplaceDisplay } from "./FindAndReplace";
+
+const { mockRequest } = vi.hoisted(() => ({ mockRequest: vi.fn() }));
 
 // Mock the dependencies
 vi.mock("../../../context/IdeMessenger", () => ({
@@ -13,6 +15,7 @@ vi.mock("../../../context/IdeMessenger", () => ({
 
 vi.mock("../../../redux/hooks", () => ({
   useAppSelector: vi.fn(),
+  useAppDispatch: () => vi.fn(),
 }));
 
 vi.mock("../../../components/ui", () => ({
@@ -31,7 +34,7 @@ vi.mock("react", async () => {
   const actual = await vi.importActual("react");
   return {
     ...actual,
-    useContext: () => ({ post: vi.fn() }),
+    useContext: () => ({ post: vi.fn(), request: mockRequest }),
   };
 });
 
@@ -101,7 +104,7 @@ describe("FindAndReplaceDisplay", () => {
   });
 
   describe("basic rendering", () => {
-    it("should render with collapsed state by default", () => {
+    it("should keep completed edit differences expanded by default", () => {
       render(<FindAndReplaceDisplay {...defaultProps} />);
 
       expect(screen.getByText("file.ts")).toBeInTheDocument();
@@ -109,9 +112,8 @@ describe("FindAndReplaceDisplay", () => {
         screen.getByTestId("toggle-find-and-replace-diff"),
       ).toBeInTheDocument();
 
-      // Should not show diff content when collapsed
-      const diffContent = screen.queryByText("-");
-      expect(diffContent).not.toBeInTheDocument();
+      expect(screen.getByText("const old = 'value';")).toBeInTheDocument();
+      expect(screen.getByText("const new = 'value';")).toBeInTheDocument();
     });
 
     it("should display file name from fileUri", () => {
@@ -147,14 +149,16 @@ describe("FindAndReplaceDisplay", () => {
   });
 
   describe("expand/collapse functionality", () => {
-    it("should expand when clicked", () => {
+    it("should collapse and re-expand when clicked", () => {
       render(<FindAndReplaceDisplay {...defaultProps} />);
+
 
       const toggleButton = screen.getByTestId("toggle-find-and-replace-diff");
       fireEvent.click(toggleButton);
-
+      expect(screen.queryByText("const new = 'value';")).not.toBeInTheDocument();
+      fireEvent.click(toggleButton);
       // Should show diff content when expanded
-      expect(screen.getByText("-")).toBeInTheDocument();
+      expect(screen.getByText("−")).toBeInTheDocument();
       expect(screen.getByText("+")).toBeInTheDocument();
     });
 
@@ -181,7 +185,7 @@ describe("FindAndReplaceDisplay", () => {
       render(<FindAndReplaceDisplay {...defaultProps} />);
 
       // Should show diff content without expanding
-      expect(screen.getByText("-")).toBeInTheDocument();
+      expect(screen.getByText("−")).toBeInTheDocument();
       expect(screen.getByText("+")).toBeInTheDocument();
     });
   });
@@ -190,8 +194,6 @@ describe("FindAndReplaceDisplay", () => {
     it("should generate and display diff correctly", () => {
       render(<FindAndReplaceDisplay {...defaultProps} />);
 
-      const toggleButton = screen.getByTestId("toggle-find-and-replace-diff");
-      fireEvent.click(toggleButton);
 
       // Should show removed line
       expect(screen.getByText("const old = 'value';")).toBeInTheDocument();
@@ -223,8 +225,6 @@ describe("FindAndReplaceDisplay", () => {
 
       render(<FindAndReplaceDisplay {...defaultProps} edits={multipleEdits} />);
 
-      const toggleButton = screen.getByTestId("toggle-find-and-replace-diff");
-      fireEvent.click(toggleButton);
 
       expect(mockExecuteFindAndReplace).toHaveBeenCalledTimes(2);
     });
@@ -251,8 +251,6 @@ describe("FindAndReplaceDisplay", () => {
 
       render(<FindAndReplaceDisplay {...defaultProps} />);
 
-      const toggleButton = screen.getByTestId("toggle-find-and-replace-diff");
-      fireEvent.click(toggleButton);
 
       expect(screen.getByText("No changes to display")).toBeInTheDocument();
     });
@@ -312,8 +310,6 @@ describe("FindAndReplaceDisplay", () => {
     it("should use editingFileContents when provided", () => {
       render(<FindAndReplaceDisplay {...defaultProps} />);
 
-      const toggleButton = screen.getByTestId("toggle-find-and-replace-diff");
-      fireEvent.click(toggleButton);
 
       expect(mockExecuteFindAndReplace).toHaveBeenCalledWith(
         "const old = 'value';\nconst other = 'test';",
@@ -332,8 +328,6 @@ describe("FindAndReplaceDisplay", () => {
         />,
       );
 
-      const toggleButton = screen.getByTestId("toggle-find-and-replace-diff");
-      fireEvent.click(toggleButton);
 
       expect(mockExecuteFindAndReplace).toHaveBeenCalledWith(
         "const old = 'value';",
@@ -344,4 +338,29 @@ describe("FindAndReplaceDisplay", () => {
       );
     });
   });
+  describe("completed edit undo", () => {
+    beforeEach(() => {
+      mockUseAppSelector.mockImplementation((selector: any) => {
+        if (selector.toString().includes("selectApplyStateByToolCallId")) return { status: "closed", streamId: "s" };
+        return mockToolCallState;
+      });
+    });
+    it("sends exact snapshots and disables repeated undo after success", async () => {
+      mockRequest.mockResolvedValue({status: "success", content: {ok: true, saved: true}});
+      render(<FindAndReplaceDisplay {...defaultProps} newFileContents="new contents" />);
+      fireEvent.click(screen.getByRole("button", {name: "Undo edit"}));
+      await waitFor(() => expect(screen.getByRole("button", {name: "Edit undone"})).toBeDisabled());
+      expect(mockRequest).toHaveBeenCalledWith("edit/undoCompleted", {
+        filepath: defaultProps.fileUri, before: defaultProps.editingFileContents, after: "new contents",
+      });
+    });
+    it("shows conflicts without pretending the undo succeeded", async () => {
+      mockRequest.mockResolvedValue({status: "success", content: {ok: false, message: "Newer changes protected"}});
+      render(<FindAndReplaceDisplay {...defaultProps} newFileContents="new contents" />);
+      fireEvent.click(screen.getByRole("button", {name: "Undo edit"}));
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Newer changes protected"));
+      expect(screen.getByRole("button", {name: "Undo edit"})).not.toBeDisabled();
+    });
+  });
+
 });
