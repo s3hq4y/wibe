@@ -57,12 +57,14 @@ $pkgs  = @("sqlite3","web-tree-sitter","tree-sitter-wasms","win-ca",
 foreach($pkg in $pkgs){
   $from = $null
   foreach($r in $roots){ $c = Join-Path $r $pkg; if(Test-Path $c){ $from = $c; break } }
-  if(-not $from){ Write-Host "      MISSING $pkg"; continue }
+  if(-not $from){ throw "Required extension runtime dependency missing: $pkg" }
   $to = Join-Path $nmDst $pkg
   robocopy $from $to /E /NFL /NDL /NJH /NJS /XD test tests docs /XF *.md *.map | Out-Null
 }
 # 棰勭紪璇戜簩杩涘埗涓嶈兘琚繃婊ゆ帀
-$binSrc = Join-Path $extSrc "core\node_modules\sqlite3\build\Release\vscode-sqlite3.node"
+# Use the root binary built against Electron, not the extension build-Node ABI.
+$binSrc = Join-Path $Src "node_modules\@vscode\sqlite3\build\Release\vscode-sqlite3.node"
+if (-not (Test-Path $binSrc)) { throw "Electron-targeted sqlite3 native binary missing" }
 $binDst = Join-Path $nmDst  "sqlite3\build\Release\vscode-sqlite3.node"
 New-Item -ItemType Directory -Force -Path (Split-Path $binDst) | Out-Null
 Copy-Item $binSrc $binDst -Force
@@ -133,7 +135,7 @@ if (Test-Path (Join-Path $ptyBin "conpty.node")) {
     node $reg
   }
 } else {
-  Write-Host "      WARN: conpty.node not built; terminal will not launch"
+  throw "conpty.node not built; refusing to package a broken terminal"
 }
 
 Write-Host "[5/5] native-keymap / native-is-elevated native modules -> product"
@@ -208,6 +210,17 @@ foreach($m in @("sqlite3","web-tree-sitter","win-ca")){
   Write-Host ("      {0,-18} {1}" -f $m, $r)
 }
 Pop-Location
+# Validate against the shipped Electron ABI, never against the build Node.
+$productConfig = [IO.File]::ReadAllText((Join-Path $Src "product.json")) | ConvertFrom-Json
+$electronExe = Join-Path $Prod ($productConfig.nameShort + ".exe")
+$previousRunAsNode = $env:ELECTRON_RUN_AS_NODE
+try {
+  $env:ELECTRON_RUN_AS_NODE = "1"
+  & $electronExe (Join-Path $Src "build\verify-windows-native.cjs") $Prod
+  if ($LASTEXITCODE -ne 0) { throw "Packaged Electron native validation failed" }
+} finally {
+  $env:ELECTRON_RUN_AS_NODE = $previousRunAsNode
+}
 Write-Host "post-build done."
 
 
