@@ -19,6 +19,8 @@ import { stripImages } from "core/util/messageContent";
 import * as vscode from "vscode";
 
 import { ApplyManager } from "../apply";
+import { BackgroundEditManager } from "../apply/BackgroundEditManager";
+import { EditSnapshotDiff } from "../diff/EditSnapshotDiff";
 import { VerticalDiffManager } from "../diff/vertical/manager";
 import { addCurrentSelectionToEdit } from "../quickEdit/AddCurrentSelection";
 import EditDecorationManager from "../quickEdit/EditDecorationManager";
@@ -84,6 +86,11 @@ export class VsCodeMessenger {
     private readonly vsCodeExtension: VsCodeExtension,
   ) {
     /** WEBVIEW ONLY LISTENERS **/
+    const backgroundEdits = new BackgroundEditManager(state => webviewProtocol.request("updateApplyState", state).then(() => {}));
+    context.subscriptions.push(backgroundEdits);
+    const editSnapshotDiff = new EditSnapshotDiff();
+    context.subscriptions.push(editSnapshotDiff);
+    this.onWebview("edit/showDiff", (msg) => editSnapshotDiff.show(msg.data));
     this.onWebview("showFile", (msg) => {
       this.ide.openFile(msg.data.filepath);
     });
@@ -113,7 +120,9 @@ export class VsCodeMessenger {
       vscode.commands.executeCommand("incontrol.openInNewWindow");
     });
 
-    this.onWebview("acceptDiff", async ({ data: { filepath, streamId } }) => {
+    this.onWebview("acceptDiff", async ({ data }) => {
+      if (await backgroundEdits.resolve(true, data)) return;
+      const { filepath, streamId } = data;
       await vscode.commands.executeCommand(
         "incontrol.acceptDiff",
         filepath,
@@ -133,16 +142,26 @@ export class VsCodeMessenger {
       const document = await vscode.workspace.openTextDocument(uri);
       const conflict = undoSnapshotError(data.before, data.after, document.getText());
       if (conflict) return { ok: false, message: conflict };
-      const edit = new vscode.WorkspaceEdit();
-      edit.replace(uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), data.before);
-      // WorkspaceEdit captures the open document version; conflicting edits are rejected by VS Code.
-      if (!(await vscode.workspace.applyEdit(edit))) {
-        return { ok: false, message: "The editor could not apply undo; the file may have changed" };
+      const wasDirty = document.isDirty;
+      await vscode.commands.executeCommand("_wibe.setBackgroundEdit", document.uri.toString(), true);
+      try {
+        const latestConflict = undoSnapshotError(data.before, data.after, document.getText());
+        if (latestConflict) return { ok: false, message: latestConflict };
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), data.before);
+        // WorkspaceEdit captures the open document version; conflicting edits are rejected by VS Code.
+        if (!(await vscode.workspace.applyEdit(edit))) {
+          return { ok: false, message: "The editor could not apply undo; the file may have changed" };
+        }
+        return { ok: true, saved: wasDirty ? false : await document.save() };
+      } finally {
+        await vscode.commands.executeCommand("_wibe.setBackgroundEdit", document.uri.toString(), false);
       }
-      return { ok: true, saved: await document.save() };
     });
 
-    this.onWebview("rejectDiff", async ({ data: { filepath, streamId } }) => {
+    this.onWebview("rejectDiff", async ({ data }) => {
+      if (await backgroundEdits.resolve(false, data)) return;
+      const { filepath, streamId } = data;
       await vscode.commands.executeCommand(
         "incontrol.rejectDiff",
         filepath,
@@ -151,6 +170,8 @@ export class VsCodeMessenger {
     });
 
     this.onWebview("applyToFile", async ({ data }) => {
+      // Agent file edits never enter the editor-dependent inline diff pipeline.
+      if (data.toolCallId) return backgroundEdits.stage(data);
       const [verticalDiffManager, configHandler] = await Promise.all([
         verticalDiffManagerPromise,
         configHandlerPromise,
@@ -174,25 +195,16 @@ export class VsCodeMessenger {
           return;
         }
 
-        await this.ide.openFile(filepath);
-
-        // Get active text editor
-        const editor = vscode.window.activeTextEditor;
-
-        if (!editor) {
-          vscode.window.showErrorMessage(t("No active editor to apply edits to"));
-          return;
+        const uri = vscode.Uri.parse(filepath);
+        const document = await vscode.workspace.openTextDocument(uri);
+        await vscode.commands.executeCommand("_wibe.setBackgroundEdit", document.uri.toString(), true);
+        try {
+          const edit = new vscode.WorkspaceEdit();
+          edit.replace(uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), prevFileContent);
+          if (!(await vscode.workspace.applyEdit(edit))) throw new Error("Unable to restore file contents");
+        } finally {
+          await vscode.commands.executeCommand("_wibe.setBackgroundEdit", document.uri.toString(), false);
         }
-
-        editor.edit((builder) =>
-          builder.replace(
-            new vscode.Range(
-              editor.document.positionAt(0),
-              editor.document.positionAt(editor.document.getText().length),
-            ),
-            prevFileContent,
-          ),
-        );
       },
     );
 

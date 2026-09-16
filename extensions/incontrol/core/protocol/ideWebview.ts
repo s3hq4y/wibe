@@ -13,6 +13,15 @@ import {
   ShowFilePayload,
 } from "../";
 
+/** Immutable snapshots from one chat edit, not the current on-disk file. */
+export interface ShowEditDiffParams {
+  filepath: string;
+  before: string;
+  after: string;
+  scope: "file" | "fragments";
+  selection?: { side: "before" | "after"; line: number };
+}
+
 export type ToIdeFromWebviewProtocol = ToIdeFromWebviewOrCoreProtocol & {
   openUrl: [string, void];
   applyToFile: [ApplyToFilePayload, void];
@@ -39,6 +48,7 @@ export type ToIdeFromWebviewProtocol = ToIdeFromWebviewOrCoreProtocol & {
   "vscode/openMoveRightMarkdown": [undefined, void];
   acceptDiff: [AcceptOrRejectDiffPayload, void];
   rejectDiff: [AcceptOrRejectDiffPayload, void];
+  "edit/showDiff": [ShowEditDiffParams, void];
   "edit/undoCompleted": [
     { filepath: string; before: string; after: string },
     { ok: boolean; saved?: boolean; message?: string },

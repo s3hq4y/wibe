@@ -9,6 +9,7 @@ import {
 import { updateEditStateApplyState } from "../slices/editState";
 import {
   acceptToolCall,
+  cancelToolCall,
   errorToolCall,
   updateApplyState,
   updateToolCallOutput,
@@ -38,6 +39,7 @@ vi.mock("../slices/editState", () => ({
 }));
 
 vi.mock("../slices/sessionSlice", () => ({
+  cancelToolCall: vi.fn(() => ({ type: "session/cancelToolCall" })),
   acceptToolCall: vi.fn(() => ({ type: "session/acceptToolCall" })),
   errorToolCall: vi.fn(() => ({ type: "session/errorToolCall" })),
   updateApplyState: vi.fn(() => ({ type: "session/updateApplyState" })),
@@ -703,5 +705,19 @@ describe("applyForEditTool", () => {
         });
       }
     });
+  });
+});
+
+describe("background edit completion safety", () => {
+  it.each([
+    { error:"Conflict: newer contents protected" },
+    { rejected:true },
+  ])("does not report a failed/rejected edit as success", async flags => {
+    vi.clearAllMocks();
+    const dispatch=vi.fn();
+    await handleApplyStateUpdate({ streamId:"bg",toolCallId:"t",filepath:"file:///x",status:"closed",background:true,...flags })(dispatch,()=>({}) as any,{ideMessenger:{post:vi.fn()}} as any);
+    expect(acceptToolCall).not.toHaveBeenCalled();
+    expect(flags.error ? errorToolCall : cancelToolCall).toHaveBeenCalledWith({toolCallId:"t"});
+    expect(updateToolCallOutput).toHaveBeenCalledWith(expect.objectContaining({toolCallId:"t"}));
   });
 });

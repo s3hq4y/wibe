@@ -37,6 +37,7 @@ export const multiEditImpl: ClientToolImpl = async (
       text: newFileContents,
       filepath: fileUri,
       isSearchAndReplace: true,
+      expectedFileContent: editingFileContents,
     }),
   );
 

@@ -1,7 +1,7 @@
 {
 	"platform": "win32-x64",
 	"python": "3.13.12",
-	"requirementsSha256": "712129598f9576734dea843c1d33b04fb9dee2ceafbc231d46cc6b62d37eef4e",
+	"requirementsSha256": "ef648292447d7485b431bd8ea8a8b4a46135d1bd44808849a3484a595c5e23d0",
 	"packages": [
 		{
 			"name": "annotated-types",
@@ -200,6 +200,12 @@
 			"version": "0.37.0",
 			"url": "https://files.pythonhosted.org/packages/2c/58/ca301544e1fa93ed4f80d724bf5b194f6e4b945841c5bfd555878eea9fcb/referencing-0.37.0-py3-none-any.whl",
 			"sha256": "381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231"
+		},
+		{
+			"name": "regex",
+			"version": "2026.9.10",
+			"url": "https://files.pythonhosted.org/packages/cd/fd/5c85fa6cfb8e034080bda5a72fa0a4df2b7777a35eb7e73c2799c2adda7a/regex-2026.9.10-cp313-cp313-win_amd64.whl",
+			"sha256": "20e8bfb07ad79a282f8b95b56fe67f9750b1b7f775724e4ba1f23cb296115ce4"
 		},
 		{
 			"name": "reportlab",

@@ -77,37 +77,13 @@ export class VerticalDiffHandler implements vscode.Disposable {
     this.disposables.push(disposable);
   }
 
-  /**  ensures the current target file is open and focused before performing edits*/
+  /** Reuse a user-visible editor without ever opening or focusing a source tab. */
   private async ensureCurrentFileIsFocused() {
     const targetUri = this.editor.document.uri;
-    const active = vscode.window.activeTextEditor;
-    if (
-      active &&
-      URI.equal(active.document.uri.toString(), targetUri.toString())
-    ) {
-      this.editor = active;
-      return;
-    }
-
-    const visible = vscode.window.visibleTextEditors.find((foundEditor) =>
-      URI.equal(foundEditor.document.uri.toString(), targetUri.toString()),
-    );
-    if (visible) {
-      await vscode.window.showTextDocument(visible.document, {
-        preview: false,
-        preserveFocus: false,
-        viewColumn: visible.viewColumn,
-      });
-      this.editor = vscode.window.activeTextEditor ?? visible;
-      return;
-    }
-
-    const doc = await vscode.workspace.openTextDocument(targetUri);
-    const editor = await vscode.window.showTextDocument(doc, {
-      preview: false,
-      preserveFocus: false,
-    });
-    this.editor = editor;
+    const visible = vscode.window.visibleTextEditors.find(editor =>
+      URI.equal(editor.document.uri.toString(), targetUri.toString()));
+    if (!visible) throw new Error("Target editor was closed; open it manually to continue");
+    this.editor = visible;
   }
 
   public get range(): vscode.Range {

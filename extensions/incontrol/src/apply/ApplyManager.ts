@@ -33,14 +33,12 @@ export class ApplyManager {
     toolCallId,
     isSearchAndReplace,
   }: ApplyToFilePayload) {
-    if (filepath) {
-      await this.ensureFileOpen(filepath);
-    }
-
+    // Manual code-block apply must not open or switch a source tab either.
+    // Agent tools use BackgroundEditManager; this legacy inline path requires
+    // the user to have explicitly selected the target editor first.
     const { activeTextEditor } = vscode.window;
-    if (!activeTextEditor) {
-      void vscode.window.showErrorMessage(t("No active editor to apply edits to"));
-      return;
+    if (!activeTextEditor || (filepath && activeTextEditor.document.uri.toString() !== filepath)) {
+      throw new Error("Open the target file manually before applying this code block");
     }
 
     // Capture the original file content before applying changes
@@ -81,15 +79,6 @@ export class ApplyManager {
         toolCallId,
       );
     }
-  }
-
-  private async ensureFileOpen(filepath: string): Promise<void> {
-    const fileExists = await this.ide.fileExists(filepath);
-    if (!fileExists) {
-      await this.ide.writeFile(filepath, "");
-      await this.ide.openFile(filepath);
-    }
-    await this.ide.openFile(filepath);
   }
 
   private modelIsTooFastForStreaming(model: string): boolean {

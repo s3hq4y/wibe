@@ -10,6 +10,7 @@
 
 import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
+import { createHash } from 'crypto';
 import { BrowserLauncher } from './browserLauncher';
 import * as net from 'net';
 import * as path from 'path';
@@ -37,6 +38,8 @@ export interface SidecarOptions {
 	sidecarRoot: string;
 	/** Python 解释器路径；未提供时按平台探测 */
 	pythonPath?: string;
+	/** Wibe-owned user-data directory for update journals and immutable runtimes. */
+	runtimeStateRoot?: string;
 	browserPath?: string;
 	browserPort?: number;
 	preferredPort?: number;
@@ -50,6 +53,9 @@ export class SidecarManager {
 	private port: number = DEFAULT_SIDECAR_PORT;
 	private healthTimer: NodeJS.Timeout | undefined;
 	private disposed = false;
+	private managedPython: string | undefined;
+	private managedPending = false;
+	private starting: Promise<SidecarHealth> | undefined;
 
 	constructor(private readonly opts: SidecarOptions) { }
 
@@ -144,7 +150,9 @@ export class SidecarManager {
 	private isBundledPython(executable: string): boolean {
 		const resolved = path.resolve(executable);
 		const bundled = this.bundledPython();
-		return process.platform === 'win32' ? resolved.toLowerCase() === bundled.toLowerCase() : resolved === bundled;
+		const candidates = [bundled, ...(this.managedPython ? [this.managedPython] : [])];
+		return candidates.some(candidate => process.platform === 'win32'
+			? resolved.toLowerCase() === candidate.toLowerCase() : resolved === candidate);
 	}
 
 	private pythonEnvironment(executable: string): NodeJS.ProcessEnv {
@@ -161,6 +169,48 @@ export class SidecarManager {
 		// -I ignores PYTHONHOME/PYTHONPATH/user site; -B permits read-only installation directories.
 		// Encoding and unbuffered output use flags because isolated mode ignores PYTHON* variables.
 		return this.isBundledPython(executable) ? ['-I', '-B', '-X', 'utf8', '-u', ...args] : args;
+	}
+
+	private runtimeManager(): string {
+		return path.resolve(this.opts.sidecarRoot, '..', 'uwa-runtime', 'manager.py');
+	}
+
+	private runtimeStateRoot(): string {
+		const installation = createHash('sha256').update(path.resolve(this.opts.sidecarRoot).toLowerCase()).digest('hex').slice(0, 16);
+		return path.join(this.opts.runtimeStateRoot ?? path.resolve(this.opts.sidecarRoot, '..', '.wibe-runtime'), installation);
+	}
+
+	private managerArguments(action: string): string[] {
+		return [this.runtimeManager(), action, '--sidecar-root', this.opts.sidecarRoot,
+			'--state-root', this.runtimeStateRoot(), '--base-python', this.bundledPython()];
+	}
+
+	private async runtimeControl(action: 'select' | 'confirm' | 'rollback'): Promise<{ python?: string; pending?: boolean; rolledBack?: boolean; confirmed?: boolean }> {
+		const base = this.bundledPython();
+		const result = await SidecarManager.run(base, this.pythonArguments(base, this.managerArguments(action)),
+			this.opts.sidecarRoot, 120_000, this.pythonEnvironment(base));
+		if (result.code !== 0 || result.spawnError) { throw new Error(result.stderr || result.stdout || result.spawnError); }
+		const lines = result.stdout.trim().split('\n');
+		for (const line of lines.slice(0, -1)) { this.log(line); }
+		return JSON.parse(lines[lines.length - 1]);
+	}
+
+	private async rollbackUpdate(): Promise<boolean> {
+		if (!this.managedPending) { return false; }
+		try {
+			const result = await this.runtimeControl('rollback');
+			this.managedPython = undefined;
+			this.managedPending = false;
+			return result.rolledBack === true;
+		} catch (error) {
+			this.log(`update recovery failed; preserved recovery journal: ${error}`);
+			return false;
+		}
+	}
+
+	/** The Wibe-owned launcher remains outside files replaced by upstream releases. */
+	private sidecarArguments(executable: string): string[] {
+		return this.isBundledPython(executable) ? this.managerArguments('launch') : [path.join(this.opts.sidecarRoot, 'main.py')];
 	}
 
 	/**
@@ -207,6 +257,9 @@ export class SidecarManager {
 		if (deps.spawnError || deps.code !== 0) {
 			const detail = (deps.stdout || deps.stderr || '').trim().split('\n').pop() ?? '';
 			return { ok: false, reason: detail ? `依赖不完整（${detail}）` : '依赖不完整' };
+		}
+		if (this.isBundledPython(pythonPath) && !fs.existsSync(this.runtimeManager())) {
+			return { ok: false, reason: '安装包缺少 uwa-runtime/manager.py，请重新安装完整的 Wibe 安装包' };
 		}
 		return { ok: true };
 	}
@@ -355,15 +408,26 @@ export class SidecarManager {
 		};
 
 		const explicit = this.opts.pythonPath;
-		if (explicit) {
+		if (explicit && !this.isBundledPython(explicit)) {
 			const hit = await firstViable([explicit]);
 			if (hit) { return hit; }
 		}
 
 		const bundled = this.bundledPython();
 		if (fs.existsSync(path.dirname(bundled))) {
-			const hit = await firstViable([bundled]);
-			if (hit) { return hit; }
+			try {
+				const selection = await this.runtimeControl('select');
+				if (!selection.python) { throw new Error('Managed runtime selection is empty'); }
+				const relative = path.relative(this.runtimeStateRoot(), selection.python);
+				if (path.resolve(selection.python).toLowerCase() !== path.resolve(bundled).toLowerCase()
+					&& (relative.startsWith('..') || path.isAbsolute(relative))) { throw new Error('Managed runtime path escapes state directory'); }
+				this.managedPython = selection.python;
+				this.managedPending = selection.pending === true;
+				const hit = await firstViable([selection.python]);
+				if (hit) { return hit; }
+			} catch (error) {
+				this.log(`managed runtime selection failed: ${error}`);
+			}
 			this.log('内置 Python 运行时损坏或依赖不完整，请重新安装完整的 Wibe 安装包；不会回退到系统 Python。');
 			return undefined;
 		}
@@ -404,7 +468,21 @@ export class SidecarManager {
 	 * 若目标端口上已有健康实例（用户手动起的、或上次未清理干净的），
 	 * 直接复用而不重复 spawn —— 避免两个实例抢同一个 chrome_profile。
 	 */
-	async start(): Promise<SidecarHealth> {
+	start(): Promise<SidecarHealth> {
+		if (!this.starting) {
+			this.starting = this.startInternal().catch(async error => {
+				if (!this.disposed && this.managedPending) {
+					await this.stop();
+					if (await this.rollbackUpdate()) { return this.startInternal(true); }
+				}
+				throw error;
+			}).finally(() => { this.starting = undefined; });
+		}
+		return this.starting;
+	}
+
+	private async startInternal(retried = false): Promise<SidecarHealth> {
+		this.disposed = false;
 		const preferred = this.opts.preferredPort ?? DEFAULT_SIDECAR_PORT;
 
 		if (await SidecarManager.probePort(preferred)) {
@@ -425,6 +503,7 @@ export class SidecarManager {
 		// 不 spawn、也不进入 60 秒健康探测窗口，避免把配置问题伪装成超时。
 		const python = await this.resolvePython();
 		if (!python) {
+			if (!retried && await this.rollbackUpdate()) { return this.startInternal(true); }
 			// 上一轮可能已经起过浏览器；这里补一刀确保不留孤儿
 			await this.browser?.dispose();
 			this.browser = undefined;
@@ -453,7 +532,7 @@ export class SidecarManager {
 
 		const entry = path.join(this.opts.sidecarRoot, 'main.py');
 		this.log(`spawning: ${python} ${entry} (port ${this.port})`);
-		this.proc = spawn(python, this.pythonArguments(python, [entry]), {
+		this.proc = spawn(python, this.pythonArguments(python, this.sidecarArguments(python)), {
 			cwd: this.opts.sidecarRoot,
 			windowsHide: true,
 			env: {
@@ -491,10 +570,18 @@ export class SidecarManager {
 
 		const ok = await this.waitReady(60_000);
 		if (!ok) {
+			const cancelled = this.disposed;
 			await this.stop();
+			if (!cancelled && !retried && await this.rollbackUpdate()) { return this.startInternal(true); }
 			return { alive: false, port: this.port, error: 'startup timeout (60s)' };
 		}
 
+		if (this.managedPending) {
+			try {
+				const result = await this.runtimeControl('confirm');
+				this.managedPending = result.confirmed !== true;
+			} catch (error) { this.log(`update confirmation deferred: ${error}`); }
+		}
 		this.startHealthLoop();
 		return this.checkHealth(this.port);
 	}
@@ -580,7 +667,14 @@ export class SidecarManager {
 		if (!this.proc) {
 			return;
 		}
-		const pid = this.proc.pid;
+		const child = this.proc;
+		const pid = child.pid;
+		const waitForExit = (timeout: number): Promise<boolean> => new Promise(resolve => {
+			if (child.exitCode !== null || child.signalCode !== null || this.proc !== child) { resolve(true); return; }
+			const onExit = () => { clearTimeout(timer); resolve(true); };
+			const timer = setTimeout(() => { child.removeListener('exit', onExit); resolve(false); }, timeout);
+			child.once('exit', onExit);
+		});
 
 		try {
 			const ctl = new AbortController();
@@ -594,17 +688,14 @@ export class SidecarManager {
 			// 端点不存在或已死，走强杀
 		}
 
-		const exited = await Promise.race([
-			new Promise<boolean>(r => this.proc?.once('exit', () => r(true))),
-			new Promise<boolean>(r => setTimeout(() => r(false), 5000)),
-		]);
+		const exited = await waitForExit(5000);
 
 		if (!exited && pid !== undefined) {
 			this.log(`force killing process tree pid=${pid}`);
 			try {
 				if (process.platform === 'win32') {
 					// /T 连同子进程（Chrome）一并结束
-					spawn('taskkill', ['/pid', String(pid), '/T', '/F']);
+					await SidecarManager.run('taskkill', ['/pid', String(pid), '/T', '/F'], this.opts.sidecarRoot, 15_000);
 				} else {
 					process.kill(-pid, 'SIGKILL');
 				}
@@ -612,6 +703,7 @@ export class SidecarManager {
 				this.log(`kill failed: ${e}`);
 			}
 		}
+		if (!await waitForExit(5000)) { throw new Error('Sidecar did not exit; refusing to roll back live code'); }
 		this.proc = undefined;
 	}
 }

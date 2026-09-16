@@ -88,7 +88,7 @@ describe("terminal title status and shimmer", () => {
     expect(screen.getByRole("status")).toHaveTextContent(new RegExp(status, "i"));
     expect(screen.getByTestId("terminal-command-title")).toHaveAttribute("data-running", String(status === "running"));
   });
-  test.each(["failed", "background"] as const)("stops shimmer for %s even if calling state is stale", async status => {
+  test.each(["completed", "failed", "background"] as const)("stops shimmer for %s even if calling state is stale", async status => {
     await renderWithProviders(<UnifiedTerminalCommand command="npm test" status={status} toolCallState={{status:"calling"} as ToolCallState} />);
     expect(screen.getByTestId("terminal-command-title")).toHaveAttribute("data-running", "false");
   });
@@ -100,4 +100,12 @@ describe("terminal title status and shimmer", () => {
     expect(screen.getByText("Permission denied")).toBeInTheDocument();
     expect(screen.getByText("failed: exit code 1")).toBeInTheDocument();
   });
+});
+
+test("command cards no longer stack large outer and inner margins", async () => {
+  await renderWithProviders(<UnifiedTerminalCommand command="cat sokoban.html" />);
+  const card = screen.getByTestId("terminal-container");
+  expect(card).toHaveClass("my-0");
+  expect(card).not.toHaveClass("mb-4");
+  expect(card.firstElementChild).toHaveClass("my-0");
 });

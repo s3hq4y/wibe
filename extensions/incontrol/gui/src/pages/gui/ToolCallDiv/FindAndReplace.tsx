@@ -64,6 +64,7 @@ export function FindAndReplaceDisplay({
   const showContent = isExpanded ?? ["generated", "calling", "done"].includes(toolCallState?.status ?? "");
   const [undoState, setUndoState] = useState<"idle" | "busy" | "done">("idle");
   const [undoMessage, setUndoMessage] = useState("");
+  const [diffOpenError, setDiffOpenError] = useState("");
   const alreadyUndone = toolCallState?.processedArgs?.editUndone === true;
   async function undoCompletedEdit() {
     if (!fileUri || typeof editingFileContents !== "string" || typeof newFileContents !== "string" || (undoState !== "idle" || alreadyUndone)) return;
@@ -112,6 +113,12 @@ export function FindAndReplaceDisplay({
 
   const diffResult = useMemo(() => {
     try {
+      // Without a full "before", never compare a fragment against a full
+      // "after" or pretend the fragment line numbers belong to the file.
+      if (typeof editingFileContents !== "string") {
+        const after = edits.map(edit => edit.new_string ?? "").join("\n");
+        return { diff: diffLines(currentFileContent, after), before: currentFileContent, after, error: null };
+      }
       let contentsAfterReplace = newFileContents;
       if (typeof contentsAfterReplace === "undefined") {
         // Apply all edits sequentially
@@ -134,14 +141,29 @@ export function FindAndReplaceDisplay({
 
       // Generate diff between original and final content
       const diff = diffLines(currentFileContent, contentsAfterReplace);
-      return { diff, error: null };
+      return { diff, before: currentFileContent, after: contentsAfterReplace, error: null };
     } catch (error) {
       return {
         diff: null,
         error: error instanceof Error ? error.message : "Unknown error",
       };
     }
-  }, [currentFileContent, newFileContents, edits]);
+  }, [currentFileContent, newFileContents, edits, editingFileContents]);
+
+  async function openDiff(line?: number, side: "before" | "after" = "after") {
+    if (!fileUri || !diffResult.diff) return;
+    setDiffOpenError("");
+    try {
+      const response = await ideMessenger.request("edit/showDiff", {
+        filepath: fileUri, before: diffResult.before!, after: diffResult.after!,
+        scope: typeof editingFileContents === "string" ? "file" : "fragments",
+        ...(line === undefined ? {} : { selection: { line, side } }),
+      });
+      if (response.status !== "success") throw new Error(String(response.error));
+    } catch (error) {
+      setDiffOpenError(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   const diffStats = useMemo(() => {
     if (!diffResult?.diff) {
@@ -207,16 +229,16 @@ export function FindAndReplaceDisplay({
                 showContent ? "rotate-0" : "-rotate-90"
               }`}
             />
-            <FileInfo
-              filepath={displayName || "..."}
-              onClick={(e) => {
-                if (!fileUri) {
-                  return;
-                }
-                e.stopPropagation();
-                ideMessenger.post("openFile", { path: fileUri });
-              }}
-            />
+            <button type="button" disabled={!fileUri}
+              className="min-w-0 cursor-pointer border-none bg-transparent p-0 text-inherit hover:underline disabled:cursor-default"
+              aria-label={`Compare ${displayName || "file"} before and after`}
+              title="Open side-by-side diff"
+              onClick={event => {
+                event.stopPropagation();
+                void openDiff();
+              }}>
+              <FileInfo filepath={displayName || "..."} />
+            </button>
           </div>
           <DiffStats added={diffStats.added} removed={diffStats.removed} />
         </div>
@@ -235,12 +257,14 @@ export function FindAndReplaceDisplay({
               ideMessenger.post(`acceptDiff`, {
                 filepath: fileUri,
                 streamId: applyState.streamId,
+                ...(applyState.background ? { background: true, toolCallId } : {}),
               });
             }}
             onClickReject={() => {
               ideMessenger.post(`rejectDiff`, {
                 filepath: fileUri,
                 streamId: applyState.streamId,
+                ...(applyState.background ? { background: true, toolCallId } : {}),
               });
             }}
             disableManualApply={true}
@@ -248,6 +272,7 @@ export function FindAndReplaceDisplay({
           />
         )}
       </div>
+      {diffOpenError && <div role="alert" className="text-error px-3 py-2 text-xs">{diffOpenError}</div>}
       {undoMessage && <div role="status" className="text-description px-3 py-2 text-xs">{undoMessage}</div>}
       {showContent ? content : null}
     </div>
@@ -271,5 +296,7 @@ export function FindAndReplaceDisplay({
     );
   }
 
-  return renderContainer(<EditDiff parts={diffResult.diff} />);
+  return renderContainer(<EditDiff parts={diffResult.diff}
+    isPartial={typeof editingFileContents !== "string"}
+    onNavigate={fileUri ? (line, side) => { void openDiff(line, side); } : undefined} />);
 }

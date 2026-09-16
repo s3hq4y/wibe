@@ -1443,6 +1443,10 @@ export interface ApplyState {
   originalFileContent?: string;
   toolCallId?: string;
   autoFormattingDiff?: string;
+  background?: boolean;
+  error?: string;
+  rejected?: boolean;
+  saved?: boolean;
 }
 
 export type StreamDiffLinesType = "edit" | "apply";
@@ -1480,6 +1484,8 @@ export interface HighlightedCodePayload {
 export interface AcceptOrRejectDiffPayload {
   filepath?: string;
   streamId?: string;
+  background?: boolean;
+  toolCallId?: string;
 }
 
 export interface ShowFilePayload {
@@ -1492,6 +1498,7 @@ export interface ApplyToFilePayload {
   text: string;
   toolCallId?: string;
   isSearchAndReplace?: boolean;
+  expectedFileContent?: string;
 }
 
 export interface RangeInFileWithContents {

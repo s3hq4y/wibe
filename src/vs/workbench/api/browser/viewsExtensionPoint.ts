@@ -16,6 +16,7 @@ import { ExtensionIdentifier, ExtensionIdentifierSet, IExtensionDescription, IEx
 import { SyncDescriptor } from '../../../platform/instantiation/common/descriptors.js';
 import { IInstantiationService } from '../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../platform/log/common/log.js';
+import { IProductService } from '../../../platform/product/common/productService.js';
 import { Registry } from '../../../platform/registry/common/platform.js';
 import { PaneCompositeRegistry, Extensions as ViewletExtensions } from '../../browser/panecomposite.js';
 import { CustomTreeView, TreeViewPane } from '../../browser/parts/views/treeView.js';
@@ -283,7 +284,8 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
 
 	constructor(
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
-		@ILogService private readonly logService: ILogService
+		@ILogService private readonly logService: ILogService,
+		@IProductService private readonly productService: IProductService
 	) {
 		this.viewContainersRegistry = Registry.as<IViewContainersRegistry>(ViewContainerExtensions.ViewContainersRegistry);
 		this.viewsRegistry = Registry.as<IViewsRegistry>(ViewContainerExtensions.ViewsRegistry);
@@ -416,7 +418,7 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
 				hideIfEmpty: true,
 				order,
 				icon,
-			}, location);
+			}, location, { isDefault: location === ViewContainerLocation.AuxiliaryBar && this.productService.chatReplacement?.viewContainer === id });
 
 		}
 

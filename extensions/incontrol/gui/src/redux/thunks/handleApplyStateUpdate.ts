@@ -9,6 +9,7 @@ import {
 import { updateEditStateApplyState } from "../slices/editState";
 import {
   acceptToolCall,
+  cancelToolCall,
   errorToolCall,
   updateApplyState,
   updateToolCallOutput,
@@ -41,6 +42,18 @@ export const handleApplyStateUpdate = createAsyncThunk<
     } else {
       // chat or agent
       dispatch(updateApplyState(applyState));
+      if (applyState.toolCallId && (applyState.error || applyState.rejected)) {
+        dispatch(applyState.error ? errorToolCall({ toolCallId: applyState.toolCallId }) : cancelToolCall({ toolCallId: applyState.toolCallId }));
+        dispatch(updateToolCallOutput({ toolCallId: applyState.toolCallId, contextItems: [{
+          name: applyState.error ? "Edit Failed" : "Edit Rejected",
+          content: applyState.error ?? "The user rejected this edit. No file changes were applied.",
+          description: applyState.filepath ?? "", hidden: false,
+        }] }));
+        if (applyState.status === "closed" && applyState.error) {
+          void dispatch(streamResponseAfterToolCall({ toolCallId: applyState.toolCallId }));
+        }
+        return;
+      }
 
       // Handle apply status updates - use toolCallId from event payload
       if (applyState.toolCallId) {
@@ -58,6 +71,7 @@ export const handleApplyStateUpdate = createAsyncThunk<
           extra.ideMessenger.post("acceptDiff", {
             streamId: applyState.streamId,
             filepath: applyState.filepath,
+            ...(applyState.background ? { background: true, toolCallId: applyState.toolCallId } : {}),
           });
         }
 
@@ -115,7 +129,7 @@ export const handleApplyStateUpdate = createAsyncThunk<
                       contextItems: [
                         {
                           name: "Edit Success",
-                          content: `Successfully edited ${applyState.filepath}`,
+                          content: applyState.saved === false ? `Edited ${applyState.filepath} in an unsaved editor buffer. Save it before external tools read the disk file.` : `Successfully edited ${applyState.filepath}`,
                           description: "",
                           hidden: true,
                         },

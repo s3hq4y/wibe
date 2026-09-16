@@ -399,6 +399,7 @@ export async function activateBridge(
 
 	sidecar = new SidecarManager({
 		sidecarRoot,
+		runtimeStateRoot: path.join(context.globalStorageUri.fsPath, 'uwa-runtime'),
 		browserPort: cfg.get<number>('browserPort') ?? 9222,
 		browserPath: cfg.get<string>('browserPath') || undefined,
 		pythonPath: cfg.get<string>('pythonPath') || undefined,

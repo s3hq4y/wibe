@@ -32,8 +32,11 @@ def verify(root):
     # Exercise native modules and paths that metadata-only checks cannot validate.
     for module in ('ssl', 'sqlite3', 'ctypes', 'pydantic_core', 'PIL.Image', 'lxml.etree',
                    'psutil', 'win32api', 'win32clipboard', 'pythoncom', 'pywintypes',
-                   'uvicorn', 'httptools', 'watchfiles', 'websockets'):
+                   'uvicorn', 'httptools', 'watchfiles', 'websockets', 'regex', 'regex._regex'):
         importlib.import_module(module)
+    assert (root / 'resources/uwa-runtime/manager.py').is_file(), 'Wibe runtime manager is missing'
+    guard = runpy.run_path(str(root / 'resources/uwa-runtime/dependencies.py'))
+    guard['check_requirements'](requirements)
     check = runpy.run_path(str(root / 'resources/uwa-sidecar/check_deps.py'))
     assert check['check_dependencies'](), 'Sidecar dependency import failed'
     # Embedded Python does not add the script directory automatically; _pth must supply it.

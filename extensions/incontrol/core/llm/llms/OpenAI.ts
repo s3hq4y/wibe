@@ -1,3 +1,4 @@
+import { prepareUwaChatMessages } from "../../util/uwaImages";
 import {
   ChatCompletionCreateParams,
   ChatCompletionMessageParam,
@@ -27,6 +28,7 @@ import {
 } from "../openaiTypeConverters.js";
 import {
   consumeUwaFields,
+  isUwaModelApiBase,
   getUwaConversationState,
   setUwaConversationState,
   uwaConversationFingerprint,
@@ -551,8 +553,9 @@ class OpenAI extends BaseLLM {
     const body = this._convertArgs(options, messages);
     // 合并 uwa 桥接字段：让 sidecar 知道这是 ide 模式的续聊，
     // 否则它会按默认逻辑在同一会话里反复开新对话。
-    const uwaFields = consumeUwaFields() ?? {};
-    Object.assign(body as any, uwaFields);
+    const uwaFields = (isUwaModelApiBase(this.apiBase) ? consumeUwaFields() : undefined) ?? {};
+    Object.assign(body as any, uwaFields, this.extraBodyProperties());
+    body.messages = prepareUwaChatMessages(body.messages, this.apiBase, (body as any).history_mode);
     // 本请求所属 IDE 会话的指纹（首条 user 文本摘要）：绑定按会话分槽，
     // 多会话切回时不把 A 的消息定向到 B 的网页对话。
     const uwaFp = uwaConversationFingerprint(
@@ -568,8 +571,8 @@ class OpenAI extends BaseLLM {
     //   3. 都失败则降级回默认端点（消息照发，日志可追踪，不阻断）。
     let uwaTargetUrl: URL | undefined;
     try {
-      const mode = String((uwaFields as any).history_mode ?? "").toLowerCase();
-      const forceNew = Boolean((uwaFields as any).force_new_conversation);
+      const mode = String((body as any).history_mode ?? "").toLowerCase();
+      const forceNew = Boolean((body as any).force_new_conversation);
       uwaTrace(
         `direct mode=${mode} forceNew=${forceNew} fp=${uwaFp ?? "-"} key=${
           String((options as any)?.uwaSessionKey ?? "").slice(0, 10) || "-"
@@ -615,10 +618,7 @@ class OpenAI extends BaseLLM {
       {
       method: "POST",
       headers: this._getHeaders(),
-      body: JSON.stringify({
-        ...body,
-        ...this.extraBodyProperties(),
-      }),
+      body: JSON.stringify(body),
       signal,
     });
 

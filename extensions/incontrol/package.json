@@ -183,7 +183,6 @@
           "type": "boolean",
           "default": true,
           "description": "在状态栏显示 uwa sidecar 状态（点击可启动/停止）"
-
         },
         "incontrol.bridge.pagePollIntervalSec": {
           "type": "number",
@@ -713,18 +712,18 @@
       ]
     },
     "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "incontrol",
-          "title": "%viewContainer.incontrol%",
-          "icon": "media/sidebar-icon.png"
-        }
-      ],
       "panel": [
         {
           "id": "incontrolConsole",
           "title": "%viewContainer.incontrolConsole%",
           "icon": "$(window)"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "incontrol",
+          "title": "%viewContainer.incontrol%",
+          "icon": "media/sidebar-icon.png"
         }
       ]
     },
@@ -762,7 +761,13 @@
         "fileMatch": "**/config.yaml",
         "url": "./config-yaml-schema.json"
       }
-    ]
+    ],
+    "configurationDefaults": {
+      "workbench.secondarySideBar.defaultVisibility": "visible",
+      "chat.disableAIFeatures": true,
+      "chat.titleBar.signIn.enabled": false,
+      "chat.titleBar.openInAgentsWindow.enabled": false
+    }
   },
   "scripts": {
     "esbuild-base": "node scripts/esbuild.js",

@@ -309,6 +309,19 @@ export class TextDiffEditor extends AbstractTextEditor<IDiffEditorViewState> imp
 			Object.assign(editorConfiguration, diffEditorConfiguration);
 		}
 
+		// Chat edit snapshots explicitly request a side-by-side review. Scope this
+		// to BOTH virtual resources: do not mutate user settings or ordinary diffs.
+		if (this.input instanceof DiffEditorInput &&
+			this.input.original.resource?.scheme === 'incontrol-edit-diff' &&
+			this.input.modified.resource?.scheme === 'incontrol-edit-diff') {
+			Object.assign(editorConfiguration, {
+				renderSideBySide: true,
+				useInlineViewWhenSpaceIsLimited: false,
+				ignoreTrimWhitespace: false,
+				hideUnchangedRegions: { enabled: false }
+			} satisfies IDiffEditorOptions);
+		}
+
 		const verbose = configuration.accessibility?.verbosity?.diffEditor ?? false;
 		(editorConfiguration as IDiffEditorOptions).accessibilityVerbose = verbose;
 

@@ -46,3 +46,14 @@ export function visibleEditRows(rows: EditDiffRow[], context = 3): (EditDiffRow 
   if (hidden) result.push(hidden);
   return result;
 }
+
+/** Zero-based target in the current file; deleted/inserted-only lines use the
+ * next surviving line at that boundary, or the last surviving line at EOF. */
+export function editDiffTargetLine(rows: EditDiffRow[], row: EditDiffRow, side: "before" | "after" = "after"): number {
+  const field = side === "after" ? "newLine" : "oldLine";
+  if (row[field] !== undefined) return Math.max(0, row[field]! - 1);
+  const index = rows.indexOf(row);
+  const line = row[field] ?? rows.slice(index + 1).find(candidate => candidate[field] !== undefined)?.[field] ??
+    rows.slice(0, index).reverse().find(candidate => candidate[field] !== undefined)?.[field] ?? 1;
+  return Math.max(0, line - 1);
+}

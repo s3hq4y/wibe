@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { excludedBuiltInExtensionGlobs, isBuiltInExtensionExcluded } from './lib/productExtensionPolicy.ts';
 import { gulp, rename, replace, filter, jsonEditor } from './lib/gulp/facade.ts';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -302,7 +303,7 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 			return !set.has(platform);
 		}).map(ext => `!.build/extensions/${ext.name}/**`);
 
-		const extensions = gulp.src(['.build/extensions/**', ...platformSpecificBuiltInExtensionsExclusions], { base: '.build', dot: true });
+		const extensions = gulp.src(['.build/extensions/**', ...platformSpecificBuiltInExtensionsExclusions, ...excludedBuiltInExtensionGlobs(product)], { base: '.build', dot: true });
 
 		const sourceFilterPattern = stripSourceMapsInPackagingTasks
 			? ['**', '!**/*.{js,css}.map']
@@ -456,6 +457,7 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 		if (platform === 'win32' && arch === 'x64') {
 			all = es.merge(all, gulp.src([
 				'resources/python/**',
+				'resources/uwa-runtime/*.py',
 				'resources/uwa-sidecar/**',
 				'!resources/uwa-sidecar/**/{__pycache__,venv,.venv,.git,chrome_profile,logs,temp,tmp,scratch,download_images,tests,node_modules,backup_*}/**',
 				'!resources/uwa-sidecar/**/*.{pyc,pyo,log,bak,tmp}',
@@ -699,6 +701,9 @@ function prepareCopilotRipgrepShimTask(platform: string, arch: string, destinati
 	const outputDir = path.join(path.dirname(root), destinationFolderName);
 
 	return async () => {
+		if (isBuiltInExtensionExcluded(product, 'copilot')) {
+			return;
+		}
 		// On Windows with win32VersionedUpdate, app resources live under a
 		// commit-hash prefix: {output}/{commitHash}/resources/app/
 		const versionedResourcesFolder = util.getVersionedResourcesFolder(platform, commit!);

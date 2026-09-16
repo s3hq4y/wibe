@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="./WIBE_VERSION"><img src="https://img.shields.io/badge/version-alpha--1.0.2--base--1.136.1-00A34D?style=flat-square&labelColor=071A10" alt="version alpha-1.0.2-base-1.136.1"></a>
+  <a href="./WIBE_VERSION"><img src="https://img.shields.io/badge/version-alpha--1.0.3--base--1.136.1-00A34D?style=flat-square&labelColor=071A10" alt="version alpha-1.0.3-base-1.136.1"></a>
   <a href="https://github.com/microsoft/vscode"><img src="https://img.shields.io/badge/upstream-Code%20--%20OSS%201.136.1-3178C6?style=flat-square&labelColor=071A10" alt="upstream Code - OSS 1.136.1"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-8A2BE2?style=flat-square&labelColor=071A10" alt="license AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&labelColor=071A10" alt="platform Windows">
@@ -17,8 +17,8 @@
 
 Wibe is a desktop editor based on [Visual Studio Code — Open Source](https://github.com/microsoft/vscode) (**Code - OSS 1.136.1**). The editor, extensions host, and settings layout stay upstream. On top of that, Wibe ships a local agent that talks to the AI websites you already use — in a real browser, on your machine.
 
-**Version:** `alpha-1.0.2-base-1.136.1`
-Wibe **1.0.2 alpha**, built on Code - OSS **1.136.1**.
+**Version:** `alpha-1.0.3-base-1.136.1`
+Wibe **1.0.3 alpha**, built on Code - OSS **1.136.1**.
 
 > **Tested only on DeepSeek** ([chat.deepseek.com](https://chat.deepseek.com)). Other sites may have built-in automations in the sidecar, but this build has **not** been verified on them.
 
@@ -118,7 +118,7 @@ Do **not** edit `resources/uwa-sidecar/app/core/`. Sidecar customisation goes th
 | `resources/uwa-sidecar/` | Local Web-to-API service |
 | `docs/` | Bridge protocol and “vs vanilla” notes |
 | `BRIDGE.md` | Short contract / do-not-break rules |
-| `WIBE_VERSION` | Display version (`alpha-1.0.2-base-1.136.1`) |
+| `WIBE_VERSION` | Display version (`alpha-1.0.3-base-1.136.1`) |
 
 ---
 
