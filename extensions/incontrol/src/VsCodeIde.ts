@@ -140,7 +140,7 @@ class VsCodeIde implements IDE {
 
   onDidChangeActiveTextEditor(callback: (uri: string) => void): void {
     vscode.window.onDidChangeActiveTextEditor((editor) => {
-      if (editor) {
+      if (editor && editor.document.uri.scheme !== "incontrol-edit-diff") {
         callback(editor.document.uri.toString());
       }
     });
@@ -319,19 +319,15 @@ class VsCodeIde implements IDE {
     startLine: number,
     endLine: number,
   ): Promise<void> {
-    const range = new vscode.Range(
-      new vscode.Position(startLine, 0),
-      new vscode.Position(endLine, 0),
-    );
-    openEditorAndRevealRange(vscode.Uri.parse(fileUri), range).then(
-      (editor) => {
-        // Select the lines
-        editor.selection = new vscode.Selection(
-          new vscode.Position(startLine, 0),
-          new vscode.Position(endLine, 0),
-        );
-      },
-    );
+    const uri = vscode.Uri.parse(fileUri);
+    const document = await vscode.workspace.openTextDocument(uri);
+    // A historical diff can outlive later edits to the file. Clamp its target
+    // instead of creating an invalid selection, and keep the editor tab pinned.
+    const start = Number.isFinite(startLine) ? Math.max(0, Math.trunc(startLine)) : 0;
+    const end = Number.isFinite(endLine) ? Math.max(start, Math.trunc(endLine)) : start;
+    const range = document.validateRange(new vscode.Range(start, 0, end, 0));
+    const editor = await openEditorAndRevealRange(uri, range, vscode.ViewColumn.One, false);
+    editor.selection = new vscode.Selection(range.start, range.end);
   }
 
   async runCommand(
@@ -424,7 +420,8 @@ class VsCodeIde implements IDE {
   }
 
   async getCurrentFile() {
-    if (!vscode.window.activeTextEditor) {
+    if (!vscode.window.activeTextEditor ||
+        vscode.window.activeTextEditor.document.uri.scheme === "incontrol-edit-diff") {
       return undefined;
     }
     return {
@@ -435,11 +432,12 @@ class VsCodeIde implements IDE {
   }
 
   async getPinnedFiles(): Promise<string[]> {
-    const tabArray = vscode.window.tabGroups.all[0].tabs;
-
-    return tabArray
-      .filter((t) => t.isPinned)
-      .map((t) => (t.input as vscode.TabInputText).uri.toString());
+    // Diff/notebook/webview tabs have no TabInputText.uri. In particular,
+    // pinned snapshot reviews must never become editable workspace context.
+    return vscode.window.tabGroups.all.flatMap(group => group.tabs)
+      .filter(t => t.isPinned && t.input instanceof vscode.TabInputText &&
+        t.input.uri.scheme !== "incontrol-edit-diff")
+      .map(t => (t.input as vscode.TabInputText).uri.toString());
   }
 
   runRipgrepQuery(dirUri: string, args: string[]) {

@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { isBuiltInExtensionExcluded } from './lib/productExtensionPolicy.ts';
 import { gulp, rename, replace, filter, flatmap, gunzip, jsonEditor } from './lib/gulp/facade.ts';
 import * as path from 'path';
 import es from 'event-stream';
@@ -384,6 +385,7 @@ function packageTask(type: string, platform: string, arch: string, sourceFolderN
 			.filter(entry => !entry.clientOnly)
 			.map(entry => entry.name);
 		const extensionPaths = [...localWorkspaceExtensions, ...marketplaceExtensions]
+			.filter(name => !isBuiltInExtensionExcluded(product, name))
 			.map(name => `.build/extensions/${name}/**`);
 
 		const extensions = gulp.src(extensionPaths, { base: '.build', dot: true });
@@ -606,6 +608,9 @@ function patchWin32DependenciesTask(destinationFolderName: string) {
 
 function prepareCopilotRipgrepShimTaskREH(platform: string, arch: string, destinationFolderName: string) {
 	return async () => {
+		if (isBuiltInExtensionExcluded(product, 'copilot')) {
+			return;
+		}
 		const outputDir = path.join(BUILD_ROOT, destinationFolderName);
 		const nodeModulesDir = path.join(outputDir, 'node_modules');
 

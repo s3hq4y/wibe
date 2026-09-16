@@ -155,12 +155,6 @@
 		"managedSettingsUrl": "https://api.github.com/copilot_internal/managed_settings"
 	},
 	"trustedExtensionAuthAccess": {
-		"github": [
-			"GitHub.copilot-chat"
-		],
-		"github-enterprise": [
-			"GitHub.copilot-chat"
-		],
 		"microsoft": [
 			"vscode.github-authentication"
 		]
@@ -240,9 +234,14 @@
 			"type": "light"
 		}
 	],
-	"builtInExtensionsEnabledWithAutoUpdates": [
-		"GitHub.copilot-chat"
-	],
+	"builtInExtensionsEnabledWithAutoUpdates": [],
 	"sessionsWindowAllowedExtensions": [],
-	"voiceWsUrl": "wss://falcon-caas.mai.microsoft.com/voice-code/api/v1/realtime/voice"
+	"chatReplacement": {
+		"viewContainer": "workbench.view.extension.incontrol"
+	},
+	"excludedBuiltInExtensions": [
+		"copilot",
+		"GitHub.copilot",
+		"GitHub.copilot-chat"
+	]
 }

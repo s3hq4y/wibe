@@ -47,6 +47,7 @@ try {
 	for (const name of ['requirements.txt', 'check_deps.py', 'VERSION']) {
 		await fs.copyFile(path.join(root, 'resources/uwa-sidecar', name), path.join(sidecar, name));
 	}
+	await fs.cp(path.join(root, 'resources/uwa-runtime'), path.join(relocated, 'resources/uwa-runtime'), { recursive: true });
 	await fs.cp(path.join(root, 'resources/uwa-sidecar/app'), path.join(sidecar, 'app'), {
 		recursive: true, filter: source => !source.split(path.sep).includes('__pycache__')
 	});

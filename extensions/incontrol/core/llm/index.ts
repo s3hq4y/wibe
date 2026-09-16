@@ -1,3 +1,4 @@
+import { prepareUwaChatMessages } from "../util/uwaImages";
 import { ModelRole } from "@incontrol/config-yaml";
 import { fetchwithRequestOptions } from "@incontrol/fetch";
 import {
@@ -1024,6 +1025,9 @@ export abstract class BaseLLM implements ILLM {
   private canUseOpenAIResponses(options: CompletionOptions): boolean {
     return (
       this.providerName === "openai" &&
+      // Managed UWA needs the chat-completions bridge fields and image policy,
+      // even when the selected web model happens to have an o-/gpt-5 name.
+      !isUwaModelApiBase(this.apiBase) &&
       this._llmOptions.useResponsesApi !== false &&
       typeof (this as any)._streamResponses === "function" &&
       (this as any).isOSeriesOrGpt5PlusModel(options.model)
@@ -1432,6 +1436,7 @@ export abstract class BaseLLM implements ILLM {
               if (uwaFields) {
                 Object.assign(body as any, uwaFields);
               }
+              body.messages = prepareUwaChatMessages(body.messages, this.apiBase, (body as any).history_mode);
               try {
                 const mode = String(
                   (body as any).history_mode ?? "",

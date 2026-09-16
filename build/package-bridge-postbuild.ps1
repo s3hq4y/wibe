@@ -36,6 +36,12 @@ foreach ($leak in @("venv", "chrome_profile")) {
 }
 Write-Host ("      files: " + (Get-ChildItem $sideDst -Recurse -File).Count)
 
+$managerSrc = Join-Path $Src "resources\uwa-runtime"
+$managerDst = Join-Path $Prod "resources\app\resources\uwa-runtime"
+New-Item -ItemType Directory -Force -Path $managerDst | Out-Null
+Copy-Item (Join-Path $managerSrc "*.py") $managerDst -Force
+if (-not (Test-Path (Join-Path $managerDst "manager.py"))) { throw "Wibe runtime manager missing" }
+
 Write-Host "      bundled Python + locked dependencies -> product"
 & node (Join-Path $Src "build\python\prepare-runtime.mjs")
 if ($LASTEXITCODE -ne 0) { throw "Bundled Python preparation failed" }

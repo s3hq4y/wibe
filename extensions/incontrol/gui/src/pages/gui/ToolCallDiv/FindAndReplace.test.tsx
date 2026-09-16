@@ -4,7 +4,7 @@ import { EditOperation } from "core/tools/definitions/multiEdit";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FindAndReplaceDisplay } from "./FindAndReplace";
 
-const { mockRequest } = vi.hoisted(() => ({ mockRequest: vi.fn() }));
+const { mockRequest, mockPost } = vi.hoisted(() => ({ mockRequest: vi.fn(), mockPost: vi.fn() }));
 
 // Mock the dependencies
 vi.mock("../../../context/IdeMessenger", () => ({
@@ -34,7 +34,7 @@ vi.mock("react", async () => {
   const actual = await vi.importActual("react");
   return {
     ...actual,
-    useContext: () => ({ post: vi.fn(), request: mockRequest }),
+    useContext: () => ({ post: mockPost, request: mockRequest }),
   };
 });
 
@@ -42,7 +42,6 @@ vi.mock("react", async () => {
 import { executeFindAndReplace } from "core/edit/searchAndReplace/performReplace";
 import { useAppSelector } from "../../../redux/hooks";
 
-const mockPost = vi.fn();
 const mockUseAppSelector = useAppSelector as any;
 const mockExecuteFindAndReplace = executeFindAndReplace as any;
 
@@ -76,6 +75,7 @@ describe("FindAndReplaceDisplay", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockRequest.mockResolvedValue({ status: "success", content: undefined });
 
     mockUseAppSelector.mockImplementation((selector: any) => {
       const mockState = {
@@ -101,6 +101,66 @@ describe("FindAndReplaceDisplay", () => {
         return content.replace(oldStr, newStr);
       },
     );
+  });
+
+  describe("side-by-side snapshot review without losing the chat diff", () => {
+    const expected = {
+      filepath: defaultProps.fileUri, before: defaultProps.editingFileContents,
+      after: "const new = 'value';\nconst other = 'test';", scope: "file",
+    };
+    it("opens immutable before/after snapshots from the title", () => {
+      render(<FindAndReplaceDisplay {...defaultProps} />);
+      fireEvent.click(screen.getByRole("button", { name: "Compare file.ts before and after" }));
+      expect(mockRequest).toHaveBeenCalledWith("edit/showDiff", expected);
+      expect(mockPost).not.toHaveBeenCalled();
+      expect(screen.getByText("const new = 'value';")).toBeVisible();
+      expect(screen.getByText("const old = 'value';")).toBeVisible();
+    });
+    it("selects additions in the modified snapshot", () => {
+      render(<FindAndReplaceDisplay {...defaultProps} />);
+      fireEvent.click(screen.getByText("const new = 'value';"));
+      expect(mockRequest).toHaveBeenCalledWith("edit/showDiff", { ...expected, selection: { side: "after", line: 0 } });
+    });
+    it("selects deleted lines in the original snapshot, not their surviving boundary", () => {
+      render(<FindAndReplaceDisplay {...defaultProps} editingFileContents={"a\nx\ny\n"} newFileContents={"a\n"} />);
+      fireEvent.click(screen.getByText("y"));
+      expect(mockRequest).toHaveBeenCalledWith("edit/showDiff", expect.objectContaining({ before: "a\nx\ny\n", after: "a\n", selection: { side: "before", line: 2 } }));
+    });
+    it("labels fragment history and never mixes a partial before with a full after", () => {
+      render(<FindAndReplaceDisplay {...defaultProps} editingFileContents={undefined} newFileContents="unrelated full file" />);
+      fireEvent.click(screen.getByText("const new = 'value';"));
+      expect(mockRequest).toHaveBeenCalledWith("edit/showDiff", {
+        filepath: defaultProps.fileUri, before: "const old = 'value';", after: "const new = 'value';",
+        scope: "fragments", selection: { side: "after", line: 0 },
+      });
+      expect(screen.getByText(/full file snapshot unavailable/)).toBeVisible();
+      expect(mockPost).not.toHaveBeenCalled();
+    });
+    it("does not send unresolved paths", () => {
+      render(<FindAndReplaceDisplay {...defaultProps} fileUri={undefined} />);
+      expect(screen.getByRole("button", { name: "Compare file.ts before and after" })).toBeDisabled();
+      fireEvent.click(screen.getByText("const new = 'value';"));
+      expect(mockRequest).not.toHaveBeenCalled();
+    });
+    it("keeps snapshots after undo rather than swapping sides or reading the live file", () => {
+      mockUseAppSelector.mockImplementation((selector: any) => selector.toString().includes("selectToolCallById") ? { ...mockToolCallState, processedArgs: { editUndone: true } } : undefined);
+      render(<FindAndReplaceDisplay {...defaultProps} />);
+      fireEvent.click(screen.getByText("const new = 'value';"));
+      expect(mockRequest).toHaveBeenCalledWith("edit/showDiff", { ...expected, selection: { side: "after", line: 0 } });
+    });
+    it("keeps whitespace-only changes and empty new files as real snapshots", () => {
+      render(<FindAndReplaceDisplay {...defaultProps} editingFileContents={"  old\n"} newFileContents="" />);
+      fireEvent.click(screen.getByRole("button", { name: "Compare file.ts before and after" }));
+      expect(mockRequest).toHaveBeenCalledWith("edit/showDiff", { ...expected, before: "  old\n", after: "" });
+    });
+    it("shows an open failure without hiding the chat diff or modifying files", async () => {
+      mockRequest.mockResolvedValue({ status: "error", error: "Diff unavailable" });
+      render(<FindAndReplaceDisplay {...defaultProps} />);
+      fireEvent.click(screen.getByRole("button", { name: "Compare file.ts before and after" }));
+      await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Diff unavailable"));
+      expect(screen.getByText("const old = 'value';")).toBeVisible();
+      expect(mockPost).not.toHaveBeenCalled();
+    });
   });
 
   describe("basic rendering", () => {
@@ -320,22 +380,12 @@ describe("FindAndReplaceDisplay", () => {
       );
     });
 
-    it("should fallback to edit old_strings when no editingFileContents", () => {
-      render(
-        <FindAndReplaceDisplay
-          {...defaultProps}
-          editingFileContents={undefined}
-        />,
-      );
-
-
-      expect(mockExecuteFindAndReplace).toHaveBeenCalledWith(
-        "const old = 'value';",
-        "const old = 'value';",
-        "const new = 'value';",
-        false,
-        0,
-      );
+    it("shows paired edit fragments when the full original is unavailable", () => {
+      render(<FindAndReplaceDisplay {...defaultProps} editingFileContents={undefined} />);
+      expect(mockExecuteFindAndReplace).not.toHaveBeenCalled();
+      expect(screen.getByText("const old = 'value';")).toBeVisible();
+      expect(screen.getByText("const new = 'value';")).toBeVisible();
+      expect(screen.getByText(/full file snapshot unavailable/)).toBeVisible();
     });
   });
   describe("completed edit undo", () => {

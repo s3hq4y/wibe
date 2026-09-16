@@ -5,6 +5,8 @@
 
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
 import { URI } from '../../../../../base/common/uri.js';
+import { ResourceSet } from '../../../../../base/common/map.js';
+import { CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
 import { ITextFileService, TextFileEditorModelState } from '../../../../services/textfile/common/textfiles.js';
 import { ILifecycleService } from '../../../../services/lifecycle/common/lifecycle.js';
 import { Disposable } from '../../../../../base/common/lifecycle.js';
@@ -23,6 +25,7 @@ import { DEFAULT_EDITOR_ASSOCIATION } from '../../../../common/editor.js';
 export class TextFileEditorTracker extends Disposable implements IWorkbenchContribution {
 
 	static readonly ID = 'workbench.contrib.textFileEditorTracker';
+	private readonly backgroundEditResources = new ResourceSet();
 
 	constructor(
 		@IEditorService private readonly editorService: IEditorService,
@@ -35,13 +38,25 @@ export class TextFileEditorTracker extends Disposable implements IWorkbenchContr
 	) {
 		super();
 
+		this._register(CommandsRegistry.registerCommand('_wibe.setBackgroundEdit', (_accessor, value: string, active: boolean) => {
+			if (typeof value !== 'string' || typeof active !== 'boolean') { return; }
+			const resource = URI.parse(value);
+			if (active) {
+				this.backgroundEditResources.add(resource);
+			} else if (!this.textFileService.isDirty(resource)) {
+				this.backgroundEditResources.delete(resource);
+			}
+		}));
 		this.registerListeners();
 	}
 
 	private registerListeners(): void {
 
 		// Ensure dirty text file and untitled models are always opened as editors
-		this._register(this.textFileService.files.onDidChangeDirty(model => this.ensureDirtyFilesAreOpenedWorker.work(model.resource)));
+		this._register(this.textFileService.files.onDidChangeDirty(model => {
+			if (!model.isDirty()) { this.backgroundEditResources.delete(model.resource); }
+			this.ensureDirtyFilesAreOpenedWorker.work(model.resource);
+		}));
 		this._register(this.textFileService.files.onDidSaveError(model => this.ensureDirtyFilesAreOpenedWorker.work(model.resource)));
 		this._register(this.textFileService.untitled.onDidChangeDirty(model => this.ensureDirtyFilesAreOpenedWorker.work(model.resource)));
 
@@ -65,6 +80,11 @@ export class TextFileEditorTracker extends Disposable implements IWorkbenchContr
 			if (!this.textFileService.isDirty(resource)) {
 				return false; // resource must be dirty
 			}
+
+			// Background edits explicitly must not open source tabs, even on a
+			// slow/failed save. The dirty working copy remains recoverable and
+			// the chat reports failures; manual file opening still works.
+			if (this.backgroundEditResources.has(resource)) { return false; }
 
 			const fileModel = this.textFileService.files.get(resource);
 			if (fileModel?.hasState(TextFileEditorModelState.PENDING_SAVE)) {

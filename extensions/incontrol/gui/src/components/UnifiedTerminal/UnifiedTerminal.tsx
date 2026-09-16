@@ -10,45 +10,14 @@ import { getFontSize } from "../../util";
 import { CopyButton } from "../StyledMarkdownPreview/StepContainerPreToolbar/CopyButton";
 import { RunInTerminalButton } from "../StyledMarkdownPreview/StepContainerPreToolbar/RunInTerminalButton";
 import { t } from "../../i18n";
+import { ExecutionTitle } from "../ExecutionTitle";
 import { terminalReadTarget } from "./terminalReadTitle";
 
-const titleSweep = keyframes`
-  from { background-position: 200% center; }
-  to { background-position: -200% center; }
-`;
-
-const CommandTitle = styled.span<{ $running: boolean }>`
-  min-width: 0;
+const CommandTitle = styled(ExecutionTitle)`
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   margin-left: 8px;
-  color: var(--vscode-foreground, var(--foreground));
-  ${({ $running }) => $running && `
-    @supports ((background-clip: text) or (-webkit-background-clip: text)) {
-      background-image: linear-gradient(105deg,
-        var(--vscode-descriptionForeground, var(--foreground)) 25%,
-        var(--vscode-textLink-foreground, #4daafc) 45%,
-        var(--vscode-foreground, var(--foreground)) 50%,
-        var(--vscode-textLink-foreground, #4daafc) 55%,
-        var(--vscode-descriptionForeground, var(--foreground)) 75%);
-      background-size: 250% 100%;
-      background-clip: text;
-      -webkit-background-clip: text;
-      color: transparent;
-    }
-  `}
-  animation: ${({ $running }) => $running ? titleSweep : "none"} 2.4s linear infinite;
-  @media (prefers-reduced-motion: reduce) {
-    animation: none;
-    background-image: none;
-    color: var(--vscode-foreground, var(--foreground));
-  }
-  @media (forced-colors: active) {
-    animation: none;
-    background-image: none;
-    color: CanvasText;
-  }
 `;
 
 const blinkCursor = keyframes`
@@ -310,7 +279,7 @@ interface UnifiedTerminalCommandProps {
 export function UnifiedTerminalCommand({
   command,
   output = "",
-  status = "completed",
+  status,
   statusMessage = "",
   toolCallState,
   toolCallId,
@@ -326,7 +295,8 @@ export function UnifiedTerminalCommand({
   // briefly stale tool-call status while the output stream is settling.
   const statusType = status === "failed" || statusMessage.includes("failed") ? "failed" :
     status === "background" || statusMessage.includes("background") ? "background" :
-    toolCallState?.status === "calling" || status === "running" ? "running" : status;
+    status === "completed" ? "completed" :
+    toolCallState?.status === "calling" || status === "running" ? "running" : "completed";
   const isRunning = statusType === "running";
   const hasOutput = output.length > 0;
 
@@ -352,10 +322,10 @@ export function UnifiedTerminalCommand({
   return (
     <StyledTerminalContainer
       fontSize={getFontSize()}
-      className="mx-2 mb-4"
+      className="mx-2 my-0"
       data-testid="terminal-container"
     >
-      <div className="outline-command-border rounded-default bg-editor !my-2 flex min-w-0 flex-col outline outline-1">
+      <div className="outline-command-border rounded-default bg-editor my-0 flex min-w-0 flex-col outline outline-1">
         {/* Toolbar */}
         <div
           className={`find-widget-skip bg-editor sticky -top-2 z-10 m-0 flex items-center justify-between gap-3 px-1.5 py-1 ${

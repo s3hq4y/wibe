@@ -269,6 +269,10 @@ export interface IProductConfiguration {
 	readonly commonlyUsedSettings?: string[];
 	readonly aiGeneratedWorkspaceTrust?: IAiGeneratedWorkspaceTrust;
 
+	/** Replacement product UI; generic chat/agent and account APIs remain available. */
+	readonly chatReplacement?: { readonly viewContainer: string };
+	/** Extension directory names/identifiers omitted from compilation and final packages. */
+	readonly excludedBuiltInExtensions?: readonly string[];
 	readonly defaultChatAgent: IDefaultChatAgent;
 	readonly chatParticipantRegistry?: string;
 	readonly chatSessionRecommendations?: IChatSessionRecommendation[];

@@ -1,5 +1,6 @@
 import { Tool, ToolCallState } from "core";
 import Mustache from "mustache";
+import { ExecutionTitle } from "../../../components/ExecutionTitle";
 import { getStatusIntro } from "./utils";
 
 interface ToolCallStatusMessageProps {
@@ -52,11 +53,13 @@ export function ToolCallStatusMessage({
   }
 
   return (
-    <div
+    <ExecutionTitle
+      as="div"
+      $running={toolCallState.status === "generating" || toolCallState.status === "calling"}
       className="text-description line-clamp-4 min-w-0 break-words"
       data-testid="tool-call-title"
     >
       {`incontrol ${intro} ${message}`}
-    </div>
+    </ExecutionTitle>
   );
 }

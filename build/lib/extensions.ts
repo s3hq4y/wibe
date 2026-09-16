@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { isBuiltInExtensionExcluded } from './productExtensionPolicy.ts';
 import es from 'event-stream';
 import fs from 'fs';
 import cp from 'child_process';
@@ -471,7 +472,7 @@ function doPackageLocalExtensionsStream(forWeb: boolean, disableMangle: boolean,
  */
 export function packageCopilotExtensionStream(disableMangle: boolean): Stream {
 	const extensionPath = path.join(root, 'extensions', 'copilot');
-	if (!fs.existsSync(extensionPath)) {
+	if (isBuiltInExtensionExcluded(productJson, 'copilot') || !fs.existsSync(extensionPath)) {
 		return es.readArray([]);
 	}
 
@@ -499,6 +500,7 @@ export function packageMarketplaceExtensionsStream(forWeb: boolean): Stream {
 	const marketplaceExtensionsStream = minifyExtensionResources(
 		es.merge(
 			...marketplaceExtensionsDescriptions
+				.filter(extension => !isBuiltInExtensionExcluded(productJson, extension.name))
 				.map(extension => {
 					const src = getExtensionStream(extension).pipe(rename(p => p.dirname = `extensions/${p.dirname}`));
 					return updateExtensionPackageJSON(src, (data: any) => {

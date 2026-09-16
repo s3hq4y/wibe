@@ -1,7 +1,7 @@
 import { ArrowRightIcon } from "@heroicons/react/24/outline";
 import { ToolCallState } from "core";
 import { BuiltInToolNames } from "core/tools/builtIn";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useAppSelector } from "../../../redux/hooks";
 import { RootState } from "../../../redux/store";
 import FunctionSpecificToolCallDiv from "./FunctionSpecificToolCallDiv";
@@ -20,7 +20,8 @@ export function ToolCallDiv({
   toolCallStates,
   historyIndex,
 }: ToolCallDivProps) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
+  const groupId = useId();
   const availableTools = useAppSelector(
     (state: RootState) => state.config.config.tools,
   );
@@ -108,20 +109,17 @@ export function ToolCallDiv({
 
   if (shouldShowGroupedUI) {
     return (
-      <div className="border-border rounded-lg border px-4 py-3 pb-0">
+      <div className="border-border rounded-lg border px-3 py-2">
         <GroupedToolCallHeader
           toolCallStates={toolCallStates}
           activeCalls={pendingCalls.length > 0 ? pendingCalls : activeCalls}
           open={open}
-          onToggle={() => setOpen(!open)}
+          onToggle={() => setOpen((value) => !value)}
+          controls={groupId}
         />
-        <div
-          className={`overflow-y-auto transition-all duration-300 ease-in-out ${
-            open ? "max-h-[50vh] opacity-100" : "max-h-0 opacity-0"
-          }`}
-        >
+        <div id={groupId} hidden={!open} className="max-h-[50vh] overflow-y-auto">
           {toolCallStates.map((toolCallState) => (
-            <div className="py-1 pl-6" key={toolCallState.toolCallId}>
+            <div className="py-0.5 pl-4" key={toolCallState.toolCallId}>
               {renderToolCall(toolCallState)}
             </div>
           ))}
@@ -131,7 +129,7 @@ export function ToolCallDiv({
   }
 
   return toolCallStates.map((toolCallState) => (
-    <div className="py-1" key={toolCallState.toolCallId}>
+    <div className="py-0.5" key={toolCallState.toolCallId}>
       {renderToolCall(toolCallState)}
     </div>
   ));
