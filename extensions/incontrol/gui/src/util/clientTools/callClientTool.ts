@@ -3,6 +3,7 @@ import { BuiltInToolNames } from "core/tools/builtIn";
 import { IncontrolError, IncontrolErrorReason } from "core/util/errors";
 import { IIdeMessenger } from "../../context/IdeMessenger";
 import { AppThunkDispatch, RootState } from "../../redux/store";
+import { markGoalCompleteImpl } from "./markGoalCompleteImpl";
 import { multiEditImpl } from "./multiEditImpl";
 
 export interface ClientToolExtras {
@@ -26,11 +27,10 @@ export type ClientToolImpl = (
   extras: ClientToolExtras,
 ) => Promise<ClientToolOutput>;
 
-// In this build only multi_edit runs on the client side; the terminal tool
-// is dispatched to core. The other client tools (edit_existing_file,
-// single_find_and_replace, mark_goal_complete) were removed when the tool
-// list was slimmed down to terminal + multi_edit, so the switch has just one
-// reachable case.
+// In this build multi_edit and mark_goal_complete run on the client side; the
+// terminal tool is dispatched to core. The other client tools
+// (edit_existing_file, single_find_and_replace) were removed when the tool
+// list was slimmed down.
 export async function callClientTool(
   toolCallState: ToolCallState,
   extras: ClientToolExtras,
@@ -41,6 +41,9 @@ export async function callClientTool(
     switch (toolCall.function.name) {
       case BuiltInToolNames.MultiEdit:
         output = await multiEditImpl(parsedArgs, toolCall.id, extras);
+        break;
+      case BuiltInToolNames.MarkGoalComplete:
+        output = await markGoalCompleteImpl(parsedArgs, toolCall.id, extras);
         break;
       default:
         throw new Error(`Invalid client tool name ${toolCall.function.name}`);

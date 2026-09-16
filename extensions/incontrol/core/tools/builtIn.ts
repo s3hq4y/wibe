@@ -23,10 +23,11 @@ export enum BuiltInToolNames {
 export const BUILT_IN_GROUP_NAME = "Built-In";
 
 // The set of built-in tools that run in the GUI / extension host rather than
-// in core. Only multi_edit survives in this fork - the other edit tools and
-// the goal-complete helper were removed when the tool list was slimmed down
-// to the terminal + multi_edit pair, so this list is now just the single
-// remaining client-side tool. The core import side filters by this list to
-// decide which tool calls stay in core (none) versus which one stays in the
-// client (multi_edit).
-export const CLIENT_TOOLS_IMPLS = [BuiltInToolNames.MultiEdit];
+// in core: multi_edit (file edits) and mark_goal_complete (which mutates the
+// GUI-side session goal). The terminal tool is dispatched to core. The core
+// import side filters by this list to decide which tool calls stay in core
+// versus which ones run in the client.
+export const CLIENT_TOOLS_IMPLS = [
+  BuiltInToolNames.MultiEdit,
+  BuiltInToolNames.MarkGoalComplete,
+];

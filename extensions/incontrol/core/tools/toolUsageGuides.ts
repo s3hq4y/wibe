@@ -1,6 +1,7 @@
 /**
- * Hand-written usage documentation for the two built-in tools (terminal and
- * multi-edit). This is the body of the bundled "tool-usage" skill that gets
+ * Hand-written usage documentation for the built-in tools (terminal,
+ * multi-edit and goal-complete). This is the body of the bundled "tool-usage"
+ * skill that gets
  * seeded into ~/.incontrol/skills/tool-usage/SKILL.md (see
  * core/config/markdown/loadMarkdownSkills.ts) and is meant to be read by the
  * model via read_skill, so it must stay accurate with respect to
@@ -30,6 +31,14 @@ export function getToolUsageGuides(): ToolUsageGuide[] {
 - All edits must validate or nothing is applied - never leave the file in a broken state.
 - Use \`replace_all: true\` to rename a token across the file; without it, a non-unique \`old_string\` is an error.
 - After editing, run the narrowest command that proves the change rather than assuming success.`,
+    },
+    {
+      title: "Goal completion",
+      body: `Tool: \`mark_goal_complete (summary)\`.
+
+- Only available while a session goal is active (set with the \`/goal\` slash command). It is the ONLY way to stop goal tracking - saying the goal is complete in plain text does not stop the nudge loop.
+- Call it once the goal has genuinely been met and verified, passing a one-sentence \`summary\` of how it was achieved.
+- Do not call it speculatively or for partial progress; keep working (and use \`run_terminal_command\`/\`multi_edit\`) until the goal is truly done.`,
     },
     {
       title: "Terminal",
