@@ -1,34 +1,28 @@
-import iconv from "iconv-lite";
 import childProcess from "node:child_process";
 import os from "node:os";
 import { IncontrolError, IncontrolErrorReason } from "../../util/errors";
+import {
+  buildWindowsShellCommand,
+  createUtf8StreamDecoder,
+} from "./windowsShell";
 
 // Default timeout for terminal commands (2 minutes)
 const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
 
-// Automatically decode the buffer according to the platform to avoid garbled Chinese
-function getDecodedOutput(data: Buffer): string {
-  if (process.platform === "win32") {
-    try {
-      let out = iconv.decode(data, "utf-8");
-      if (/�/.test(out)) {
-        out = iconv.decode(data, "gbk");
-      }
-      return out;
-    } catch {
-      return iconv.decode(data, "gbk");
-    }
-  } else {
-    return data.toString();
-  }
-} // Simple helper function to use login shell on Unix/macOS and PowerShell on Windows
+// On Windows the shell is launched with UTF-8 console/output encodings (see
+// windowsShell.ts), so every stream is plain UTF-8 and can be decoded with a
+// streaming decoder. Guessing between UTF-8 and GBK per chunk is no longer needed
+// and was unreliable for mixed content.
+function createOutputDecoder(): (data: Buffer) => string {
+  const decoder = createUtf8StreamDecoder();
+  return (data: Buffer) => decoder.write(data);
+}
+
+// Simple helper function to use login shell on Unix/macOS and PowerShell on Windows
 function getShellCommand(command: string): { shell: string; args: string[] } {
   if (process.platform === "win32") {
-    // Windows: Use PowerShell
-    return {
-      shell: "powershell.exe",
-      args: ["-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", command],
-    };
+    // Windows: PowerShell with UTF-8 input/output, parse errors included.
+    return buildWindowsShellCommand(command);
   } else {
     // Unix/macOS: Use login shell to source .bashrc/.zshrc etc.
     const userShell = process.env.SHELL || "/bin/bash";
@@ -146,6 +140,8 @@ export const runTerminalCommandImpl: ToolImpl = async (args, extras) => {
 
           // Use spawn with color environment
           const { shell, args } = getShellCommand(command);
+          const decodeStdout = createOutputDecoder();
+          const decodeStderr = createOutputDecoder();
           const childProc = childProcess.spawn(shell, args, {
             cwd,
             env: getColorEnv(), // Add enhanced environment for colors
@@ -206,7 +202,7 @@ export const runTerminalCommandImpl: ToolImpl = async (args, extras) => {
             // Skip if this process has been backgrounded
             if (isProcessBackgrounded(toolCallId)) return;
 
-            const newOutput = getDecodedOutput(data);
+            const newOutput = decodeStdout(data);
             terminalOutput += newOutput;
 
             // Update the tracked output for potential cancellation notifications
@@ -237,7 +233,7 @@ export const runTerminalCommandImpl: ToolImpl = async (args, extras) => {
             // Skip if this process has been backgrounded
             if (isProcessBackgrounded(toolCallId)) return;
 
-            const newOutput = getDecodedOutput(data);
+            const newOutput = decodeStderr(data);
             terminalOutput += newOutput;
 
             // Update the tracked output for potential cancellation notifications
@@ -382,6 +378,8 @@ export const runTerminalCommandImpl: ToolImpl = async (args, extras) => {
               let timeoutId: ReturnType<typeof setTimeout> | undefined;
               let sigkillTimeoutId: ReturnType<typeof setTimeout> | undefined;
 
+              const decodeStdout = createOutputDecoder();
+              const decodeStderr = createOutputDecoder();
               const childProc = childProcess.spawn(
                 nonStreamingShell,
                 nonStreamingArgs,
@@ -423,11 +421,11 @@ export const runTerminalCommandImpl: ToolImpl = async (args, extras) => {
               }, DEFAULT_TOOL_TIMEOUT_MS);
 
               childProc.stdout?.on("data", (data) => {
-                stdout += getDecodedOutput(data);
+                stdout += decodeStdout(data);
               });
 
               childProc.stderr?.on("data", (data) => {
-                stderr += getDecodedOutput(data);
+                stderr += decodeStderr(data);
               });
 
               childProc.on("close", (code) => {
