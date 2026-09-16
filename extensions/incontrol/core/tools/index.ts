@@ -4,13 +4,15 @@ import { applySlimmedToolDescriptions } from "./toolUsageDocs";
 
 // I'm writing these as functions because we've messed up 3 TIMES by pushing to const, causing duplicate tool definitions on subsequent config loads.
 //
-// Slimmed to the two tools incontrol ships with: a terminal for running
-// commands and a single multi-edit tool for changing files. Every other
-// helper (read, ls, grep, search, fetch, rule, skill, view-diff, ...) is
-// gone, so the model has nothing else to call.
+// Slimmed to a terminal for running commands, a single multi-edit tool for
+// changing files, and the goal-complete signal. Every other helper (read, ls,
+// grep, search, fetch, rule, skill, view-diff, ...) is gone, so the model has
+// nothing else to call. mark_goal_complete is only surfaced by
+// selectActiveTools while a session goal is active.
 export const getBaseToolDefinitions = (): Tool[] => [
   toolDefinitions.runTerminalCommandTool,
   toolDefinitions.multiEditTool,
+  toolDefinitions.markGoalCompleteTool,
 ];
 
 // Kept for backwards compatibility with code that expects

@@ -1,9 +1,13 @@
 import { Tool } from "..";
 import { TOOL_USAGE_ONE_LINERS } from "./toolUsageOneLiners";
-import { multiEditTool, runTerminalCommandTool } from "./definitions";
+import {
+  markGoalCompleteTool,
+  multiEditTool,
+  runTerminalCommandTool,
+} from "./definitions";
 
 function getStaticDocTools(): Tool[] {
-  return [runTerminalCommandTool, multiEditTool];
+  return [runTerminalCommandTool, multiEditTool, markGoalCompleteTool];
 }
 
 /** Full descriptions of every statically defined built-in tool, by name. */

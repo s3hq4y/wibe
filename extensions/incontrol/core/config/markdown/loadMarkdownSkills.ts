@@ -75,10 +75,10 @@ export async function createSkillFile(
     scope === "global"
       ? localPathToUri(getGlobalFolderWithName(SKILLS_DIR))
       : joinPathsToUri(
-          (await ide.getWorkspaceDirs())[0],
-          WORKSPACE_CONFIG_DIR_NAME,
-          SKILLS_DIR,
-        );
+        (await ide.getWorkspaceDirs())[0],
+        WORKSPACE_CONFIG_DIR_NAME,
+        SKILLS_DIR,
+      );
 
   const dir = joinPathsToUri(baseDir, safeName);
   const fileUri = joinPathsToUri(dir, "SKILL.md");
@@ -166,7 +166,7 @@ function getSkillFileDedupeKey(fileUri: string): string {
 const BUNDLED_TOOL_USAGE_SKILL_NAME = "tool-usage";
 
 /** Bump to re-seed the bundled skill over an older copy on existing installs. */
-const BUNDLED_TOOL_USAGE_VERSION = 3;
+const BUNDLED_TOOL_USAGE_VERSION = 4;
 
 function getBundledVersionPath(): string {
   return path.join(getGlobalFolderWithName(SKILLS_DIR), ".bundled-version.json");
