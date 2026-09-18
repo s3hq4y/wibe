@@ -4,6 +4,7 @@ import { MCPManagerSingleton } from "../context/mcp/MCPManagerSingleton";
 import { IncontrolError, IncontrolErrorReason } from "../util/errors";
 import { canParseUrl } from "../util/url";
 import { BuiltInToolNames } from "./builtIn";
+import { fetchImageImpl } from "./implementations/fetchImage";
 import { runTerminalCommandImpl } from "./implementations/runTerminalCommand";
 import { coerceArgsToSchema, safeParseToolCallArgs } from "./parseArgs";
 
@@ -176,6 +177,8 @@ export async function callBuiltInTool(
   switch (functionName) {
     case BuiltInToolNames.RunTerminalCommand:
       return await runTerminalCommandImpl(args, extras);
+    case BuiltInToolNames.FetchImage:
+      return await fetchImageImpl(args, extras);
     default:
       throw new Error(`Tool "${functionName}" not found`);
   }
@@ -199,8 +202,8 @@ export async function callTool(
     const { contextItems, mcpUiState } = tool.uri
       ? await callToolFromUri(tool.uri, args, extras)
       : {
-          contextItems: await callBuiltInTool(tool.function.name, args, extras),
-        };
+        contextItems: await callBuiltInTool(tool.function.name, args, extras),
+      };
     if (tool.faviconUrl) {
       contextItems.forEach((item) => {
         item.icon = tool.faviconUrl;

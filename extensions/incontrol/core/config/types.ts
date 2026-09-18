@@ -24,7 +24,7 @@ declare global {
       ) => void;
     }
   }
-  
+
   export interface ChunkWithoutID {
     content: string;
     startLine: number;
@@ -32,13 +32,13 @@ declare global {
     signature?: string;
     otherMetadata?: { [key: string]: any };
   }
-  
+
   export interface Chunk extends ChunkWithoutID {
     digest: string;
     filepath: string;
     index: number; // Index of the chunk in the document at filepath
   }
-  
+
   export interface IndexingProgressUpdate {
     progress: number;
     desc: string;
@@ -53,7 +53,7 @@ declare global {
       | "cancelled";
     debugInfo?: string;
   }
-  
+
   // This is more or less a V2 of IndexingProgressUpdate for docs etc.
   export interface IndexingStatus {
     id: string;
@@ -68,21 +68,21 @@ declare global {
     icon?: string;
     url?: string;
   }
-  
+
   export type PromptTemplateFunction = (
     history: ChatMessage[],
     otherData: Record<string, string>,
   ) => string | ChatMessage[];
-  
+
   export type PromptTemplate = string | PromptTemplateFunction;
-  
+
   export interface ILLM extends LLMOptions {
     get providerName(): string;
 
     uniqueId: string;
     lastRequestId?: string;
     model: string;
-  
+
     title?: string;
     systemMessage?: string;
     contextLength: number;
@@ -96,65 +96,65 @@ declare global {
     apiKey?: string;
     apiBase?: string;
     cacheBehavior?: CacheBehavior;
-  
+
     deployment?: string;
     apiVersion?: string;
     apiType?: string;
     region?: string;
     projectId?: string;
-  
+
     // Embedding options
     embeddingId: string;
     maxEmbeddingChunkSize: number;
     maxEmbeddingBatchSize: number;
-  
+
     complete(
       prompt: string,
       signal: AbortSignal,
       options?: LLMFullCompletionOptions,
     ): Promise<string>;
-  
+
     streamComplete(
       prompt: string,
       signal: AbortSignal,
       options?: LLMFullCompletionOptions,
     ): AsyncGenerator<string, PromptLog>;
-  
+
     streamFim(
       prefix: string,
       suffix: string,
       signal: AbortSignal,
       options?: LLMFullCompletionOptions,
     ): AsyncGenerator<string, PromptLog>;
-  
+
     streamChat(
       messages: ChatMessage[],
       signal: AbortSignal,
       options?: LLMFullCompletionOptions,
     ): AsyncGenerator<ChatMessage, PromptLog>;
-  
+
     chat(
       messages: ChatMessage[],
       signal: AbortSignal,
       options?: LLMFullCompletionOptions,
     ): Promise<ChatMessage>;
-  
+
     embed(chunks: string[]): Promise<number[][]>;
-  
+
     rerank(query: string, chunks: Chunk[]): Promise<number[]>;
-  
+
     countTokens(text: string): number;
-  
+
     supportsImages(): boolean;
-  
+
     supportsCompletions(): boolean;
-  
+
     supportsPrefill(): boolean;
-  
+
     supportsFim(): boolean;
-  
+
     listModels(): Promise<string[]>;
-  
+
     renderPromptTemplate(
       template: PromptTemplate,
       history: ChatMessage[],
@@ -162,9 +162,9 @@ declare global {
       canPutWordsInModelsMouth?: boolean,
     ): string | ChatMessage[];
   }
-  
+
   export type ContextProviderType = "normal" | "query" | "submenu";
-  
+
   export interface ContextProviderDescription {
     title: ContextProviderName;
     displayTitle: string;
@@ -173,9 +173,9 @@ declare global {
     type: ContextProviderType;
     dependsOnIndexing?: boolean;
   }
-  
+
   export type FetchFunction = (url: string | URL, init?: any) => Promise<any>;
-  
+
   export interface ContextProviderExtras {
     config: IncontrolConfig;
     fullInput: string;
@@ -186,30 +186,30 @@ declare global {
     selectedCode: RangeInFile[];
     fetch: FetchFunction;
   }
-  
+
   export interface LoadSubmenuItemsArgs {
     config: IncontrolConfig;
     ide: IDE;
     fetch: FetchFunction;
   }
-  
+
   export interface CustomContextProvider {
     title: string;
     displayTitle?: string;
     description?: string;
     renderInlineAs?: string;
     type?: ContextProviderType;
-  
+
     getContextItems(
       query: string,
       extras: ContextProviderExtras,
     ): Promise<ContextItem[]>;
-  
+
     loadSubmenuItems?: (
       args: LoadSubmenuItemsArgs,
     ) => Promise<ContextSubmenuItem[]>;
   }
-  
+
   export interface ContextSubmenuItem {
     id: string;
     title: string;
@@ -217,84 +217,84 @@ declare global {
     icon?: string;
     metadata?: any;
   }
-  
+
   export interface SiteIndexingConfig {
     title: string;
     startUrl: string;
     maxDepth?: number;
     faviconUrl?: string;
   }
-  
+
   export interface IContextProvider {
     get description(): ContextProviderDescription;
-  
+
     getContextItems(
       query: string,
       extras: ContextProviderExtras,
     ): Promise<ContextItem[]>;
-  
+
     loadSubmenuItems(args: LoadSubmenuItemsArgs): Promise<ContextSubmenuItem[]>;
   }
-  
+
   export interface Session {
     sessionId: string;
     title: string;
     workspaceDirectory: string;
     history: ChatHistoryItem[];
   }
-  
+
   export interface SessionMetadata {
     sessionId: string;
     title: string;
     dateCreated: string;
     workspaceDirectory: string;
   }
-  
+
   export interface RangeInFile {
     filepath: string;
     range: Range;
   }
-  
+
   export interface Location {
     filepath: string;
     position: Position;
   }
-  
+
   export interface FileWithContents {
     filepath: string;
     contents: string;
   }
-  
+
   export interface Range {
     start: Position;
     end: Position;
   }
-  
+
   export interface Position {
     line: number;
     character: number;
   }
-  
+
   export interface FileEdit {
     filepath: string;
     range: Range;
     replacement: string;
   }
-  
+
   export interface CompletionOptions extends BaseCompletionOptions {
     model: string;
   }
-  
+
   export type ChatMessageRole = "user" | "assistant" | "system" | "tool";
-  
+
   export interface MessagePart {
     type: "text" | "imageUrl";
     text?: string;
     imageUrl?: { url: string };
   }
-  
+
   export type MessageContent = string | MessagePart[];
-  
+
   export interface ToolCall {
     id: string;
     type: "function";
@@ -303,7 +303,7 @@ declare global {
       arguments: string;
     };
   }
-  
+
   export interface ToolCallDelta {
     id?: string;
     type?: "function";
@@ -312,75 +312,83 @@ declare global {
       arguments?: string;
     };
   }
-  
+
   export interface ToolResultChatMessage {
     role: "tool";
     content: string;
     toolCallId: string;
   }
-  
+
   export interface UserChatMessage {
     role: "user";
     content: MessageContent;
   }
-  
+
   export interface AssistantChatMessage {
     role: "assistant";
     content: MessageContent;
     toolCalls?: ToolCallDelta[];
   }
-  
+
   export interface SystemChatMessage {
     role: "system";
     content: string;
   }
-  
+
   export type ChatMessage =
     | UserChatMessage
     | AssistantChatMessage
     | SystemChatMessage
     | ToolResultChatMessage;
-  
+
   export interface ContextItemId {
     providerTitle: string;
     itemId: string;
   }
-  
+
   export type ContextItemUriTypes = "file" | "url";
-  
+
   export interface ContextItemUri {
     type: ContextItemUriTypes;
     value: string;
   }
-  
+
   export interface ContextItem {
-    content: string;
-    name: string;
-    description: string;
-    editing?: boolean;
-    editable?: boolean;
-    icon?: string;
-    uri?: ContextItemUri;
-    hidden?: boolean;
-  }
-  
+      content: string;
+      name: string;
+      description: string;
+      editing?: boolean;
+      editable?: boolean;
+      icon?: string;
+      uri?: ContextItemUri;
+      hidden?: boolean;
+      status?: string;
+      /**
+       * Optional image payload (data URL or remote URL) produced by a tool.
+       * The tool result itself is text-only, so this is carried out-of-band and
+       * forwarded to the model as a user image message (see
+       * streamResponseAfterToolCall).
+       */
+      imageUrl?: string;
+    }
+
   export interface ContextItemWithId extends ContextItem {
     id: ContextItemId;
   }
-  
+
   export interface InputModifiers {
     useCodebase: boolean;
     noContext: boolean;
   }
-  
+
   export interface SymbolWithRange extends RangeInFile {
     name: string;
     type: Parser.SyntaxNode["type"];
     content: string;
   }
-  
+
   export type FileSymbolMap = Record<string, SymbolWithRange[]>;
-  
+
   export interface PromptLog {
     modelTitle: string;
     modelProvider: string;
@@ -388,8 +396,8 @@ declare global {
     prompt: string;
     completion: string;
   }
-  
-  
+
+
   export type ToolStatus =
     | "generating"
     | "generated"
@@ -397,7 +405,7 @@ declare global {
     | "done"
     | "errored"
     | "canceled";
-  
+
   // Will exist only on "assistant" messages with tool calls
   interface ToolCallState {
     toolCallId: string;
@@ -406,7 +414,7 @@ declare global {
     parsedArgs: any;
     output?: ContextItem[];
   }
-  
+
   export interface ChatHistoryItem {
     message: ChatMessage;
     contextItems: ContextItemWithId[];
@@ -416,68 +424,68 @@ declare global {
     toolCallState?: ToolCallState;
     isGatheringContext?: boolean;
   }
-  
+
   export interface LLMFullCompletionOptions extends BaseCompletionOptions {
     log?: boolean;
     model?: string;
   }
-  
+
   export type ToastType = "info" | "error" | "warning";
-  
+
   export interface LLMInteractionBase {
     interactionId: string;
     timestamp: number;
   }
-  
+
   export interface LLMInteractionStartChat extends LLMInteractionBase {
     kind: "startChat";
     messages: ChatMessage[];
     options: CompletionOptions;
   }
-  
+
   export interface LLMInteractionStartComplete extends LLMInteractionBase {
     kind: "startComplete";
     prompt: string;
     options: CompletionOptions;
   }
-  
+
   export interface LLMInteractionStartFim extends LLMInteractionBase {
     kind: "startFim";
     prefix: string;
     suffix: string;
     options: CompletionOptions;
   }
-  
+
   export interface LLMInteractionChunk extends LLMInteractionBase {
     kind: "chunk";
     chunk: string;
   }
-  
+
   export interface LLMInteractionMessage extends LLMInteractionBase {
     kind: "message";
     message: ChatMessage;
   }
-  
+
   export interface LLMInteractionEnd extends LLMInteractionBase {
     promptTokens: number;
     generatedTokens: number;
     thinkingTokens: number;
   }
-  
+
   export interface LLMInteractionSuccess extends LLMInteractionEnd {
     kind: "success";
   }
-  
+
   export interface LLMInteractionCancel extends LLMInteractionEnd {
     kind: "cancel";
   }
-  
+
   export interface LLMInteractionError extends LLMInteractionEnd {
     kind: "error";
     name: string;
     message: string;
   }
-  
+
   export type LLMInteractionItem =
     | LLMInteractionStartChat
     | LLMInteractionStartComplete
@@ -487,7 +495,7 @@ declare global {
     | LLMInteractionSuccess
     | LLMInteractionCancel
     | LLMInteractionError;
-  
+
   // When we log a LLM interaction, we want to add the interactionId and timestamp
   // in the logger code, so we need a type that omits these members from *each*
   // member of the union. This can be done by using the distributive behavior of
@@ -498,23 +506,23 @@ declare global {
   type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
     ? Omit<T, K>
     : never;
-  
+
   export type LLMInteractionItemDetails = DistributiveOmit<
     LLMInteractionItem,
     "interactionId" | "timestamp"
   >;
-  
+
   export interface ILLMInteractionLog {
     logItem(item: LLMInteractionItemDetails): void;
   }
-  
+
   export interface ILLMLogger {
     createInteractionLog(): ILLMInteractionLog;
   }
-  
+
   export interface LLMOptions {
     model: string;
-  
+
     title?: string;
     uniqueId?: string;
     systemMessage?: string;
@@ -531,7 +539,7 @@ declare global {
     aiGatewaySlug?: string;
     apiBase?: string;
     cacheBehavior?: CacheBehavior;
-  
+
     useLegacyCompletionsEndpoint?: boolean;
 
     /**
@@ -547,32 +555,32 @@ declare global {
     embeddingId?: string;
     maxEmbeddingChunkSize?: number;
     maxEmbeddingBatchSize?: number;
-  
+
     // Cloudflare options
     accountId?: string;
-  
+
     // Azure options
     deployment?: string;
     apiVersion?: string;
     apiType?: string;
-  
+
     // AWS options
     profile?: string;
     modelArn?: string;
-  
+
     // AWS and GCP Options
     region?: string;
-  
+
     // GCP Options
     capabilities?: ModelCapability;
-  
+
     // GCP and Watsonx Options
     projectId?: string;
-  
+
     // IBM watsonx Options
     deploymentId?: string;
   }
-  
+
   type RequireAtLeastOne<T, Keys extends keyof T = keyof T> = Pick<
     T,
     Exclude<keyof T, Keys>
@@ -580,7 +588,7 @@ declare global {
     {
       [K in Keys]-?: Required<Pick<T, K>> & Partial<Pick<T, Exclude<Keys, K>>>;
     }[Keys];
-  
+
   export interface CustomLLMWithOptionals {
     options: LLMOptions;
     streamCompletion?: (
@@ -599,7 +607,7 @@ declare global {
       fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
     ) => Promise<string[]>;
   }
-  
+
   /**
    * The LLM interface requires you to specify either \`streamCompletion\` or \`streamChat\` (or both).
    */
@@ -607,29 +615,29 @@ declare global {
     CustomLLMWithOptionals,
     "streamCompletion" | "streamChat"
   >;
-  
+
   // IDE
-  
+
   export type DiffLineType = "new" | "old" | "same";
-  
+
   export interface DiffLine {
     type: DiffLineType;
     line: string;
   }
-  
+
   export class Problem {
     filepath: string;
     range: Range;
     message: string;
   }
-  
+
   export class Thread {
     name: string;
     id: number;
   }
-  
+
   export type IdeType = "vscode" | "jetbrains";
-  
+
   export interface IdeInfo {
     ideType: IdeType;
     name: string;
@@ -637,81 +645,81 @@ declare global {
     remoteName: string;
     extensionVersion: string;
   }
-  
+
   export interface BranchAndDir {
     branch: string;
     directory: string;
   }
-  
+
   export interface IndexTag extends BranchAndDir {
     artifactId: string;
   }
-  
+
   export enum FileType {
     Unkown = 0,
     File = 1,
     Directory = 2,
     SymbolicLink = 64,
   }
-  
+
   export interface IdeSettings {
     remoteConfigServerUrl: string | undefined;
     remoteConfigSyncPeriod: number;
     userToken: string;
   }
-  
+
   export interface IDE {
     getIdeInfo(): Promise<IdeInfo>;
-  
+
     getIdeSettings(): Promise<IdeSettings>;
-  
+
     getDiff(includeUnstaged: boolean): Promise<string[]>;
-  
+
     getClipboardContent(): Promise<{ text: string; copiedAt: string }>;
-  
+
     isTelemetryEnabled(): Promise<boolean>;
-  
+
     getUniqueId(): Promise<string>;
-  
+
     getTerminalContents(): Promise<string>;
-  
+
     getDebugLocals(threadIndex: number): Promise<string>;
-  
+
     getTopLevelCallStackSources(
       threadIndex: number,
       stackDepth: number,
     ): Promise<string[]>;
-  
+
     getAvailableThreads(): Promise<Thread[]>;
-  
+
     getWorkspaceDirs(): Promise<string[]>;
-  
+
     fileExists(filepath: string): Promise<boolean>;
-  
+
     writeFile(path: string, contents: string): Promise<void>;
-  
+
     showVirtualFile(title: string, contents: string): Promise<void>;
     openFile(path: string): Promise<void>;
-  
+
     openUrl(url: string): Promise<void>;
-  
+
     getExternalUri?(uri: string): Promise<string>;
-  
+
     runCommand(command: string): Promise<void>;
-  
+
     saveFile(filepath: string): Promise<void>;
-  
+
     readFile(filepath: string): Promise<string>;
-  
+
     readRangeInFile(filepath: string, range: Range): Promise<string>;
-  
+
     showLines(
       filepath: string,
       startLine: number,
       endLine: number,
     ): Promise<void>;
     getOpenFiles(): Promise<string[]>;
-  
+
     getCurrentFile(): Promise<
       | undefined
       | {
@@ -720,46 +728,46 @@ declare global {
           contents: string;
         }
     >;
-  
+
     getPinnedFiles(): Promise<string[]>;
-  
+
     getSearchResults(query: string, maxResults?: number): Promise<string>;
-  
+
     subprocess(command: string, cwd?: string): Promise<[string, string]>;
-  
+
     getProblems(filepath?: string | undefined): Promise<Problem[]>;
-  
+
     getBranch(dir: string): Promise<string>;
-  
+
     getTags(artifactId: string): Promise<IndexTag[]>;
-  
+
     getRepoName(dir: string): Promise<string | undefined>;
-  
+
     showToast(
       type: ToastType,
       message: string,
       ...otherParams: any[]
     ): Promise<any>;
-  
+
     getGitRootPath(dir: string): Promise<string | undefined>;
-  
+
     listDir(dir: string): Promise<[string, FileType][]>;
-  
+
     getLastModified(files: string[]): Promise<{ [path: string]: number }>;
-  
+
     // LSP
     gotoDefinition(location: Location): Promise<RangeInFile[]>;
     gotoTypeDefinition(location: Location): Promise<RangeInFile[]>;
     getSignatureHelp(location: Location): Promise<SignatureHelp | null>;
     getReferences(location: Location): Promise<RangeInFile[]>;
     getDocumentSymbols(textDocumentIdentifier: string): Promise<DocumentSymbol[]>;
-  
+
     // Callbacks
     onDidChangeActiveTextEditor(callback: (filepath: string) => void): void;
   }
-  
+
   // Slash Commands
-  
+
   export interface IncontrolSDK {
     ide: IDE;
     llm: ILLM;
@@ -772,16 +780,16 @@ declare global {
     config: IncontrolConfig;
     fetch: FetchFunction;
   }
-  
+
   export interface SlashCommand {
     name: string;
     description: string;
     params?: { [key: string]: any };
     run: (sdk: IncontrolSDK) => AsyncGenerator<string | undefined>;
   }
-  
+
   // Config
-  
+
   type StepName =
     | "AnswerQuestionChroma"
     | "GenerateShellCommandStep"
@@ -793,7 +801,7 @@ declare global {
     | "OpenConfigStep"
     | "GenerateShellCommandStep"
     | "DraftIssueStep";
-  
+
   type ContextProviderName =
     | "diff"
     | "terminal"
@@ -822,7 +830,7 @@ declare global {
     | "repo-map"
     | "url"
     | string;
-  
+
   type TemplateType =
     | "llama2"
     | "alpaca"
@@ -842,7 +850,7 @@ declare global {
     | "granite"
     | "llama3"
     | "codestral";
-  
+
   export interface RequestOptions {
     timeout?: number;
     verifySsl?: boolean;
@@ -853,40 +861,40 @@ declare global {
     noProxy?: string[];
     clientCertificate?: ClientCertificateOptions;
   }
-  
+
   export interface CacheBehavior {
     cacheSystemMessage?: boolean;
     cacheConversation?: boolean;
   }
-  
+
   export interface ClientCertificateOptions {
     cert: string;
     key: string;
     passphrase?: string;
   }
-  
+
   export interface StepWithParams {
     name: StepName;
     params: { [key: string]: any };
   }
-  
+
   export interface ContextProviderWithParams {
     name: ContextProviderName;
     params: { [key: string]: any };
   }
-  
+
   export interface SlashCommandDescription {
     name: string;
     description: string;
     params?: { [key: string]: any };
   }
-  
+
   export interface CustomCommand {
     name: string;
     prompt: string;
     description: string;
   }
-  
+
   interface Prediction {
     type: "content";
     content:
@@ -896,13 +904,13 @@ declare global {
           text: string;
         }[];
   }
-  
+
   export interface ToolExtras {
     ide: IDE;
     llm: ILLM;
     fetch: FetchFunction;
   }
-  
+
   export interface Tool {
     type: "function";
     function: {
@@ -911,13 +919,13 @@ declare global {
       parameters?: Record<string, any>;
       strict?: boolean | null;
     };
-  
+
     displayTitle: string;
     wouldLikeTo: string;
     readonly: boolean;
     uri?: string;
   }
-  
+
   interface BaseCompletionOptions {
     temperature?: number;
     topP?: number;
@@ -937,11 +945,11 @@ declare global {
     prediction?: Prediction;
     tools?: Tool[];
   }
-  
+
   export interface ModelCapability {
     uploadImage?: boolean;
   }
-  
+
   export interface ModelDescription {
     title: string;
     provider: string;
@@ -958,7 +966,7 @@ declare global {
     capabilities?: ModelCapability;
     cacheBehavior?: CacheBehavior;
   }
-  
+
   export interface JSONEmbedOptions {
     apiBase?: string;
     apiKey?: string;
@@ -971,23 +979,23 @@ declare global {
     maxBatchSize?: number;
     // AWS options
     profile?: string;
-  
+
     // AWS and GCP Options
     region?: string;
-  
+
     // GCP and Watsonx Options
     projectId?: string;
   }
-  
+
   export interface EmbeddingsProviderDescription extends EmbedOptions {
     provider: string;
   }
-  
+
   export interface RerankerDescription {
     name: string;
     params?: { [key: string]: any };
   }
-  
+
   export interface TabAutocompleteOptions {
     disable: boolean;
     maxPromptTokens: number;
@@ -1006,7 +1014,7 @@ declare global {
     useImports?: boolean;
     showWhateverWeHaveAtXMs?: number;
   }
-  
+
   interface StdioOptions {
     type: "stdio";
     command: string;
@@ -1014,23 +1022,23 @@ declare global {
     env?: Record<string, string>;
     cwd?: string;
   }
-  
+
   interface WebSocketOptions {
     type: "websocket";
     url: string;
   }
-  
+
   interface SSEOptions {
     type: "sse";
     url: string;
   }
-  
+
   type TransportOptions = StdioOptions | WebSocketOptions | SSEOptions;
-  
+
   export interface MCPOptions {
     transport: TransportOptions;
   }
-  
+
   export interface IncontrolUIConfig {
     codeBlockToolbarPosition?: "top" | "bottom";
     fontSize?: number;
@@ -1040,7 +1048,7 @@ declare global {
     /** A user-authored prompt that is injected only after it is enabled from the chat toolbar. */
     manualSystemMessage?: string;
   }
-  
+
   interface ContextMenuConfig {
     comment?: string;
     docstring?: string;
@@ -1048,18 +1056,18 @@ declare global {
     optimize?: string;
     fixGrammar?: string;
   }
-  
+
   interface ExperimentalModelRoles {
     inlineEdit?: string;
     applyCodeBlock?: string;
     repoMapFileSelection?: string;
   }
-  
+
   export type ApplyStateStatus =
     | "streaming" // Changes are being applied to the file
     | "done" // All changes have been applied, awaiting user to accept/reject
     | "closed"; // All changes have been applied. Note that for new files, we immediately set the status to "closed"
-  
+
   export interface ApplyState {
     streamId: string;
     status?: ApplyStateStatus;
@@ -1069,7 +1077,7 @@ declare global {
     originalFileContent?: string;
     autoFormattingDiff?: string;
   }
-  
+
   export interface RangeInFileWithContents {
     filepath: string;
     range: {
@@ -1078,9 +1086,9 @@ declare global {
     };
     contents: string;
   }
-  
+
   export type CodeToEdit = RangeInFileWithContents | FileWithContents;
-  
+
   /**
    * Represents the configuration for a quick action in the Code Lens.
    * Quick actions are custom commands that can be added to function and class declarations.
@@ -1090,13 +1098,13 @@ declare global {
      * The title of the quick action that will display in the Code Lens.
      */
     title: string;
-  
+
     /**
      * The prompt that will be sent to the model when the quick action is invoked,
      * with the function or class body concatenated.
      */
     prompt: string;
-  
+
     /**
      * If \`true\`, the result of the quick action will be sent to the chat panel.
      * If \`false\`, the streamed result will be inserted into the document.
@@ -1105,28 +1113,28 @@ declare global {
      */
     sendToChat: boolean;
   }
-  
+
   export type DefaultContextProvider = ContextProviderWithParams & {
     query?: string;
   };
-  
+
   interface ExperimentalConfig {
     contextMenuPrompts?: ContextMenuConfig;
     modelRoles?: ExperimentalModelRoles;
     defaultContext?: DefaultContextProvider[];
     promptPath?: string;
-  
+
     /**
      * Quick actions are a way to add custom commands to the Code Lens of
      * function and class declarations.
      */
     quickActions?: QuickActionConfig[];
-  
+
     /**
      * Automatically read LLM chat responses aloud using system TTS models
      */
     readResponseTTS?: boolean;
-  
+
     /**
      * If set to true, we will attempt to pull down and install an instance of Chromium
      * that is compatible with the current version of Puppeteer.
@@ -1143,13 +1151,13 @@ declare global {
      */
     maxGoalNudges?: number;
   }
-  
+
   interface AnalyticsConfig {
     type: string;
     url?: string;
     clientKey?: string;
   }
-  
+
   // config.json
   export interface SerializedIncontrolConfig {
     env?: string[];
@@ -1173,13 +1181,13 @@ declare global {
     analytics?: AnalyticsConfig;
     docs?: SiteIndexingConfig[];
   }
-  
+
   export type ConfigMergeType = "merge" | "overwrite";
-  
+
   export type IncontrolRcJson = Partial<SerializedIncontrolConfig> & {
     mergeBehavior: ConfigMergeType;
   };
-  
+
   // config.ts - give users simplified interfaces
   export interface Config {
     /** If set to true, incontrol will collect anonymous usage data to improve the product. If set to false, we will collect nothing. Read here to learn more: https://docs.continue.dev/telemetry */
@@ -1225,7 +1233,7 @@ declare global {
     /** Analytics configuration */
     analytics?: AnalyticsConfig;
   }
-  
+
   // in the actual Continue source code
   export interface IncontrolConfig {
     allowAnonymousTelemetry?: boolean;
@@ -1248,7 +1256,7 @@ declare global {
     docs?: SiteIndexingConfig[];
     tools: Tool[];
   }
-  
+
   export interface BrowserSerializedIncontrolConfig {
     allowAnonymousTelemetry?: boolean;
     models: ModelDescription[];
@@ -1268,24 +1276,24 @@ declare global {
     docs?: SiteIndexingConfig[];
     tools: Tool[];
   }
-  
+
   // DOCS SUGGESTIONS AND PACKAGE INFO
   export interface FilePathAndName {
     path: string;
     name: string;
   }
-  
+
   export interface PackageFilePathAndName extends FilePathAndName {
     packageRegistry: string; // e.g. npm, pypi
   }
-  
+
   export type ParsedPackageInfo = {
     name: string;
     packageFile: PackageFilePathAndName;
     language: string;
     version: string;
   };
-  
+
   export type PackageDetails = {
     docsLink?: string;
     docsLinkWarning?: string;
@@ -1294,11 +1302,11 @@ declare global {
     repo?: string;
     license?: string;
   };
-  
+
   export type PackageDetailsSuccess = PackageDetails & {
     docsLink: string;
   };
-  
+
   export type PackageDocsResult = {
     packageInfo: ParsedPackageInfo;
   } & (

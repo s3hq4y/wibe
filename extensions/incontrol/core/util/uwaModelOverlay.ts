@@ -84,6 +84,13 @@ export function applyUwaModelsToSerialized(serialized: {
 			underlyingProviderName: "openai",
 			model: m.model,
 			apiBase: m.apiBase,
+			// The sidecar drives a real browser conversation and performs the
+			// image upload itself, independently of whether the underlying web
+			// model is multimodal. Without this, `modelSupportsImages` falls back
+			// to name heuristics that miss many synced web models (e.g. gpt-5,
+			// gemini-2.5), and `compileChatMessages` strips the `imageUrl` parts
+			// produced by fetch_image before they ever reach the sidecar.
+			capabilities: { uploadImage: true },
 		} satisfies JSONModelDescription);
 		knownTitles.add(m.title);
 	}

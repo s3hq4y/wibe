@@ -109,3 +109,6 @@ resources/uwa-sidecar/chrome_profile*/
 
 # Local project execution notes (never commit)
 /arena.md
+
+# Issue 草稿（本地留档；提 issue 后保留，便于复用这套流程）
+/.issue-*.md

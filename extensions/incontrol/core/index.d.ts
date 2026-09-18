@@ -64,7 +64,7 @@ type RequiredLLMOptions =
 
 export interface ILLM
   extends Omit<LLMOptions, RequiredLLMOptions>,
-    Required<Pick<LLMOptions, RequiredLLMOptions>> {
+  Required<Pick<LLMOptions, RequiredLLMOptions>> {
   get providerName(): string;
   get underlyingProviderName(): string;
 
@@ -424,6 +424,8 @@ export interface ContextItem {
   uri?: ContextItemUri;
   hidden?: boolean;
   status?: string;
+  /** Optional image payload (data URL or remote URL) produced by a tool. */
+  imageUrl?: string;
 }
 
 export interface ContextItemWithId extends ContextItem {
@@ -840,10 +842,10 @@ export interface IDE {
   getCurrentFile(): Promise<
     | undefined
     | {
-        isUntitled: boolean;
-        path: string;
-        contents: string;
-      }
+      isUntitled: boolean;
+      path: string;
+      contents: string;
+    }
   >;
 
   getPinnedFiles(): Promise<string[]>;
@@ -1053,11 +1055,11 @@ export interface CustomCommand {
 export interface Prediction {
   type: "content";
   content:
-    | string
-    | {
-        type: "text";
-        text: string;
-      }[];
+  | string
+  | {
+    type: "text";
+    text: string;
+  }[];
 }
 
 export interface ToolExtras {
@@ -1671,14 +1673,14 @@ export interface ExperimentalConfig {
      * This is the only brake on the goal loop - the depth guard in
      * streamNormalInput only fires under NODE_ENV=test.
      */
-    maxGoalNudges?: number;
-    /**
-     * Custom nudge message sent to the model when the goal is not yet complete.
-     * Use {{goal}} to insert the goal text. Falls back to the built-in message
-     * when omitted.
-     */
-    goalNudgeMessage?: string;
-  }
+  maxGoalNudges?: number;
+  /**
+   * Custom nudge message sent to the model when the goal is not yet complete.
+   * Use {{goal}} to insert the goal text. Falls back to the built-in message
+   * when omitted.
+   */
+  goalNudgeMessage?: string;
+}
 
 export interface AnalyticsConfig {
   provider: string;
@@ -1780,9 +1782,9 @@ export interface Config {
   embeddingsProvider?: EmbeddingsProviderDescription | ILLM;
   /** The model that Continue will use for tab autocompletions. */
   tabAutocompleteModel?:
-    | CustomLLM
-    | JSONModelDescription
-    | (CustomLLM | JSONModelDescription)[];
+  | CustomLLM
+  | JSONModelDescription
+  | (CustomLLM | JSONModelDescription)[];
   /** Options for tab autocomplete */
   tabAutocompleteOptions?: Partial<TabAutocompleteOptions>;
   /** UI styles customization */
@@ -1876,9 +1878,9 @@ export type PackageDetailsSuccess = PackageDetails & {
 export type PackageDocsResult = {
   packageInfo: ParsedPackageInfo;
 } & (
-  | { error: string; details?: never }
-  | { details: PackageDetailsSuccess; error?: never }
-);
+    | { error: string; details?: never }
+    | { details: PackageDetailsSuccess; error?: never }
+  );
 
 export interface TerminalOptions {
   reuseTerminal?: boolean;
