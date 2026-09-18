@@ -21,6 +21,8 @@ import { convertToolCallStatesToSystemCallsAndOutput } from "core/tools/systemMe
 import { SystemMessageToolsFramework } from "core/tools/systemMessageTools/types";
 import { findLast, findLastIndex } from "core/util/findLast";
 import {
+  buildToolImageUserMessage,
+  collectContextItemImages,
   normalizeToMessageParts,
   renderContextItems,
   renderContextItemsWithStatus,
@@ -60,6 +62,19 @@ export function constructMessages(
   }
 
   const historyCopy = [...filteredHistory];
+
+  // Index of the newest assistant message. Tool-produced images are only
+  // re-attached while that tool round is still the freshest assistant turn;
+  // once the model has produced a newer reply we stop resending the (possibly
+  // multi-megabyte) image on every subsequent request. uwa applies an
+  // equivalent "latest un-answered turn only" rule in prepareUwaChatMessages.
+  let lastAssistantIndex = -1;
+  for (let i = historyCopy.length - 1; i >= 0; i--) {
+    if (historyCopy[i].message.role === "assistant") {
+      lastAssistantIndex = i;
+      break;
+    }
+  }
 
   const msgs: MessageWithContextItems[] = [];
   let appliedRuleIndex = -1;
@@ -115,6 +130,30 @@ export function constructMessages(
           message: assistantMessage,
           ctxItems: [],
         });
+        // Tool results are text-only here as well, so any image a tool
+        // produced (e.g. fetch_image's ContextItem.imageUrl) is appended to
+        // the synthetic user message as `imageUrl` parts. Without this the
+        // pixels would be dropped whenever the model runs through the
+        // system-message-tools framework instead of native tool calls.
+        if (index === lastAssistantIndex) {
+          const toolImages = collectContextItemImages(
+            (item.toolCallStates ?? []).flatMap((tc) => tc.output ?? []),
+          );
+          if (toolImages.length > 0) {
+            const baseContent = normalizeToMessageParts(userMessage);
+            userMessage.content = [
+              ...toolImages.map((url) => ({
+                type: "imageUrl" as const,
+                imageUrl: { url },
+              })),
+              ...baseContent,
+              {
+                type: "text" as const,
+                text: "Image(s) returned by the tool call(s) above. Inspect them directly.",
+              },
+            ];
+          }
+        }
         msgs.push({
           message: userMessage,
           ctxItems: [],
@@ -157,6 +196,22 @@ export function constructMessages(
               toolCallId: toolCall.id!,
             },
           });
+
+          // Tool results are text-only on the wire, so any image a tool
+          // produced (e.g. fetch_image's ContextItem.imageUrl) is promoted to
+          // a following user message. OpenAI-style providers only turn
+          // `imageUrl` parts into image payloads inside user/assistant content
+          // arrays, never inside a `role: "tool"` string.
+          if (index === lastAssistantIndex) {
+            const toolImages = collectContextItemImages(output);
+            const imageMessage = buildToolImageUserMessage(
+              toolImages,
+              `Image returned by the ${toolCall.function?.name ?? "tool"} tool.`,
+            );
+            if (imageMessage) {
+              msgs.push({ ctxItems: [], message: imageMessage });
+            }
+          }
         }
       } else if (item.toolCallStates && item.toolCallStates.length > 0) {
         // This case indicates a potential mismatch - we have tool call states but no message.toolCalls

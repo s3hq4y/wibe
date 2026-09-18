@@ -12,6 +12,7 @@ import { applySlimmedToolDescriptions } from "./toolUsageDocs";
 export const getBaseToolDefinitions = (): Tool[] => [
   toolDefinitions.runTerminalCommandTool,
   toolDefinitions.multiEditTool,
+  toolDefinitions.fetchImageTool,
   toolDefinitions.markGoalCompleteTool,
 ];
 

@@ -1,13 +1,19 @@
 import { Tool } from "..";
 import { TOOL_USAGE_ONE_LINERS } from "./toolUsageOneLiners";
 import {
+  fetchImageTool,
   markGoalCompleteTool,
   multiEditTool,
   runTerminalCommandTool,
 } from "./definitions";
 
 function getStaticDocTools(): Tool[] {
-  return [runTerminalCommandTool, multiEditTool, markGoalCompleteTool];
+  return [
+    runTerminalCommandTool,
+    multiEditTool,
+    fetchImageTool,
+    markGoalCompleteTool,
+  ];
 }
 
 /** Full descriptions of every statically defined built-in tool, by name. */

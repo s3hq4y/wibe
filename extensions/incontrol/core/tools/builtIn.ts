@@ -15,6 +15,7 @@ export enum BuiltInToolNames {
   CreateRuleBlock = "create_rule_block",
   RequestRule = "request_rule",
   FetchUrlContent = "fetch_url_content",
+  FetchImage = "fetch_image",
   ReadSkill = "read_skill",
   MarkGoalComplete = "mark_goal_complete",
   GetToolUsage = "get_tool_usage",
